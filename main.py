@@ -1,23 +1,23 @@
 #!/usr/bin/env python3
 """
 ReportMate FastAPI Application
-Enterprise-grade device management API with OS data support
+Enterprise-grade device management API with comprehensive data support
 
-🚨 CRITICAL DEVICE ID ALIGNMENT FIX 🚨
-- ALL device identification now uses serialNumber as primary key
-- deviceId field is DEPRECATED and mapped to serialNumber for compatibility
-- Database queries use serial_number consistently
-- No more UUID/serialNumber confusion
+Device Management:
+- Standardized device identification using serialNumber as primary key
+- deviceId field maintained for compatibility
+- Consistent database schema across all operations
+- Clean UUID/serialNumber handling
 
 Key Features:
-- Bulk devices endpoint with OS data (/api/devices)
+- Bulk devices endpoint with complete OS data (/api/devices)
 - Individual device details (/api/device/{serial_number})
 - Health monitoring (/api/health)
 - Event ingestion (/api/events)
 - SignalR integration (/api/negotiate)
 - Database diagnostics (/api/debug/database)
 
-Critical Fix: Standardized device identification on serialNumber throughout stack
+Architecture: Professional REST API with standardized device identification
 """
 
 import json
@@ -38,8 +38,8 @@ logger = logging.getLogger(__name__)
 # FastAPI app initialization
 app = FastAPI(
     title="ReportMate API",
-    version="2.1.0",
-    description="Enterprise device management API with standardized device identification"
+    version="1.0.0",
+    description="Professional device management and telemetry API"
 )
 
 # Database connection configuration
@@ -116,21 +116,17 @@ class DeviceModules(BaseModel):
 
 class DeviceInfo(BaseModel):
     """
-    🚨 FIXED: Device information with standardized ID handling
-    - serialNumber is the PRIMARY identifier
-    - deviceId is DEPRECATED but kept for compatibility (maps to serialNumber)
+    Device information with database schema mapping
     """
     serialNumber: str  # PRIMARY KEY - Always use this
-    deviceId: str      # DEPRECATED - Maps to serialNumber for compatibility
+    deviceId: str      # UUID from device_id column
     deviceName: Optional[str] = None
     lastSeen: Optional[str] = None
     status: str = "unknown"
-    assetTag: Optional[str] = None
-    usage: Optional[str] = None
-    catalog: Optional[str] = None
-    location: Optional[str] = None
-    department: Optional[str] = None
+    model: Optional[str] = None
+    manufacturer: Optional[str] = None
     platform: Optional[str] = None
+    os_version: Optional[str] = None
     modules: Optional[DeviceModules] = None
 
 class DevicesResponse(BaseModel):
@@ -144,22 +140,20 @@ async def root():
     """API root endpoint with service information."""
     return {
         "name": "ReportMate API",
-        "version": "2.1.0",
+        "version": "1.0.0",
         "status": "running",
         "platform": "FastAPI on Azure Container Apps",
-        "deviceIdStandard": "serialNumber (UUIDs deprecated)",
-        "endpoints": {
-            "health": "/api/health",
-            "device": "/api/device/{serial_number}",
-            "devices": "/api/devices",
-            "events": "/api/events",
-            "events_submit": "/api/events (POST)",
-            "signalr": "/api/negotiate",
-            "debug_database": "/api/debug/database"
-        }
-    }
-
-@app.get("/api/health")
+            "deviceIdStandard": "serialNumber",
+            "endpoints": {
+                "health": "/api/health",
+                "device": "/api/device/{serial_number}",
+                "devices": "/api/devices",
+                "events": "/api/events",
+                "events_submit": "/api/events (POST)",
+                "signalr": "/api/negotiate",
+                "debug_database": "/api/debug/database"
+            }
+        }@app.get("/api/health")
 async def health_check():
     """Health check endpoint."""
     try:
@@ -173,7 +167,7 @@ async def health_check():
             "status": "healthy",
             "timestamp": datetime.now(timezone.utc).isoformat(),
             "database": "connected",
-            "version": "2.1.0",
+            "version": "1.0.0",
             "deviceIdStandard": "serialNumber"
         }
     except Exception as e:
@@ -190,136 +184,158 @@ async def health_check():
 @app.get("/api/devices", response_model=DevicesResponse)
 async def get_all_devices():
     """
-    🚀 CRITICAL FIX: Bulk devices endpoint with standardized device identification
-    
-    🚨 DEVICE ID ALIGNMENT FIX:
-    - Uses serialNumber as primary identifier
-    - deviceId field maps to serialNumber for compatibility
-    - No more UUID confusion
-    
-    Returns:
-        - All devices with serialNumber as primary key
-        - OS data (platform, modules.system.operatingSystem) for devices that have it
-        - Windows: name, build, edition, version, featureUpdate, displayVersion
-        - macOS: name, major, minor, patch
+    Bulk devices endpoint with standardized device identification
     """
     try:
+        print(f"[DEBUG] Starting get_all_devices endpoint")
+        
         conn = get_db_connection()
         cursor = conn.cursor()
         
-        # 🚨 CRITICAL FIX: Query uses serial_number as primary key
-        # REMOVED device_id field confusion - serialNumber is the source of truth
+        # Query uses correct column names and handles NULL serials
         query = """
-        WITH device_os AS (
-            SELECT 
-                d.serial_number, 
-                d.device_name,
-                d.last_seen,
-                d.created_at,
-                d.status,
-                d.asset_tag,
-                d.usage,
-                d.catalog,
-                d.location,
-                d.department,
-                s.data as system_data
-            FROM devices d
-            LEFT JOIN system s ON d.serial_number = s.device_id
-        )
         SELECT 
-            serial_number,
-            device_name, 
-            last_seen,
-            created_at,
-            status,
-            asset_tag,
-            usage,
-            catalog,
-            location,
-            department,
-            system_data
-        FROM device_os
-        ORDER BY device_name ASC, serial_number ASC
+            d.id,
+            d.device_id,
+            d.name,
+            d.serial_number, 
+            d.last_seen,
+            d.created_at,
+            d.status,
+            d.model,
+            d.manufacturer,
+            d.os,
+            d.os_name,
+            d.os_version,
+            s.data as system_data
+        FROM devices d
+        LEFT JOIN system s ON d.id = s.device_id
+        WHERE d.serial_number IS NOT NULL AND d.serial_number != ''
+        ORDER BY d.serial_number ASC
         """
         
+        print(f"[DEBUG] Executing devices query")
         cursor.execute(query)
         rows = cursor.fetchall()
+        print(f"[DEBUG] Query returned {len(rows)} rows")
         conn.close()
         
         devices = []
         
-        for row in rows:
-            serial_number, device_name, last_seen, created_at, status, asset_tag, usage, catalog, location, department, system_data = row
-            
-            # 🚨 FIXED: Build device info with serialNumber as primary key
-            device_info = {
-                "serialNumber": serial_number,  # PRIMARY KEY
-                "deviceId": serial_number,       # COMPATIBILITY - Maps to serialNumber
-                "deviceName": device_name,
-                "lastSeen": last_seen.isoformat() if last_seen else None,
-                "createdAt": created_at.isoformat() if created_at else None,
-                "status": status or "online",
-                "assetTag": asset_tag,
-                "usage": usage,
-                "catalog": catalog,
-                "location": location,
-                "department": department
-            }
-            
-            # 🚀 CRITICAL: Add OS data from system module
-            if system_data:
-                try:
-                    system_json = json.loads(system_data) if isinstance(system_data, str) else system_data
-                    
-                    # Extract operating system data from system module
-                    os_data = None
-                    if isinstance(system_json, dict) and "operatingSystem" in system_json:
-                        # System data has operatingSystem directly
-                        os_data = system_json["operatingSystem"]
-                    
-                    if os_data:
-                        # 🚀 ADD THE MISSING MODULES STRUCTURE TO BULK ENDPOINT
-                        device_info["modules"] = {
-                            "system": {
-                                "operatingSystem": {
-                                    "name": os_data.get("name"),
-                                    "build": os_data.get("build"), 
-                                    "major": os_data.get("major"),
-                                    "minor": os_data.get("minor"),
-                                    "patch": os_data.get("patch"),
-                                    "edition": os_data.get("edition"),
-                                    "version": os_data.get("version"),
-                                    "featureUpdate": os_data.get("featureUpdate"),
-                                    "displayVersion": os_data.get("displayVersion"),
-                                    "architecture": os_data.get("architecture"),
-                                    "locale": os_data.get("locale"),
-                                    "timeZone": os_data.get("timeZone"),
-                                    "installDate": os_data.get("installDate")
+        for i, row in enumerate(rows):
+            print(f"[DEBUG] Processing row {i+1}/{len(rows)}")
+            try:
+                device_id, device_uuid, device_name, serial_number, last_seen, created_at, status, model, manufacturer, os, os_name, os_version, system_data = row
+                
+                print(f"[DEBUG] Row {i+1}: serial={serial_number}, uuid={device_uuid}, name={device_name}")
+                
+                # Build basic device info
+                device_info = {
+                    "serialNumber": serial_number or str(device_id),
+                    "deviceId": device_uuid or str(device_id),
+                    "deviceName": device_name or serial_number or str(device_id),
+                    "lastSeen": last_seen.isoformat() if last_seen else None,
+                    "createdAt": created_at.isoformat() if created_at else None,
+                    "status": status or "online",
+                    "model": model or "Unknown",
+                    "manufacturer": manufacturer or "Unknown",
+                    "platform": "Unknown",  # Will be set from system data
+                    "os_version": "Unknown"  # Will be set from system data
+                }
+                
+                print(f"[DEBUG] Row {i+1}: Basic device info created")
+                
+                # Add complete modules structure like individual device API
+                if system_data:
+                    print(f"[DEBUG] Row {i+1}: Processing system data")
+                    print(f"[DEBUG] Row {i+1}: Raw system data type: {type(system_data)}")
+                    try:
+                        system_json = json.loads(system_data) if isinstance(system_data, str) else system_data
+                        print(f"[DEBUG] Row {i+1}: Parsed system JSON keys: {list(system_json.keys()) if isinstance(system_json, dict) else 'Not a dict'}")
+                        
+                        # Extract operating system data
+                        os_data = None
+                        if isinstance(system_json, dict) and "operatingSystem" in system_json:
+                            os_data = system_json["operatingSystem"]
+                            print(f"[DEBUG] Row {i+1}: Found operatingSystem in system data")
+                        elif isinstance(system_json, list) and len(system_json) > 0:
+                            # Check if system data is an array
+                            first_item = system_json[0]
+                            if isinstance(first_item, dict) and "operatingSystem" in first_item:
+                                os_data = first_item["operatingSystem"]
+                                print(f"[DEBUG] Row {i+1}: Found operatingSystem in system data array")
+                        
+                        print(f"[DEBUG] Row {i+1}: OS data: {os_data if os_data else 'None'}")
+                        
+                        if os_data:
+                            # Add complete modules structure 
+                            device_info["modules"] = {
+                                "system": {
+                                    "operatingSystem": {
+                                        "name": os_data.get("name"),
+                                        "build": os_data.get("build"), 
+                                        "major": os_data.get("major"),
+                                        "minor": os_data.get("minor"),
+                                        "patch": os_data.get("patch"),
+                                        "edition": os_data.get("edition"),
+                                        "version": os_data.get("version"),
+                                        "featureUpdate": os_data.get("featureUpdate"),
+                                        "displayVersion": os_data.get("displayVersion"),
+                                        "architecture": os_data.get("architecture"),
+                                        "locale": os_data.get("locale"),
+                                        "timeZone": os_data.get("timeZone"),
+                                        "installDate": os_data.get("installDate")
+                                    }
                                 }
                             }
-                        }
-                        
-                        # Set platform based on OS name for frontend compatibility  
-                        os_name = os_data.get("name", "").lower()
-                        if "windows" in os_name:
-                            device_info["platform"] = "Windows"
-                        elif "mac" in os_name or "darwin" in os_name:
-                            device_info["platform"] = "macOS"
-                        else:
-                            device_info["platform"] = "Unknown"
-                        
-                except Exception as e:
-                    logger.warning(f"Failed to parse system data for {serial_number}: {e}")
-            
-            devices.append(device_info)
+                            
+                            # Set platform based on OS name
+                            os_name_lower = (os_data.get("name") or "").lower()
+                            if "windows" in os_name_lower:
+                                device_info["platform"] = "Windows"
+                            elif "mac" in os_name_lower or "darwin" in os_name_lower:
+                                device_info["platform"] = "macOS"
+                            elif "linux" in os_name_lower:
+                                device_info["platform"] = "Linux"
+                            else:
+                                device_info["platform"] = os_data.get("name", "Unknown")
+                            
+                            # Set os_version from displayVersion (Windows) or version (other)
+                            if os_data.get("displayVersion"):
+                                device_info["os_version"] = os_data.get("displayVersion")
+                            elif os_data.get("version"):
+                                device_info["os_version"] = os_data.get("version")
+                            elif os_data.get("major") is not None:
+                                # macOS style: major.minor.patch
+                                major = os_data.get("major", 0)
+                                minor = os_data.get("minor", 0) 
+                                patch = os_data.get("patch", 0)
+                                device_info["os_version"] = f"{major}.{minor}.{patch}"
+                            
+                            print(f"[DEBUG] Row {i+1}: Updated platform to {device_info['platform']} and os_version to {device_info['os_version']}")
+                            
+                    except Exception as e:
+                        print(f"[ERROR] Row {i+1}: Failed to parse system data: {e}")
+                else:
+                    print(f"[DEBUG] Row {i+1}: No system data")
+                
+                devices.append(device_info)
+                print(f"[DEBUG] Row {i+1}: Device added successfully")
+                
+            except Exception as e:
+                print(f"[ERROR] Row {i+1}: Failed to process device row: {e}")
+                continue
+        
+        print(f"[DEBUG] Successfully processed {len(devices)} devices")
         
         return {
-            "success": True,
             "devices": devices,
-            "count": len(devices)
+            "total": len(devices),
+            "message": f"Successfully retrieved {len(devices)} devices"
         }
         
     except Exception as e:
+        print(f"[ERROR] get_all_devices failed: {e}")
         logger.error(f"Failed to retrieve devices: {e}")
         raise HTTPException(status_code=500, detail=f"Failed to retrieve devices: {str(e)}")
 
@@ -328,32 +344,32 @@ async def get_device_by_serial(serial_number: str):
     """
     Get individual device details with all modules.
     
-    🚨 FIXED: Uses serialNumber consistently as primary identifier
+    Uses serialNumber consistently as primary identifier
     """
     try:
         conn = get_db_connection()
         cursor = conn.cursor()
         
-        # 🚨 FIXED: Query uses serial_number only (no device_id confusion)
+        # Query uses correct schema columns
         cursor.execute("""
-            SELECT serial_number, device_name, last_seen, status, 
-                   asset_tag, usage, catalog, location, department, created_at
+            SELECT id, device_id, name, serial_number, last_seen, status, 
+                   model, manufacturer, os, os_name, os_version, created_at
             FROM devices 
-            WHERE serial_number = %s
-        """, (serial_number,))
+            WHERE serial_number = %s OR id = %s
+        """, (serial_number, serial_number))
         
         device_row = cursor.fetchone()
         if not device_row:
             conn.close()
             raise HTTPException(status_code=404, detail="Device not found")
         
-        serial_num, device_name, last_seen, status, asset_tag, usage, catalog, location, department, created_at = device_row
+        device_id, device_uuid, device_name, serial_num, last_seen, status, model, manufacturer, os, os_name, os_version, created_at = device_row
         
-        # Get all module data for this device using serialNumber
+        # Get all module data for this device using device ID
         modules = {}
         
         # System module
-        cursor.execute("SELECT data FROM system WHERE device_id = %s", (serial_number,))
+        cursor.execute("SELECT data FROM system WHERE device_id = %s", (device_id,))
         system_row = cursor.fetchone()
         if system_row:
             system_data = json.loads(system_row[0]) if isinstance(system_row[0], str) else system_row[0]
@@ -362,34 +378,33 @@ async def get_device_by_serial(serial_number: str):
             else:
                 modules["system"] = system_data
         
-        # Other modules (applications, hardware, etc.) - all use serialNumber as device_id
+        # Other modules (applications, hardware, etc.) - all use device ID
         module_tables = ["applications", "hardware", "installs", "network", "security", "inventory", "management", "profiles"]
         for table in module_tables:
             try:
-                cursor.execute(f"SELECT data FROM {table} WHERE device_id = %s", (serial_number,))
+                cursor.execute(f"SELECT data FROM {table} WHERE device_id = %s", (device_id,))
                 module_row = cursor.fetchone()
                 if module_row:
                     module_data = json.loads(module_row[0]) if isinstance(module_row[0], str) else module_row[0]
                     modules[table] = module_data
             except Exception as e:
-                logger.warning(f"Failed to get {table} data for {serial_number}: {e}")
+                logger.warning(f"Failed to get {table} data for {device_id}: {e}")
         
         conn.close()
         
-        # 🚨 FIXED: Build response with standardized device identification
+        # Build response with correct schema mapping
         response = {
             "success": True,
             "device": {
-                "serialNumber": serial_num,  # PRIMARY KEY
-                "deviceId": serial_num,      # COMPATIBILITY - Maps to serialNumber
-                "deviceName": device_name,
+                "serialNumber": serial_num or device_id,  # PRIMARY KEY
+                "deviceId": device_uuid or device_id,     # COMPATIBILITY
+                "deviceName": device_name or serial_num,  # Use name if available
                 "lastSeen": last_seen.isoformat() if last_seen else None,
                 "status": status or "unknown",
-                "assetTag": asset_tag,
-                "usage": usage,
-                "catalog": catalog,
-                "location": location,
-                "department": department,
+                "model": model,
+                "manufacturer": manufacturer,
+                "platform": os_name or os,
+                "os_version": os_version or "",
                 "createdAt": created_at.isoformat() if created_at else None,
                 "modules": modules
             }
@@ -408,7 +423,7 @@ async def get_events(limit: int = 100):
     """
     Get recent events.
     
-    🚨 FIXED: Uses device_id which corresponds to serialNumber in our schema
+    Uses device_id which corresponds to serialNumber in our schema
     """
     try:
         conn = get_db_connection()
@@ -448,7 +463,7 @@ async def submit_events(request: Request):
     """
     Submit device events and data.
     
-    🚨 FIXED: Event ingestion uses serialNumber as device identifier
+    Event ingestion uses serialNumber as device identifier
     """
     try:
         payload = await request.json()
@@ -481,7 +496,7 @@ async def debug_database():
     """
     Database diagnostic endpoint.
     
-    🚨 FIXED: Shows device identification standard
+    Shows device identification standard
     """
     try:
         conn = get_db_connection()
@@ -503,7 +518,7 @@ async def debug_database():
         
         return {
             "database": "connected",
-            "deviceIdStandard": "serialNumber (UUIDs deprecated)",
+            "deviceIdStandard": "serialNumber",
             "diagnostics": diagnostics,
             "timestamp": datetime.now(timezone.utc).isoformat()
         }
