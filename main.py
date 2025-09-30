@@ -111,8 +111,9 @@ class SystemModule(BaseModel):
     operatingSystem: Optional[DeviceOS] = None
 
 class DeviceModules(BaseModel):
-    """Device modules container."""
+    """Device modules container for bulk endpoint - only system and inventory."""
     system: Optional[SystemModule] = None
+    inventory: Optional[dict] = None  # Inventory data for bulk response
 
 class DeviceInfo(BaseModel):
     """
@@ -123,10 +124,6 @@ class DeviceInfo(BaseModel):
     deviceName: Optional[str] = None
     lastSeen: Optional[str] = None
     status: str = "unknown"
-    model: Optional[str] = None
-    manufacturer: Optional[str] = None
-    platform: Optional[str] = None
-    os_version: Optional[str] = None
     modules: Optional[DeviceModules] = None
 
 class DevicesResponse(BaseModel):
@@ -143,17 +140,19 @@ async def root():
         "version": "1.0.0",
         "status": "running",
         "platform": "FastAPI on Azure Container Apps",
-            "deviceIdStandard": "serialNumber",
-            "endpoints": {
-                "health": "/api/health",
-                "device": "/api/device/{serial_number}",
-                "devices": "/api/devices",
-                "events": "/api/events",
-                "events_submit": "/api/events (POST)",
-                "signalr": "/api/negotiate",
-                "debug_database": "/api/debug/database"
-            }
-        }@app.get("/api/health")
+        "deviceIdStandard": "serialNumber",
+        "endpoints": {
+            "health": "/api/health",
+            "device": "/api/device/{serial_number}",
+            "devices": "/api/devices",
+            "events": "/api/events",
+            "events_submit": "/api/events (POST)",
+            "signalr": "/api/negotiate",
+            "debug_database": "/api/debug/database"
+        }
+    }
+
+@app.get("/api/health")
 async def health_check():
     """Health check endpoint."""
     try:
@@ -192,7 +191,7 @@ async def get_all_devices():
         conn = get_db_connection()
         cursor = conn.cursor()
         
-        # Query uses correct column names and handles NULL serials
+        # CRITICAL FIX: Use same query approach as individual endpoint (which works)
         query = """
         SELECT 
             d.id,
@@ -206,26 +205,23 @@ async def get_all_devices():
             d.manufacturer,
             d.os,
             d.os_name,
-            d.os_version,
-            s.data as system_data
+            d.os_version
         FROM devices d
-        LEFT JOIN system s ON d.id = s.device_id
-        WHERE d.serial_number IS NOT NULL AND d.serial_number != ''
-        ORDER BY d.serial_number ASC
+        ORDER BY COALESCE(d.serial_number, d.device_id) ASC
         """
         
         print(f"[DEBUG] Executing devices query")
         cursor.execute(query)
         rows = cursor.fetchall()
         print(f"[DEBUG] Query returned {len(rows)} rows")
-        conn.close()
+        # Keep connection open for module queries
         
         devices = []
         
         for i, row in enumerate(rows):
             print(f"[DEBUG] Processing row {i+1}/{len(rows)}")
             try:
-                device_id, device_uuid, device_name, serial_number, last_seen, created_at, status, model, manufacturer, os, os_name, os_version, system_data = row
+                device_id, device_uuid, device_name, serial_number, last_seen, created_at, status, model, manufacturer, os, os_name, os_version = row
                 
                 print(f"[DEBUG] Row {i+1}: serial={serial_number}, uuid={device_uuid}, name={device_name}")
                 
@@ -236,89 +232,48 @@ async def get_all_devices():
                     "deviceName": device_name or serial_number or str(device_id),
                     "lastSeen": last_seen.isoformat() if last_seen else None,
                     "createdAt": created_at.isoformat() if created_at else None,
-                    "status": status or "online",
-                    "model": model or "Unknown",
-                    "manufacturer": manufacturer or "Unknown",
-                    "platform": "Unknown",  # Will be set from system data
-                    "os_version": "Unknown"  # Will be set from system data
+                    "status": status or "online"
                 }
                 
                 print(f"[DEBUG] Row {i+1}: Basic device info created")
                 
-                # Add complete modules structure like individual device API
-                if system_data:
-                    print(f"[DEBUG] Row {i+1}: Processing system data")
-                    print(f"[DEBUG] Row {i+1}: Raw system data type: {type(system_data)}")
-                    try:
-                        system_json = json.loads(system_data) if isinstance(system_data, str) else system_data
-                        print(f"[DEBUG] Row {i+1}: Parsed system JSON keys: {list(system_json.keys()) if isinstance(system_json, dict) else 'Not a dict'}")
-                        
-                        # Extract operating system data
-                        os_data = None
-                        if isinstance(system_json, dict) and "operatingSystem" in system_json:
-                            os_data = system_json["operatingSystem"]
-                            print(f"[DEBUG] Row {i+1}: Found operatingSystem in system data")
-                        elif isinstance(system_json, list) and len(system_json) > 0:
-                            # Check if system data is an array
-                            first_item = system_json[0]
-                            if isinstance(first_item, dict) and "operatingSystem" in first_item:
-                                os_data = first_item["operatingSystem"]
-                                print(f"[DEBUG] Row {i+1}: Found operatingSystem in system data array")
-                        
-                        print(f"[DEBUG] Row {i+1}: OS data: {os_data if os_data else 'None'}")
-                        
-                        if os_data:
-                            # Add complete modules structure 
-                            device_info["modules"] = {
-                                "system": {
-                                    "operatingSystem": {
-                                        "name": os_data.get("name"),
-                                        "build": os_data.get("build"), 
-                                        "major": os_data.get("major"),
-                                        "minor": os_data.get("minor"),
-                                        "patch": os_data.get("patch"),
-                                        "edition": os_data.get("edition"),
-                                        "version": os_data.get("version"),
-                                        "featureUpdate": os_data.get("featureUpdate"),
-                                        "displayVersion": os_data.get("displayVersion"),
-                                        "architecture": os_data.get("architecture"),
-                                        "locale": os_data.get("locale"),
-                                        "timeZone": os_data.get("timeZone"),
-                                        "installDate": os_data.get("installDate")
-                                    }
-                                }
-                            }
-                            
-                            # Set platform based on OS name
-                            os_name_lower = (os_data.get("name") or "").lower()
-                            if "windows" in os_name_lower:
-                                device_info["platform"] = "Windows"
-                            elif "mac" in os_name_lower or "darwin" in os_name_lower:
-                                device_info["platform"] = "macOS"
-                            elif "linux" in os_name_lower:
-                                device_info["platform"] = "Linux"
-                            else:
-                                device_info["platform"] = os_data.get("name", "Unknown")
-                            
-                            # Set os_version from displayVersion (Windows) or version (other)
-                            if os_data.get("displayVersion"):
-                                device_info["os_version"] = os_data.get("displayVersion")
-                            elif os_data.get("version"):
-                                device_info["os_version"] = os_data.get("version")
-                            elif os_data.get("major") is not None:
-                                # macOS style: major.minor.patch
-                                major = os_data.get("major", 0)
-                                minor = os_data.get("minor", 0) 
-                                patch = os_data.get("patch", 0)
-                                device_info["os_version"] = f"{major}.{minor}.{patch}"
-                            
-                            print(f"[DEBUG] Row {i+1}: Updated platform to {device_info['platform']} and os_version to {device_info['os_version']}")
-                            
-                    except Exception as e:
-                        print(f"[ERROR] Row {i+1}: Failed to parse system data: {e}")
-                else:
-                    print(f"[DEBUG] Row {i+1}: No system data")
+                # Initialize modules structure
+                device_info["modules"] = {}
                 
+                # CRITICAL FIX: Handle system module first (like individual endpoint)
+                try:
+                    cursor.execute("SELECT data FROM system WHERE device_id = %s", (serial_number,))
+                    system_row = cursor.fetchone()
+                    if system_row:
+                        system_data = json.loads(system_row[0]) if isinstance(system_row[0], str) else system_row[0]
+                        if isinstance(system_data, list) and len(system_data) > 0:
+                            device_info["modules"]["system"] = system_data[0]
+                        else:
+                            device_info["modules"]["system"] = system_data
+                        print(f"[DEBUG] Row {i+1}: Added system module")
+                except Exception as e:
+                    print(f"[ERROR] Row {i+1}: Failed to get system data for {serial_number}: {e}")
+                
+                # BULK ENDPOINT OPTIMIZATION: Only fetch inventory module (not all 8 modules)
+                try:
+                    cursor.execute("SELECT data FROM inventory WHERE device_id = %s", (serial_number,))
+                    inventory_row = cursor.fetchone()
+                    
+                    if inventory_row:
+                        inventory_data = json.loads(inventory_row[0]) if isinstance(inventory_row[0], str) else inventory_row[0]
+                        device_info["modules"]["inventory"] = inventory_data
+                        
+                        # Update device name from inventory if available
+                        if isinstance(inventory_data, dict) and inventory_data.get("deviceName") and not device_name:
+                            device_info["deviceName"] = inventory_data.get("deviceName")
+                        
+                        print(f"[DEBUG] Row {i+1}: Added inventory module")
+                    else:
+                        print(f"[DEBUG] Row {i+1}: No inventory data found")
+                except Exception as e:
+                    print(f"[ERROR] Row {i+1}: Failed to get inventory data for {serial_number}: {e}")
+                
+                # All module processing is now done above using individual endpoint approach
                 devices.append(device_info)
                 print(f"[DEBUG] Row {i+1}: Device added successfully")
                 
@@ -327,6 +282,8 @@ async def get_all_devices():
                 continue
         
         print(f"[DEBUG] Successfully processed {len(devices)} devices")
+        
+        conn.close()  # Close connection after all processing
         
         return {
             "devices": devices,
@@ -368,8 +325,8 @@ async def get_device_by_serial(serial_number: str):
         # Get all module data for this device using device ID
         modules = {}
         
-        # System module
-        cursor.execute("SELECT data FROM system WHERE device_id = %s", (device_id,))
+        # System module - use serial number as device_id 
+        cursor.execute("SELECT data FROM system WHERE device_id = %s", (serial_num,))
         system_row = cursor.fetchone()
         if system_row:
             system_data = json.loads(system_row[0]) if isinstance(system_row[0], str) else system_row[0]
@@ -378,17 +335,18 @@ async def get_device_by_serial(serial_number: str):
             else:
                 modules["system"] = system_data
         
-        # Other modules (applications, hardware, etc.) - all use device ID
+        # CRITICAL FIX: Use serial number for module queries (module tables use serial as device_id)
         module_tables = ["applications", "hardware", "installs", "network", "security", "inventory", "management", "profiles"]
         for table in module_tables:
             try:
-                cursor.execute(f"SELECT data FROM {table} WHERE device_id = %s", (device_id,))
+                # Use serial_number as device_id since module tables store serial numbers
+                cursor.execute(f"SELECT data FROM {table} WHERE device_id = %s", (serial_num,))
                 module_row = cursor.fetchone()
                 if module_row:
                     module_data = json.loads(module_row[0]) if isinstance(module_row[0], str) else module_row[0]
                     modules[table] = module_data
             except Exception as e:
-                logger.warning(f"Failed to get {table} data for {device_id}: {e}")
+                logger.warning(f"Failed to get {table} data for {serial_num}: {e}")
         
         conn.close()
         
@@ -536,10 +494,10 @@ async def not_found_handler(request: Request, exc: HTTPException):
     )
 
 @app.exception_handler(500)
-async def internal_error_handler(request: Request, exc: HTTPException):
+async def internal_error_handler(request: Request, exc: Exception):
     return JSONResponse(
         status_code=500,
-        content={"error": "Internal server error", "detail": exc.detail}
+        content={"error": "Internal server error", "detail": str(exc)}
     )
 
 if __name__ == "__main__":
