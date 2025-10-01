@@ -435,26 +435,210 @@ async def get_events(limit: int = 100):
 @app.post("/api/events")
 async def submit_events(request: Request):
     """
-    Submit device events and data.
+    Submit device events and unified module data.
     
-    Event ingestion uses serialNumber as device identifier
+    This endpoint handles:
+    - Device registration/update
+    - Module data storage (system, hardware, installs, network, etc.)
+    - Event creation for tracking
+    
+    Expected payload structure:
+    {
+        "metadata": {
+            "deviceId": "UUID",
+            "serialNumber": "SERIAL",
+            "collectedAt": "ISO8601",
+            "clientVersion": "version",
+            "platform": "Windows|macOS",
+            "collectionType": "Full|Single",
+            "enabledModules": ["system", "hardware", ...]
+        },
+        "events": [...],  # Optional event messages
+        "system": {...},   # Module data (top-level keys)
+        "hardware": {...},
+        "installs": {...},
+        ...
+    }
     """
     try:
         payload = await request.json()
         
-        # Process event submission
-        # This would contain the logic for ingesting device events
-        # For now, return success
+        # Extract metadata
+        metadata = payload.get('metadata', {})
+        device_uuid = metadata.get('deviceId', 'unknown-device')
+        serial_number = metadata.get('serialNumber', 'unknown-serial')
+        collected_at = metadata.get('collectedAt', datetime.now(timezone.utc).isoformat())
+        client_version = metadata.get('clientVersion', 'unknown')
+        platform = metadata.get('platform', 'Unknown')
+        collection_type = metadata.get('collectionType', 'Full')
+        enabled_modules = metadata.get('enabledModules', [])
+        
+        # Validate required fields
+        if device_uuid == 'unknown-device' or serial_number == 'unknown-serial':
+            raise HTTPException(
+                status_code=400,
+                detail="Both deviceId (UUID) and serialNumber are required in metadata"
+            )
+        
+        logger.info(f"Processing unified payload for device {serial_number} (UUID: {device_uuid})")
+        logger.info(f"Collection type: {collection_type}, Enabled modules: {enabled_modules}")
+        
+        # Connect to database
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        
+        # 1. UPSERT device record
+        try:
+            # Check if device exists
+            cursor.execute(
+                "SELECT id FROM devices WHERE serial_number = %s",
+                (serial_number,)
+            )
+            device_exists = cursor.fetchone()
+            
+            if device_exists:
+                # Update existing device
+                cursor.execute("""
+                    UPDATE devices 
+                    SET device_id = %s, last_seen = %s, updated_at = %s
+                    WHERE serial_number = %s
+                """, (device_uuid, collected_at, datetime.now(timezone.utc), serial_number))
+                logger.info(f"Updated existing device: {serial_number}")
+            else:
+                # Insert new device
+                # NOTE: devices.id is VARCHAR and equals serial_number (per schema design)
+                # Set name to 'Unknown' as placeholder (will be populated from system module data)
+                cursor.execute("""
+                    INSERT INTO devices (id, device_id, serial_number, name, status, last_seen, created_at, updated_at)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                """, (serial_number, device_uuid, serial_number, 'Unknown', 'online', collected_at, datetime.now(timezone.utc), datetime.now(timezone.utc)))
+                logger.info(f"Created new device: {serial_number}")
+            
+            conn.commit()
+        except Exception as device_error:
+            logger.error(f"Device upsert failed: {device_error}")
+            conn.rollback()
+            raise
+        
+        # 2. Process and store module data
+        modules_processed = []
+        module_tables = {
+            'system': 'system',
+            'hardware': 'hardware',
+            'network': 'network',
+            'installs': 'installs',
+            'security': 'security',
+            'applications': 'applications',
+            'inventory': 'inventory',
+            'management': 'management',
+            'profiles': 'profiles',
+            'displays': 'displays',
+            'printers': 'printers'
+        }
+        
+        # Get modules from payload (could be at top level or nested under 'modules' key)
+        modules_data = payload.get('modules', payload)
+        
+        for module_name, table_name in module_tables.items():
+            if module_name in modules_data and modules_data[module_name]:
+                try:
+                    module_data = modules_data[module_name]
+                    
+                    # Check if module record exists (device_id in module tables = serial_number per schema)
+                    cursor.execute(
+                        f"SELECT id FROM {table_name} WHERE device_id = %s",
+                        (serial_number,)
+                    )
+                    module_exists = cursor.fetchone()
+                    
+                    # Store as JSONB
+                    module_json = json.dumps(module_data)
+                    
+                    if module_exists:
+                        # Update existing module
+                        cursor.execute(f"""
+                            UPDATE {table_name}
+                            SET data = %s::jsonb, collected_at = %s, updated_at = %s
+                            WHERE device_id = %s
+                        """, (module_json, collected_at, datetime.now(timezone.utc), serial_number))
+                    else:
+                        # Insert new module record
+                        # NOTE: device_id column references devices.id which equals serial_number
+                        cursor.execute(f"""
+                            INSERT INTO {table_name} (device_id, data, collected_at, created_at, updated_at)
+                            VALUES (%s, %s::jsonb, %s, %s, %s)
+                        """, (serial_number, module_json, collected_at, datetime.now(timezone.utc), datetime.now(timezone.utc)))
+                    
+                    conn.commit()
+                    modules_processed.append(module_name)
+                    logger.info(f"Stored {module_name} module for device {serial_number}")
+                    
+                except Exception as module_error:
+                    logger.error(f"Failed to store {module_name} module: {module_error}")
+                    conn.rollback()
+                    continue
+        
+        # 3. Store events from payload
+        events_stored = 0
+        payload_events = payload.get('events', [])
+        
+        for event in payload_events:
+            try:
+                event_type = event.get('eventType', 'info')
+                message = event.get('message', 'Event from device')
+                details = json.dumps(event.get('details', {}))
+                
+                # NOTE: events.device_id references devices.id which equals serial_number
+                cursor.execute("""
+                    INSERT INTO events (device_id, event_type, message, details, timestamp, created_at)
+                    VALUES (%s, %s, %s, %s::jsonb, %s, %s)
+                """, (serial_number, event_type, message, details, collected_at, datetime.now(timezone.utc)))
+                
+                events_stored += 1
+            except Exception as event_error:
+                logger.error(f"Failed to store event: {event_error}")
+                continue
+        
+        # 4. Create a system event for the data collection itself
+        try:
+            collection_message = f"Data collection: {collection_type} ({len(modules_processed)} modules)"
+            collection_details = json.dumps({
+                'collection_type': collection_type,
+                'modules_processed': modules_processed,
+                'client_version': client_version,
+                'platform': platform
+            })
+            
+            # NOTE: events.device_id references devices.id which equals serial_number
+            cursor.execute("""
+                INSERT INTO events (device_id, event_type, message, details, timestamp, created_at)
+                VALUES (%s, 'info', %s, %s::jsonb, %s, %s)
+            """, (serial_number, collection_message, collection_details, collected_at, datetime.now(timezone.utc)))
+            
+            events_stored += 1
+        except Exception as system_event_error:
+            logger.error(f"Failed to create system event: {system_event_error}")
+        
+        conn.commit()
+        conn.close()
+        
+        logger.info(f"✅ Successfully processed device {serial_number}: {len(modules_processed)} modules, {events_stored} events")
         
         return {
             "success": True,
-            "message": "Events processed successfully",
+            "message": f"Complete data storage: {len(modules_processed)} modules, {events_stored} events",
+            "device_id": serial_number,
+            "serial_number": serial_number,
+            "modules_processed": modules_processed,
+            "events_stored": events_stored,
             "timestamp": datetime.now(timezone.utc).isoformat(),
-            "deviceIdStandard": "serialNumber"
+            "internal_uuid": device_uuid
         }
         
+    except HTTPException:
+        raise
     except Exception as e:
-        logger.error(f"Failed to submit events: {e}")
+        logger.error(f"Failed to submit events: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"Failed to process events: {str(e)}")
 
 @app.get("/api/negotiate")
