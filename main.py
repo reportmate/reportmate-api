@@ -117,21 +117,14 @@ class DeviceModules(BaseModel):
 
 class DeviceInfo(BaseModel):
     """
-    Device information with database schema mapping
+    Device information with database schema mapping.
+    All inventory and system details are in nested modules.
+    Frontend calculates status from lastSeen.
     """
     serialNumber: str  # PRIMARY KEY - Always use this
     deviceId: str      # UUID from device_id column
     deviceName: Optional[str] = None
     lastSeen: Optional[str] = None
-    status: str = "unknown"
-    # Inventory fields extracted to top level
-    assetTag: Optional[str] = None
-    usage: Optional[str] = None
-    catalog: Optional[str] = None
-    location: Optional[str] = None
-    department: Optional[str] = None
-    # Additional fields
-    platform: Optional[str] = None
     createdAt: Optional[str] = None
     registrationDate: Optional[str] = None
     modules: Optional[DeviceModules] = None
@@ -235,16 +228,14 @@ async def get_all_devices():
                 
                 print(f"[DEBUG] Row {i+1}: serial={serial_number}, uuid={device_uuid}, name={device_name}")
                 
-                # Build basic device info
+                # Build basic device info (no inventory duplication)
                 device_info = {
                     "serialNumber": serial_number or str(device_id),
                     "deviceId": device_uuid or str(device_id),
                     "deviceName": device_name or serial_number or str(device_id),
                     "lastSeen": last_seen.isoformat() if last_seen else None,
-                    "createdAt": created_at.isoformat() if last_seen else None,
-                    "registrationDate": created_at.isoformat() if created_at else None,  # Alias for UI clarity
-                    # NO status field - let frontend calculate using device-status.ts
-                    # Don't initialize inventory fields - add them only if they exist
+                    "createdAt": created_at.isoformat() if created_at else None,
+                    "registrationDate": created_at.isoformat() if created_at else None,
                 }
                 
                 print(f"[DEBUG] Row {i+1}: Basic device info created")
@@ -263,12 +254,6 @@ async def get_all_devices():
                         else:
                             device_info["modules"]["system"] = system_data
                         print(f"[DEBUG] Row {i+1}: Added system module")
-                        
-                        # Extract platform from system module
-                        system_info = device_info["modules"]["system"]
-                        if isinstance(system_info, dict) and "operatingSystem" in system_info:
-                            os_info = system_info["operatingSystem"]
-                            device_info["platform"] = os_info.get("name", "")
                 except Exception as e:
                     print(f"[ERROR] Row {i+1}: Failed to get system data for {serial_number}: {e}")
                 
@@ -379,43 +364,22 @@ async def get_device_by_serial(serial_number: str):
         
         conn.close()
         
-        # Extract top-level fields from inventory module
-        inventory_fields = {}
+        # Update device name from inventory if available (convenience only)
         if "inventory" in modules and isinstance(modules["inventory"], dict):
-            inv = modules["inventory"]
-            inventory_fields = {
-                "assetTag": inv.get("assetTag", ""),
-                "usage": inv.get("usage", ""),
-                "catalog": inv.get("catalog", ""),
-                "location": inv.get("location", ""),
-                "department": inv.get("department", "")
-            }
-            # Update device name from inventory if available
-            if inv.get("deviceName"):
-                device_name = inv.get("deviceName")
+            inv_device_name = modules["inventory"].get("deviceName")
+            if inv_device_name:
+                device_name = inv_device_name
         
-        # Extract platform from system module
-        platform = os_name or os
-        if "system" in modules and isinstance(modules["system"], dict):
-            if "operatingSystem" in modules["system"]:
-                platform = modules["system"]["operatingSystem"].get("name", platform)
-        
-        # Build response with correct schema mapping
+        # Build response with clean schema (no inventory duplication)
         response = {
             "success": True,
             "device": {
-                "serialNumber": serial_num or device_id,  # PRIMARY KEY
-                "deviceId": device_uuid or device_id,     # COMPATIBILITY
-                "deviceName": device_name or serial_num,  # Use name if available
+                "serialNumber": serial_num or device_id,
+                "deviceId": device_uuid or device_id,
+                "deviceName": device_name or serial_num,
                 "lastSeen": last_seen.isoformat() if last_seen else None,
                 "createdAt": created_at.isoformat() if created_at else None,
-                "registrationDate": created_at.isoformat() if created_at else None,  # Alias for UI clarity
-                # NO status field - let frontend calculate using device-status.ts
-                "model": model,
-                "manufacturer": manufacturer,
-                "platform": platform,
-                "os_version": os_version or "",
-                **inventory_fields,  # Spread inventory fields at top level
+                "registrationDate": created_at.isoformat() if created_at else None,
                 "modules": modules
             }
         }
