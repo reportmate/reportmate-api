@@ -360,19 +360,31 @@ async def get_device_by_serial(serial_number: str):
 @app.get("/api/events")
 async def get_events(limit: int = 100):
     """
-    Get recent events.
+    Get recent events with device names (optimized for dashboard).
     
-    Uses device_id which corresponds to serialNumber in our schema.
-    NOTE: Details/payload is NOT included here for performance - use /api/events/{id}/payload to lazy-load.
+    Returns only 4 essential fields per event: type, device, message, time
+    Uses JOIN to get device names in single query for maximum performance.
+    NOTE: Details/payload is NOT included here - use /api/events/{id}/payload to lazy-load.
     """
     try:
         conn = get_db_connection()
         cursor = conn.cursor()
         
+        # JOIN with inventory to get device names in single query
+        # Return only 4 fields needed for dashboard Recent Events widget
+        # Note: device_id in both tables IS the serial number
+        # deviceName is stored in inventory.data JSONB column
         cursor.execute("""
-            SELECT id, device_id, event_type, message, timestamp, created_at
-            FROM events 
-            ORDER BY created_at DESC 
+            SELECT 
+                e.id,
+                e.device_id,
+                i.data->>'deviceName' as device_name,
+                e.event_type,
+                e.message,
+                e.timestamp
+            FROM events e
+            LEFT JOIN inventory i ON e.device_id = i.device_id
+            ORDER BY e.created_at DESC 
             LIMIT %s
         """, (limit,))
         
@@ -381,15 +393,19 @@ async def get_events(limit: int = 100):
         
         events = []
         for row in rows:
-            event_id, device_id, event_type, message, timestamp, created_at = row
+            event_id, device_id, device_name, event_type, message, timestamp = row
             events.append({
+                # 4 essential fields for dashboard
                 "id": event_id,
-                "serialNumber": device_id,  # device_id in events table IS the serialNumber
-                "deviceId": device_id,      # COMPATIBILITY
+                "device": device_id,  # Serial number (used for links)
+                "deviceName": device_name or device_id,  # Friendly name from inventory
+                "kind": event_type,  # Event type (success/warning/error/info)
+                "message": message,  # User-friendly message
+                "ts": timestamp.isoformat() if timestamp else None,  # Timestamp
+                # Legacy compatibility fields (minimal)
+                "serialNumber": device_id,
                 "eventType": event_type,
-                "message": message,
-                "timestamp": timestamp.isoformat() if timestamp else None,
-                "createdAt": created_at.isoformat() if created_at else None
+                "timestamp": timestamp.isoformat() if timestamp else None
             })
         
         return {"events": events, "total": len(events)}
@@ -447,6 +463,11 @@ async def submit_events(request: Request):
     - Device registration/update
     - Module data storage (system, hardware, installs, network, etc.)
     - Event creation for tracking
+    
+    CRITICAL EVENT TYPE VALIDATION:
+    - Events containing 'installs' module MUST use event types: 'success', 'warning', or 'error'
+    - Other event types ('info', 'system') are NOT allowed for installs-related events
+    - This ensures dashboard displays accurate install status information
     
     Expected payload structure:
     {
@@ -584,30 +605,49 @@ async def submit_events(request: Request):
                     conn.rollback()
                     continue
         
-        # 3. Store events from payload
+        # 3. Store events from payload with validation
         events_stored = 0
         payload_events = payload.get('events', [])
         
+        # Check if installs module is present in payload
+        has_installs_module = 'installs' in modules_data and modules_data['installs']
+        
         for event in payload_events:
             try:
-                event_type = event.get('eventType', 'info')
+                event_type = event.get('eventType', 'info').lower()  # Normalize to lowercase
                 message = event.get('message', 'Event from device')
-                details = json.dumps(event.get('details', {}))
+                details = event.get('details', {})
+                
+                # VALIDATION: Events containing installs module MUST be success/warning/error
+                if has_installs_module or (isinstance(details, dict) and details.get('module_status') in ['success', 'warning', 'error']):
+                    allowed_types = {'success', 'warning', 'error'}
+                    if event_type not in allowed_types:
+                        logger.warning(f"Invalid event type '{event_type}' for installs module event, defaulting to 'info'")
+                        # For installs events with invalid type, use 'info' but log the issue
+                        # This ensures backward compatibility while flagging the problem
+                        if event_type not in {'info', 'system'}:
+                            event_type = 'warning'  # Default to warning for installs-related events
+                
+                # Store details as JSON
+                details_json = json.dumps(details)
                 
                 # NOTE: events.device_id references devices.id which equals serial_number
                 cursor.execute("""
                     INSERT INTO events (device_id, event_type, message, details, timestamp, created_at)
                     VALUES (%s, %s, %s, %s::jsonb, %s, %s)
-                """, (serial_number, event_type, message, details, collected_at, datetime.now(timezone.utc)))
+                """, (serial_number, event_type, message, details_json, collected_at, datetime.now(timezone.utc)))
                 
                 events_stored += 1
+                logger.debug(f"Stored {event_type} event for device {serial_number}: {message}")
+                
             except Exception as event_error:
                 logger.error(f"Failed to store event: {event_error}")
                 continue
         
         # 4. ONLY create a system event if NO events were sent in payload
         # This prevents generic "Data collection" messages when client sends better events
-        if events_stored == 0:
+        # SPECIAL CASE: Never create fallback 'info' events when installs module is present
+        if events_stored == 0 and not has_installs_module:
             try:
                 collection_message = f"Data collection: {collection_type} ({len(modules_processed)} modules)"
                 # CRITICAL: Store COMPLETE original payload in details column for full payload retrieval
@@ -634,6 +674,8 @@ async def submit_events(request: Request):
                 logger.info(f"Created fallback system event with full payload (no events in payload)")
             except Exception as system_event_error:
                 logger.error(f"Failed to create system event: {system_event_error}")
+        elif has_installs_module and events_stored == 0:
+            logger.warning(f"⚠️ INSTALLS MODULE PRESENT but NO events sent - this should not happen! Device: {serial_number}")
         else:
             logger.info(f"Skipped system event creation - {events_stored} events already in payload")
         
