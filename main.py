@@ -1,23 +1,12 @@
 #!/usr/bin/env python3
 """
 ReportMate FastAPI Application
-Enterprise-grade device management API with comprehensive data support
-
-Device Management:
-- Standardized device identification using serialNumber as primary key
-- deviceId field maintained for compatibility
-- Consistent database schema across all operations
-- Clean UUID/serialNumber handling
-
-Key Features:
 - Bulk devices endpoint with complete OS data (/api/devices)
 - Individual device details (/api/device/{serial_number})
 - Health monitoring (/api/health)
 - Event ingestion (/api/events)
 - SignalR integration (/api/negotiate)
 - Database diagnostics (/api/debug/database)
-
-Architecture: Professional REST API with standardized device identification
 """
 
 import json
@@ -39,7 +28,7 @@ logger = logging.getLogger(__name__)
 app = FastAPI(
     title="ReportMate API",
     version="1.0.0",
-    description="Professional device management and telemetry API"
+    description="Device management and telemetry API"
 )
 
 # Database connection configuration
@@ -232,7 +221,6 @@ async def get_all_devices():
                 device_info = {
                     "serialNumber": serial_number or str(device_id),
                     "deviceId": device_uuid or str(device_id),
-                    "deviceName": device_name or serial_number or str(device_id),
                     "lastSeen": last_seen.isoformat() if last_seen else None,
                     "createdAt": created_at.isoformat() if created_at else None,
                     "registrationDate": created_at.isoformat() if created_at else None,
@@ -265,23 +253,7 @@ async def get_all_devices():
                     if inventory_row:
                         inventory_data = json.loads(inventory_row[0]) if isinstance(inventory_row[0], str) else inventory_row[0]
                         device_info["modules"]["inventory"] = inventory_data
-                        
-                        # Extract top-level fields from inventory (like individual endpoint)
-                        if isinstance(inventory_data, dict):
-                            # Add all inventory fields to top level (matching individual endpoint behavior)
-                            device_info["assetTag"] = inventory_data.get("assetTag", "")
-                            device_info["usage"] = inventory_data.get("usage", "")
-                            device_info["catalog"] = inventory_data.get("catalog", "")
-                            device_info["location"] = inventory_data.get("location", "")
-                            device_info["department"] = inventory_data.get("department", "")
-                            
-                            # Update device name from inventory if available
-                            if inventory_data.get("deviceName"):
-                                device_info["deviceName"] = inventory_data.get("deviceName")
-                        
-                        print(f"[DEBUG] Extracted inventory: assetTag={device_info.get('assetTag')}, usage={device_info.get('usage')}")
-                        
-                        print(f"[DEBUG] Row {i+1}: Added inventory module with extracted fields")
+                        print(f"[DEBUG] Row {i+1}: Added inventory module")
                     else:
                         print(f"[DEBUG] Row {i+1}: No inventory data found")
                 except Exception as e:
@@ -364,19 +336,12 @@ async def get_device_by_serial(serial_number: str):
         
         conn.close()
         
-        # Update device name from inventory if available (convenience only)
-        if "inventory" in modules and isinstance(modules["inventory"], dict):
-            inv_device_name = modules["inventory"].get("deviceName")
-            if inv_device_name:
-                device_name = inv_device_name
-        
-        # Build response with clean schema (no inventory duplication)
+        # Build response with clean schema (no top-level inventory duplication)
         response = {
             "success": True,
             "device": {
                 "serialNumber": serial_num or device_id,
                 "deviceId": device_uuid or device_id,
-                "deviceName": device_name or serial_num,
                 "lastSeen": last_seen.isoformat() if last_seen else None,
                 "createdAt": created_at.isoformat() if created_at else None,
                 "registrationDate": created_at.isoformat() if created_at else None,
@@ -397,7 +362,8 @@ async def get_events(limit: int = 100):
     """
     Get recent events.
     
-    Uses device_id which corresponds to serialNumber in our schema
+    Uses device_id which corresponds to serialNumber in our schema.
+    NOTE: Details/payload is NOT included here for performance - use /api/events/{id}/payload to lazy-load.
     """
     try:
         conn = get_db_connection()
@@ -431,6 +397,46 @@ async def get_events(limit: int = 100):
     except Exception as e:
         logger.error(f"Failed to get events: {e}")
         raise HTTPException(status_code=500, detail=f"Failed to retrieve events: {str(e)}")
+
+@app.get("/api/events/{event_id}/payload")
+async def get_event_payload(event_id: int):
+    """
+    Get the details/payload for a specific event (lazy-loaded).
+    
+    This endpoint is called when user clicks to expand an event in the dashboard.
+    """
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        
+        cursor.execute("""
+            SELECT details
+            FROM events 
+            WHERE id = %s
+        """, (event_id,))
+        
+        row = cursor.fetchone()
+        conn.close()
+        
+        if not row:
+            raise HTTPException(status_code=404, detail=f"Event {event_id} not found")
+        
+        details = row[0]
+        
+        # If details is a string, try to parse as JSON
+        if isinstance(details, str):
+            try:
+                details = json.loads(details)
+            except json.JSONDecodeError:
+                details = {"raw": details}
+        
+        return {"payload": details or {}}
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Failed to get event payload: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to retrieve event payload: {str(e)}")
 
 @app.post("/api/events")
 async def submit_events(request: Request):
@@ -599,25 +605,37 @@ async def submit_events(request: Request):
                 logger.error(f"Failed to store event: {event_error}")
                 continue
         
-        # 4. Create a system event for the data collection itself
-        try:
-            collection_message = f"Data collection: {collection_type} ({len(modules_processed)} modules)"
-            collection_details = json.dumps({
-                'collection_type': collection_type,
-                'modules_processed': modules_processed,
-                'client_version': client_version,
-                'platform': platform
-            })
-            
-            # NOTE: events.device_id references devices.id which equals serial_number
-            cursor.execute("""
-                INSERT INTO events (device_id, event_type, message, details, timestamp, created_at)
-                VALUES (%s, 'info', %s, %s::jsonb, %s, %s)
-            """, (serial_number, collection_message, collection_details, collected_at, datetime.now(timezone.utc)))
-            
-            events_stored += 1
-        except Exception as system_event_error:
-            logger.error(f"Failed to create system event: {system_event_error}")
+        # 4. ONLY create a system event if NO events were sent in payload
+        # This prevents generic "Data collection" messages when client sends better events
+        if events_stored == 0:
+            try:
+                collection_message = f"Data collection: {collection_type} ({len(modules_processed)} modules)"
+                # CRITICAL: Store COMPLETE original payload in details column for full payload retrieval
+                # Include all metadata, modules, and original request data
+                collection_details = json.dumps({
+                    # Summary fields (for display in list view)
+                    'platform': platform,
+                    'client_version': client_version,
+                    'collection_type': collection_type,
+                    'modules_processed': modules_processed,
+                    # FULL PAYLOAD: Store complete original payload for detailed view
+                    'full_payload': payload,  # Complete original request
+                    'metadata': metadata,      # All metadata from request
+                    'collected_at': collected_at
+                })
+                
+                # NOTE: events.device_id references devices.id which equals serial_number
+                cursor.execute("""
+                    INSERT INTO events (device_id, event_type, message, details, timestamp, created_at)
+                    VALUES (%s, 'info', %s, %s::jsonb, %s, %s)
+                """, (serial_number, collection_message, collection_details, collected_at, datetime.now(timezone.utc)))
+                
+                events_stored += 1
+                logger.info(f"Created fallback system event with full payload (no events in payload)")
+            except Exception as system_event_error:
+                logger.error(f"Failed to create system event: {system_event_error}")
+        else:
+            logger.info(f"Skipped system event creation - {events_stored} events already in payload")
         
         conn.commit()
         conn.close()
