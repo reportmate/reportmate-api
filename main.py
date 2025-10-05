@@ -357,6 +357,337 @@ async def get_device_by_serial(serial_number: str):
         logger.error(f"Failed to get device {serial_number}: {e}")
         raise HTTPException(status_code=500, detail=f"Failed to retrieve device: {str(e)}")
 
+@app.get("/api/devices/applications")
+async def get_bulk_applications(
+    request: Request,
+    deviceNames: Optional[str] = None,
+    applicationNames: Optional[str] = None,
+    publishers: Optional[str] = None,
+    categories: Optional[str] = None,
+    versions: Optional[str] = None,
+    search: Optional[str] = None,
+    installDateFrom: Optional[str] = None,
+    installDateTo: Optional[str] = None,
+    sizeMin: Optional[int] = None,
+    sizeMax: Optional[int] = None,
+    loadAll: bool = False
+):
+    """
+    Bulk applications endpoint with filtering support.
+    
+    Returns flattened list of applications across all devices with filtering.
+    Frontend is responsible for search/filtering logic - this is just data retrieval.
+    """
+    try:
+        logger.info(f"Fetching bulk applications (loadAll={loadAll}, filters={dict(request.query_params)})")
+        
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        
+        # Parse comma-separated filter values
+        device_name_list = deviceNames.split(',') if deviceNames else []
+        app_name_list = applicationNames.split(',') if applicationNames else []
+        publisher_list = publishers.split(',') if publishers else []
+        category_list = categories.split(',') if categories else []
+        version_list = versions.split(',') if versions else []
+        
+        # Build WHERE clause for device filtering
+        where_conditions = ["d.serial_number IS NOT NULL", "d.serial_number NOT LIKE 'TEST-%'", "d.serial_number != 'localhost'"]
+        query_params = []
+        param_index = 1
+        
+        if device_name_list:
+            placeholders = ', '.join([f'${i}' for i in range(param_index, param_index + len(device_name_list) * 3)])
+            where_conditions.append(f"(inv.data->>'deviceName' IN ({placeholders}) OR inv.data->>'computerName' IN ({placeholders}) OR d.serial_number IN ({placeholders}))")
+            query_params.extend(device_name_list * 3)
+            param_index += len(device_name_list) * 3
+        
+        where_clause = ' AND '.join(where_conditions)
+        
+        # Query to get all devices with applications data
+        query = f"""
+        SELECT DISTINCT ON (d.serial_number)
+            d.serial_number,
+            d.device_id,
+            d.last_seen,
+            a.data as applications_data,
+            a.collected_at,
+            inv.data->>'deviceName' as device_name,
+            inv.data->>'computerName' as computer_name,
+            inv.data->>'usage' as usage,
+            inv.data->>'catalog' as catalog,
+            inv.data->>'location' as location,
+            inv.data->>'assetTag' as asset_tag
+        FROM devices d
+        LEFT JOIN applications a ON d.id = a.device_id
+        LEFT JOIN inventory inv ON d.id = inv.device_id
+        WHERE {where_clause}
+            AND a.data IS NOT NULL
+        ORDER BY d.serial_number, a.updated_at DESC
+        """
+        
+        cursor.execute(query, tuple(query_params))
+        rows = cursor.fetchall()
+        conn.close()
+        
+        logger.info(f"Retrieved {len(rows)} devices with applications data")
+        
+        # Process and flatten applications
+        all_applications = []
+        
+        for row in rows:
+            try:
+                serial_number, device_uuid, last_seen, apps_data, collected_at, device_name, computer_name, usage, catalog, location, asset_tag = row
+                
+                device_display_name = device_name or computer_name or serial_number
+                
+                if not apps_data:
+                    continue
+                
+                # Handle different data structures
+                installed_apps = []
+                if isinstance(apps_data, dict):
+                    installed_apps = apps_data.get('installedApplications') or apps_data.get('InstalledApplications') or apps_data.get('installed_applications') or []
+                elif isinstance(apps_data, list):
+                    installed_apps = apps_data
+                
+                # Flatten each application
+                for idx, app in enumerate(installed_apps):
+                    app_name = app.get('name') or app.get('displayName') or 'Unknown Application'
+                    app_publisher = app.get('publisher') or app.get('signed_by') or app.get('vendor') or 'Unknown'
+                    app_category = app.get('category', 'Other')
+                    app_version = app.get('version') or app.get('bundle_version') or 'Unknown'
+                    app_size = app.get('size') or app.get('estimatedSize')
+                    app_install_date = app.get('installDate') or app.get('install_date') or app.get('last_modified')
+                    
+                    # Apply application-level filters (if provided)
+                    if app_name_list and not any(name.lower() in app_name.lower() for name in app_name_list):
+                        continue
+                    if publisher_list and not any(pub.lower() in app_publisher.lower() for pub in publisher_list):
+                        continue
+                    if category_list and app_category not in category_list:
+                        continue
+                    if version_list and app_version not in version_list:
+                        continue
+                    if search and search.lower() not in app_name.lower():
+                        continue
+                    if sizeMin and app_size and app_size < sizeMin:
+                        continue
+                    if sizeMax and app_size and app_size > sizeMax:
+                        continue
+                    
+                    all_applications.append({
+                        'id': f"{device_uuid}_{idx}",
+                        'deviceId': device_uuid,
+                        'deviceName': device_display_name,
+                        'serialNumber': serial_number,
+                        'lastSeen': last_seen.isoformat() if last_seen else None,
+                        'collectedAt': collected_at.isoformat() if collected_at else None,
+                        'name': app_name,
+                        'version': app_version,
+                        'vendor': app_publisher,
+                        'publisher': app_publisher,
+                        'category': app_category,
+                        'installDate': app_install_date,
+                        'size': app_size,
+                        'path': app.get('path') or app.get('install_location'),
+                        'architecture': app.get('architecture', 'Unknown'),
+                        'bundleId': app.get('bundleId') or app.get('bundle_id'),
+                        'usage': usage,
+                        'catalog': catalog,
+                        'location': location,
+                        'assetTag': asset_tag,
+                        'raw': app
+                    })
+            
+            except Exception as e:
+                logger.warning(f"Error processing applications for device {row[0]}: {e}")
+                continue
+        
+        logger.info(f"Processed {len(all_applications)} applications from {len(rows)} devices")
+        
+        return all_applications
+        
+    except Exception as e:
+        logger.error(f"Failed to get bulk applications: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to retrieve bulk applications: {str(e)}")
+
+@app.get("/api/devices/hardware")
+async def get_bulk_hardware():
+    """
+    Bulk hardware endpoint.
+    
+    Returns flattened list of hardware details across all devices.
+    """
+    try:
+        logger.info("Fetching bulk hardware data")
+        
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        
+        query = """
+        SELECT DISTINCT ON (d.serial_number)
+            d.serial_number,
+            d.device_id,
+            d.last_seen,
+            h.data as hardware_data,
+            h.collected_at,
+            s.data as system_data,
+            inv.data->>'deviceName' as device_name,
+            inv.data->>'computerName' as computer_name
+        FROM devices d
+        LEFT JOIN hardware h ON d.id = h.device_id
+        LEFT JOIN system s ON d.id = s.device_id
+        LEFT JOIN inventory inv ON d.id = inv.device_id
+        WHERE d.serial_number IS NOT NULL
+            AND d.serial_number NOT LIKE 'TEST-%'
+            AND h.data IS NOT NULL
+        ORDER BY d.serial_number, h.updated_at DESC
+        """
+        
+        cursor.execute(query)
+        rows = cursor.fetchall()
+        conn.close()
+        
+        logger.info(f"Retrieved {len(rows)} devices with hardware data")
+        
+        # Process hardware data
+        all_hardware = []
+        
+        for row in rows:
+            try:
+                serial_number, device_uuid, last_seen, hardware_data, collected_at, system_data, device_name, computer_name = row
+                
+                device_display_name = device_name or computer_name or serial_number
+                
+                # Extract OS info from system data
+                os_info = {}
+                if system_data:
+                    if isinstance(system_data, list) and len(system_data) > 0:
+                        os_info = system_data[0].get('operatingSystem', {})
+                    elif isinstance(system_data, dict):
+                        os_info = system_data.get('operatingSystem', {})
+                
+                # Extract hardware details
+                hw_details = hardware_data if isinstance(hardware_data, dict) else {}
+                
+                all_hardware.append({
+                    'serialNumber': serial_number,
+                    'deviceId': device_uuid,
+                    'deviceName': device_display_name,
+                    'lastSeen': last_seen.isoformat() if last_seen else None,
+                    'collectedAt': collected_at.isoformat() if collected_at else None,
+                    'manufacturer': hw_details.get('manufacturer') or hw_details.get('systemManufacturer'),
+                    'model': hw_details.get('model') or hw_details.get('systemProductName'),
+                    'cpu': hw_details.get('processor') or hw_details.get('cpu'),
+                    'memory': hw_details.get('totalMemory') or hw_details.get('physicalMemory'),
+                    'storage': hw_details.get('storage') or hw_details.get('drives'),
+                    'gpu': hw_details.get('gpu') or hw_details.get('displayAdapter'),
+                    'osName': os_info.get('name'),
+                    'osVersion': os_info.get('version') or os_info.get('displayVersion'),
+                    'architecture': os_info.get('architecture'),
+                    'raw': hardware_data
+                })
+            
+            except Exception as e:
+                logger.warning(f"Error processing hardware for device {row[0]}: {e}")
+                continue
+        
+        logger.info(f"Processed {len(all_hardware)} hardware records")
+        
+        return all_hardware
+        
+    except Exception as e:
+        logger.error(f"Failed to get bulk hardware: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to retrieve bulk hardware: {str(e)}")
+
+@app.get("/api/devices/installs")
+async def get_bulk_installs():
+    """
+    Bulk installs endpoint for Cimian managed packages.
+    
+    Returns flattened list of managed installs across all devices.
+    """
+    try:
+        logger.info("Fetching bulk installs data")
+        
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        
+        query = """
+        SELECT DISTINCT ON (d.serial_number)
+            d.serial_number,
+            d.device_id,
+            d.last_seen,
+            i.data as installs_data,
+            i.collected_at,
+            inv.data->>'deviceName' as device_name,
+            inv.data->>'computerName' as computer_name,
+            inv.data->>'usage' as usage,
+            inv.data->>'catalog' as catalog,
+            inv.data->>'location' as location
+        FROM devices d
+        LEFT JOIN installs i ON d.id = i.device_id
+        LEFT JOIN inventory inv ON d.id = inv.device_id
+        WHERE d.serial_number IS NOT NULL
+            AND d.serial_number NOT LIKE 'TEST-%'
+            AND i.data IS NOT NULL
+        ORDER BY d.serial_number, i.updated_at DESC
+        """
+        
+        cursor.execute(query)
+        rows = cursor.fetchall()
+        conn.close()
+        
+        logger.info(f"Retrieved {len(rows)} devices with installs data")
+        
+        # Process installs data
+        all_installs = []
+        
+        for row in rows:
+            try:
+                serial_number, device_uuid, last_seen, installs_data, collected_at, device_name, computer_name, usage, catalog, location = row
+                
+                device_display_name = device_name or computer_name or serial_number
+                
+                # Extract Cimian data
+                cimian_data = installs_data.get('cimian', {}) if isinstance(installs_data, dict) else {}
+                managed_items = cimian_data.get('items', [])
+                
+                # Flatten each managed install
+                for idx, item in enumerate(managed_items):
+                    all_installs.append({
+                        'id': f"{device_uuid}_{idx}",
+                        'deviceId': device_uuid,
+                        'deviceName': device_display_name,
+                        'serialNumber': serial_number,
+                        'lastSeen': last_seen.isoformat() if last_seen else None,
+                        'collectedAt': collected_at.isoformat() if collected_at else None,
+                        'itemName': item.get('itemName'),
+                        'currentStatus': item.get('currentStatus'),
+                        'latestVersion': item.get('latestVersion'),
+                        'installedVersion': item.get('installedVersion'),
+                        'installDate': item.get('installDate'),
+                        'lastChecked': item.get('lastChecked'),
+                        'updateAvailable': item.get('updateAvailable'),
+                        'usage': usage,
+                        'catalog': catalog,
+                        'location': location,
+                        'raw': item
+                    })
+            
+            except Exception as e:
+                logger.warning(f"Error processing installs for device {row[0]}: {e}")
+                continue
+        
+        logger.info(f"Processed {len(all_installs)} install records from {len(rows)} devices")
+        
+        return all_installs
+        
+    except Exception as e:
+        logger.error(f"Failed to get bulk installs: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to retrieve bulk installs: {str(e)}")
+
 @app.get("/api/events")
 async def get_events(limit: int = 100):
     """
@@ -453,6 +784,97 @@ async def get_event_payload(event_id: int):
     except Exception as e:
         logger.error(f"Failed to get event payload: {e}")
         raise HTTPException(status_code=500, detail=f"Failed to retrieve event payload: {str(e)}")
+
+@app.get("/api/stats/installs")
+async def get_install_stats():
+    """
+    Get aggregated install statistics for dashboard widgets.
+    
+    Returns pre-computed counts from Cimian installs data without transferring
+    full installs module data for all devices. Optimized for dashboard performance.
+    
+    Returns:
+        {
+            "devicesWithErrors": int,      // Devices with failed/needs_reinstall
+            "devicesWithWarnings": int,    // Devices with pending/updates (no errors)
+            "totalFailedInstalls": int,    // Total count of failed installs
+            "totalWarnings": int,          // Total count of warnings
+            "lastUpdated": str            // ISO8601 timestamp
+        }
+    """
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        
+        # Count devices with install errors from Cimian event logs
+        logger.debug("Counting devices with install errors...")
+        cursor.execute("""
+            SELECT COUNT(DISTINCT i.device_id)
+            FROM installs i
+            CROSS JOIN LATERAL jsonb_array_elements(i.data->'cimian'->'events') as event
+            WHERE event->>'status' IN ('Error', 'Failed')
+               OR event->>'level' = 'ERROR'
+        """)
+        devices_with_errors = cursor.fetchone()[0] or 0
+        logger.debug(f"Devices with errors: {devices_with_errors}")
+        
+        # Count devices with warnings but NO errors from Cimian event logs
+        logger.debug("Counting devices with warnings (excluding devices with errors)...")
+        cursor.execute("""
+            SELECT COUNT(DISTINCT i.device_id)
+            FROM installs i
+            CROSS JOIN LATERAL jsonb_array_elements(i.data->'cimian'->'events') as event
+            WHERE (event->>'status' = 'Warning' OR event->>'level' = 'WARN')
+            AND i.device_id NOT IN (
+                -- Exclude devices that have any errors
+                SELECT DISTINCT device_id
+                FROM installs
+                CROSS JOIN LATERAL jsonb_array_elements(data->'cimian'->'events') as err_event
+                WHERE err_event->>'status' IN ('Error', 'Failed')
+                   OR err_event->>'level' = 'ERROR'
+            )
+        """)
+        devices_with_warnings = cursor.fetchone()[0] or 0
+        logger.debug(f"Devices with warnings: {devices_with_warnings}")
+        
+        # Count total failed install events across all devices
+        logger.debug("Counting total failed installs...")
+        cursor.execute("""
+            SELECT COUNT(*)
+            FROM installs i
+            CROSS JOIN LATERAL jsonb_array_elements(i.data->'cimian'->'events') as event
+            WHERE event->>'status' IN ('Error', 'Failed')
+               OR event->>'level' = 'ERROR'
+        """)
+        total_failed = cursor.fetchone()[0] or 0
+        
+        # Count total warning events across all devices
+        logger.debug("Counting total warnings...")
+        cursor.execute("""
+            SELECT COUNT(*)
+            FROM installs i
+            CROSS JOIN LATERAL jsonb_array_elements(i.data->'cimian'->'events') as event
+            WHERE event->>'status' = 'Warning'
+               OR event->>'level' = 'WARN'
+        """)
+        total_warnings = cursor.fetchone()[0] or 0
+        
+        conn.close()
+        
+        result = {
+            "devicesWithErrors": devices_with_errors,
+            "devicesWithWarnings": devices_with_warnings,
+            "totalFailedInstalls": total_failed,
+            "totalWarnings": total_warnings,
+            "lastUpdated": datetime.now(timezone.utc).isoformat()
+        }
+        
+        logger.info(f"Install stats: {devices_with_errors} errors, {devices_with_warnings} warnings")
+        return result
+        
+    except Exception as e:
+        logger.error(f"Failed to get install stats: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to retrieve install statistics: {str(e)}")
 
 @app.post("/api/events")
 async def submit_events(request: Request):
@@ -650,17 +1072,36 @@ async def submit_events(request: Request):
         if events_stored == 0 and not has_installs_module:
             try:
                 collection_message = f"Data collection: {collection_type} ({len(modules_processed)} modules)"
+                
+                # Sanitize metadata to remove passphrase before storing
+                sanitized_metadata = metadata.copy()
+                if 'additional' in sanitized_metadata and isinstance(sanitized_metadata['additional'], dict):
+                    sanitized_additional = sanitized_metadata['additional'].copy()
+                    # Remove passphrase completely - should NEVER be stored or visible
+                    sanitized_additional.pop('passphrase', None)
+                    sanitized_metadata['additional'] = sanitized_additional
+                
+                # Sanitize full payload to remove passphrase
+                sanitized_payload = payload.copy()
+                if 'metadata' in sanitized_payload and isinstance(sanitized_payload['metadata'], dict):
+                    sanitized_payload_metadata = sanitized_payload['metadata'].copy()
+                    if 'additional' in sanitized_payload_metadata and isinstance(sanitized_payload_metadata['additional'], dict):
+                        sanitized_payload_additional = sanitized_payload_metadata['additional'].copy()
+                        sanitized_payload_additional.pop('passphrase', None)
+                        sanitized_payload_metadata['additional'] = sanitized_payload_additional
+                    sanitized_payload['metadata'] = sanitized_payload_metadata
+                
                 # CRITICAL: Store COMPLETE original payload in details column for full payload retrieval
-                # Include all metadata, modules, and original request data
+                # Include all metadata, modules, and original request data (with passphrase removed)
                 collection_details = json.dumps({
                     # Summary fields (for display in list view)
                     'platform': platform,
                     'client_version': client_version,
                     'collection_type': collection_type,
                     'modules_processed': modules_processed,
-                    # FULL PAYLOAD: Store complete original payload for detailed view
-                    'full_payload': payload,  # Complete original request
-                    'metadata': metadata,      # All metadata from request
+                    # FULL PAYLOAD: Store complete original payload for detailed view (SANITIZED)
+                    'full_payload': sanitized_payload,  # Complete request (passphrase removed)
+                    'metadata': sanitized_metadata,      # All metadata from request (passphrase removed)
                     'collected_at': collected_at
                 })
                 
