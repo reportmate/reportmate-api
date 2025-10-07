@@ -357,6 +357,237 @@ async def get_device_by_serial(serial_number: str):
         logger.error(f"Failed to get device {serial_number}: {e}")
         raise HTTPException(status_code=500, detail=f"Failed to retrieve device: {str(e)}")
 
+
+@app.get("/api/device/{serial_number}/events")
+async def get_device_events(serial_number: str, limit: int = 100):
+    """
+    Get events for a specific device.
+    
+    Returns event history for device activity logging and monitoring.
+    Used by EventsTab for displaying device events.
+    """
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        
+        # Get device record to verify it exists
+        cursor.execute("""
+            SELECT id FROM devices 
+            WHERE serial_number = %s OR id = %s
+        """, (serial_number, serial_number))
+        
+        device_row = cursor.fetchone()
+        if not device_row:
+            conn.close()
+            raise HTTPException(status_code=404, detail="Device not found")
+        
+        device_id = device_row[0]
+        
+        # Get events for this device
+        # NOTE: events.device_id contains the serial_number (same as devices.id)
+        cursor.execute("""
+            SELECT id, event_type, message, details, timestamp, created_at
+            FROM events
+            WHERE device_id = %s
+            ORDER BY timestamp DESC
+            LIMIT %s
+        """, (device_id, limit))
+        
+        events = []
+        for row in cursor.fetchall():
+            event_id, event_type, message, details, timestamp, created_at = row
+            events.append({
+                "id": str(event_id),
+                "kind": event_type,
+                "message": message,
+                "raw": json.loads(details) if isinstance(details, str) else details,
+                "ts": timestamp.isoformat() if timestamp else created_at.isoformat()
+            })
+        
+        conn.close()
+        
+        logger.info(f"Retrieved {len(events)} events for device {serial_number}")
+        
+        return {
+            "success": True,
+            "events": events,
+            "count": len(events)
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Failed to get events for device {serial_number}: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to retrieve events: {str(e)}")
+
+
+@app.get("/api/device/{device_id}/info")
+async def get_device_info_fast(device_id: str):
+    """
+    Fast endpoint returning only InfoTab data for progressive loading.
+    
+    Returns minimal data needed for immediate display:
+    - inventory (device name, serial, etc.)
+    - system basics (OS, uptime)
+    - hardware summary (model, processor)
+    - management status
+    - security features
+    - network hostname
+    
+    This is ~10-20KB vs 100-200KB for full device data
+    Response time: <500ms vs 3-5s for full load
+    """
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        
+        # Get device record
+        cursor.execute("""
+            SELECT id, device_id, serial_number, last_seen, created_at
+            FROM devices 
+            WHERE serial_number = %s OR id = %s
+        """, (device_id, device_id))
+        
+        device_row = cursor.fetchone()
+        if not device_row:
+            conn.close()
+            raise HTTPException(status_code=404, detail="Device not found")
+        
+        _, device_uuid, serial_num, last_seen, created_at = device_row
+        
+        # Get only the modules needed for InfoTab (6 widgets)
+        info_modules = {}
+        
+        # Inventory - Device info widget
+        cursor.execute("SELECT data FROM inventory WHERE device_id = %s", (serial_num,))
+        if row := cursor.fetchone():
+            info_modules["inventory"] = json.loads(row[0]) if isinstance(row[0], str) else row[0]
+        
+        # System - System widget (OS, uptime)
+        cursor.execute("SELECT data FROM system WHERE device_id = %s", (serial_num,))
+        if row := cursor.fetchone():
+            system_data = json.loads(row[0]) if isinstance(row[0], str) else row[0]
+            info_modules["system"] = system_data[0] if isinstance(system_data, list) and len(system_data) > 0 else system_data
+        
+        # Hardware - Hardware widget (model, processor summary)
+        cursor.execute("SELECT data FROM hardware WHERE device_id = %s", (serial_num,))
+        if row := cursor.fetchone():
+            info_modules["hardware"] = json.loads(row[0]) if isinstance(row[0], str) else row[0]
+        
+        # Management - Management widget (MDM status)
+        cursor.execute("SELECT data FROM management WHERE device_id = %s", (serial_num,))
+        if row := cursor.fetchone():
+            info_modules["management"] = json.loads(row[0]) if isinstance(row[0], str) else row[0]
+        
+        # Security - Security widget (TPM, encryption)
+        cursor.execute("SELECT data FROM security WHERE device_id = %s", (serial_num,))
+        if row := cursor.fetchone():
+            info_modules["security"] = json.loads(row[0]) if isinstance(row[0], str) else row[0]
+        
+        # Network - Network widget (hostname, IP)
+        cursor.execute("SELECT data FROM network WHERE device_id = %s", (serial_num,))
+        if row := cursor.fetchone():
+            info_modules["network"] = json.loads(row[0]) if isinstance(row[0], str) else row[0]
+        
+        conn.close()
+        
+        response = {
+            "success": True,
+            "device": {
+                "serialNumber": serial_num,
+                "deviceId": device_uuid,
+                "lastSeen": last_seen.isoformat() if last_seen else None,
+                "createdAt": created_at.isoformat() if created_at else None,
+                "registrationDate": created_at.isoformat() if created_at else None,
+                "modules": info_modules
+            }
+        }
+        
+        logger.info(f"Fast info fetch for {device_id}: {len(json.dumps(response))} bytes")
+        return response
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Failed to get fast info for {device_id}: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to retrieve device info: {str(e)}")
+
+
+@app.get("/api/device/{device_id}/modules/{module_name}")
+async def get_device_module(device_id: str, module_name: str):
+    """
+    Get individual module data for progressive/on-demand loading.
+    
+    Supports all module types:
+    - applications, hardware, installs, network, security
+    - inventory, management, profiles, system
+    
+    Used for:
+    1. Background progressive loading (after fast info load)
+    2. On-demand loading when user clicks tabs
+    """
+    try:
+        # Validate module name
+        valid_modules = [
+            "applications", "hardware", "installs", "network", "security",
+            "inventory", "management", "profiles", "system", "displays",
+            "printers", "peripherals"
+        ]
+        
+        if module_name not in valid_modules:
+            raise HTTPException(status_code=400, detail=f"Invalid module: {module_name}")
+        
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        
+        # Get device serial number
+        cursor.execute("""
+            SELECT serial_number FROM devices 
+            WHERE serial_number = %s OR id = %s
+        """, (device_id, device_id))
+        
+        device_row = cursor.fetchone()
+        if not device_row:
+            conn.close()
+            raise HTTPException(status_code=404, detail="Device not found")
+        
+        serial_num = device_row[0]
+        
+        # Get module data
+        cursor.execute(f"SELECT data FROM {module_name} WHERE device_id = %s", (serial_num,))
+        module_row = cursor.fetchone()
+        
+        conn.close()
+        
+        if not module_row:
+            return {
+                "success": True,
+                "module": module_name,
+                "data": None
+            }
+        
+        module_data = json.loads(module_row[0]) if isinstance(module_row[0], str) else module_row[0]
+        
+        # Handle system module array format
+        if module_name == "system" and isinstance(module_data, list) and len(module_data) > 0:
+            module_data = module_data[0]
+        
+        response = {
+            "success": True,
+            "module": module_name,
+            "data": module_data
+        }
+        
+        logger.info(f"Module fetch {module_name} for {device_id}: {len(json.dumps(response))} bytes")
+        return response
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Failed to get module {module_name} for {device_id}: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to retrieve module: {str(e)}")
+
+
 @app.get("/api/devices/applications")
 async def get_bulk_applications(
     request: Request,
@@ -687,6 +918,555 @@ async def get_bulk_installs():
     except Exception as e:
         logger.error(f"Failed to get bulk installs: {e}")
         raise HTTPException(status_code=500, detail=f"Failed to retrieve bulk installs: {str(e)}")
+
+@app.get("/api/devices/network")
+async def get_bulk_network():
+    """
+    Bulk network endpoint for fleet-wide network overview.
+    
+    Returns devices with network configuration data (interfaces, IPs, MACs, DNS, etc.).
+    Used by /devices/network page for fleet-wide network visibility.
+    """
+    try:
+        logger.info("Fetching bulk network data")
+        
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        
+        query = """
+        SELECT DISTINCT ON (d.serial_number)
+            d.serial_number,
+            d.device_id,
+            d.last_seen,
+            n.data as network_data,
+            n.collected_at,
+            inv.data->>'deviceName' as device_name,
+            inv.data->>'computerName' as computer_name,
+            inv.data->>'usage' as usage,
+            inv.data->>'catalog' as catalog,
+            inv.data->>'location' as location,
+            inv.data->>'assetTag' as asset_tag,
+            sys.data->'operatingSystem'->>'name' as os_name,
+            sys.data->'operatingSystem'->>'version' as os_version,
+            sys.data->'operatingSystem'->>'buildNumber' as build_number,
+            sys.data->>'uptime' as uptime,
+            sys.data->>'bootTime' as boot_time
+        FROM devices d
+        LEFT JOIN network n ON d.id = n.device_id
+        LEFT JOIN inventory inv ON d.id = inv.device_id
+        LEFT JOIN system sys ON d.id = sys.device_id
+        WHERE d.serial_number IS NOT NULL
+            AND d.serial_number NOT LIKE 'TEST-%'
+            AND d.serial_number != 'localhost'
+            AND n.data IS NOT NULL
+        ORDER BY d.serial_number, n.updated_at DESC
+        """
+        
+        cursor.execute(query)
+        rows = cursor.fetchall()
+        conn.close()
+        
+        logger.info(f"Retrieved {len(rows)} devices with network data")
+        
+        # Process devices with network info
+        devices = []
+        
+        for row in rows:
+            try:
+                serial_number, device_uuid, last_seen, network_data, collected_at, device_name, computer_name, usage, catalog, location, asset_tag, os_name, os_version, build_number, uptime, boot_time = row
+                
+                device_obj = {
+                    'id': serial_number,
+                    'deviceId': serial_number,
+                    'deviceName': device_name or computer_name or serial_number,
+                    'serialNumber': serial_number,
+                    'assetTag': asset_tag,
+                    'lastSeen': last_seen.isoformat() if last_seen else None,
+                    'collectedAt': collected_at.isoformat() if collected_at else None,
+                    'operatingSystem': os_name,
+                    'osVersion': os_version,
+                    'buildNumber': build_number,
+                    'uptime': uptime,
+                    'bootTime': boot_time,
+                    'raw': network_data  # Raw network data for extractNetwork()
+                }
+                
+                devices.append(device_obj)
+            
+            except Exception as e:
+                logger.warning(f"Error processing network for device {row[0]}: {e}")
+                continue
+        
+        logger.info(f"Processed {len(devices)} devices with network data")
+        
+        return devices
+        
+    except Exception as e:
+        logger.error(f"Failed to get bulk network: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to retrieve bulk network: {str(e)}")
+
+@app.get("/api/devices/security")
+async def get_bulk_security():
+    """
+    Bulk security endpoint for fleet-wide security overview.
+    
+    Returns devices with security configuration (TPM, BitLocker, EDR, AV, etc.).
+    Used by /devices/security page for fleet-wide security visibility.
+    """
+    try:
+        logger.info("Fetching bulk security data")
+        
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        
+        query = """
+        SELECT DISTINCT ON (d.serial_number)
+            d.serial_number,
+            d.device_id,
+            d.last_seen,
+            sec.data as security_data,
+            sec.collected_at,
+            inv.data->>'deviceName' as device_name,
+            inv.data->>'computerName' as computer_name,
+            inv.data->>'usage' as usage,
+            inv.data->>'catalog' as catalog,
+            inv.data->>'location' as location,
+            inv.data->>'assetTag' as asset_tag
+        FROM devices d
+        LEFT JOIN security sec ON d.id = sec.device_id
+        LEFT JOIN inventory inv ON d.id = inv.device_id
+        WHERE d.serial_number IS NOT NULL
+            AND d.serial_number NOT LIKE 'TEST-%'
+            AND d.serial_number != 'localhost'
+            AND sec.data IS NOT NULL
+        ORDER BY d.serial_number, sec.updated_at DESC
+        """
+        
+        cursor.execute(query)
+        rows = cursor.fetchall()
+        conn.close()
+        
+        logger.info(f"Retrieved {len(rows)} devices with security data")
+        
+        devices = []
+        for row in rows:
+            try:
+                serial_number, device_uuid, last_seen, security_data, collected_at, device_name, computer_name, usage, catalog, location, asset_tag = row
+                
+                devices.append({
+                    'id': serial_number,
+                    'deviceId': serial_number,
+                    'deviceName': device_name or computer_name or serial_number,
+                    'serialNumber': serial_number,
+                    'assetTag': asset_tag,
+                    'lastSeen': last_seen.isoformat() if last_seen else None,
+                    'collectedAt': collected_at.isoformat() if collected_at else None,
+                    'usage': usage,
+                    'catalog': catalog,
+                    'location': location,
+                    'raw': security_data
+                })
+            except Exception as e:
+                logger.warning(f"Error processing security for device {row[0]}: {e}")
+                continue
+        
+        logger.info(f"Processed {len(devices)} devices with security data")
+        return devices
+        
+    except Exception as e:
+        logger.error(f"Failed to get bulk security: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to retrieve bulk security: {str(e)}")
+
+@app.get("/api/devices/profiles")
+async def get_bulk_profiles():
+    """
+    Bulk profiles endpoint for fleet-wide configuration profiles.
+    
+    Returns devices with MDM profiles and configuration policies.
+    Used by /devices/profiles page for fleet-wide profile visibility.
+    """
+    try:
+        logger.info("Fetching bulk profiles data")
+        
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        
+        query = """
+        SELECT DISTINCT ON (d.serial_number)
+            d.serial_number,
+            d.device_id,
+            d.last_seen,
+            p.data as profiles_data,
+            p.collected_at,
+            inv.data->>'deviceName' as device_name,
+            inv.data->>'computerName' as computer_name,
+            inv.data->>'usage' as usage,
+            inv.data->>'catalog' as catalog,
+            inv.data->>'location' as location,
+            inv.data->>'assetTag' as asset_tag
+        FROM devices d
+        LEFT JOIN profiles p ON d.id = p.device_id
+        LEFT JOIN inventory inv ON d.id = inv.device_id
+        WHERE d.serial_number IS NOT NULL
+            AND d.serial_number NOT LIKE 'TEST-%'
+            AND d.serial_number != 'localhost'
+            AND p.data IS NOT NULL
+        ORDER BY d.serial_number, p.updated_at DESC
+        """
+        
+        cursor.execute(query)
+        rows = cursor.fetchall()
+        conn.close()
+        
+        logger.info(f"Retrieved {len(rows)} devices with profiles data")
+        
+        devices = []
+        for row in rows:
+            try:
+                serial_number, device_uuid, last_seen, profiles_data, collected_at, device_name, computer_name, usage, catalog, location, asset_tag = row
+                
+                devices.append({
+                    'id': serial_number,
+                    'deviceId': serial_number,
+                    'deviceName': device_name or computer_name or serial_number,
+                    'serialNumber': serial_number,
+                    'assetTag': asset_tag,
+                    'lastSeen': last_seen.isoformat() if last_seen else None,
+                    'collectedAt': collected_at.isoformat() if collected_at else None,
+                    'usage': usage,
+                    'catalog': catalog,
+                    'location': location,
+                    'raw': profiles_data
+                })
+            except Exception as e:
+                logger.warning(f"Error processing profiles for device {row[0]}: {e}")
+                continue
+        
+        logger.info(f"Processed {len(devices)} devices with profiles data")
+        return devices
+        
+    except Exception as e:
+        logger.error(f"Failed to get bulk profiles: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to retrieve bulk profiles: {str(e)}")
+
+@app.get("/api/devices/management")
+async def get_bulk_management():
+    """
+    Bulk management endpoint for fleet-wide MDM status.
+    
+    Returns devices with MDM enrollment status and management configuration.
+    Used by /devices/management page for fleet-wide MDM visibility.
+    """
+    try:
+        logger.info("Fetching bulk management data")
+        
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        
+        query = """
+        SELECT DISTINCT ON (d.serial_number)
+            d.serial_number,
+            d.device_id,
+            d.last_seen,
+            m.data as management_data,
+            m.collected_at,
+            inv.data->>'deviceName' as device_name,
+            inv.data->>'computerName' as computer_name,
+            inv.data->>'usage' as usage,
+            inv.data->>'catalog' as catalog,
+            inv.data->>'location' as location,
+            inv.data->>'assetTag' as asset_tag
+        FROM devices d
+        LEFT JOIN management m ON d.id = m.device_id
+        LEFT JOIN inventory inv ON d.id = inv.device_id
+        WHERE d.serial_number IS NOT NULL
+            AND d.serial_number NOT LIKE 'TEST-%'
+            AND d.serial_number != 'localhost'
+            AND m.data IS NOT NULL
+        ORDER BY d.serial_number, m.updated_at DESC
+        """
+        
+        cursor.execute(query)
+        rows = cursor.fetchall()
+        conn.close()
+        
+        logger.info(f"Retrieved {len(rows)} devices with management data")
+        
+        devices = []
+        for row in rows:
+            try:
+                serial_number, device_uuid, last_seen, management_data, collected_at, device_name, computer_name, usage, catalog, location, asset_tag = row
+                
+                # Extract key management fields from the raw data for easy frontend access
+                mdm_enrollment = management_data.get('mdmEnrollment', {}) if management_data else {}
+                device_details = management_data.get('deviceDetails', {}) if management_data else {}
+                tenant_details = management_data.get('tenantDetails', {}) if management_data else {}
+                
+                # Determine enrollment status from isEnrolled boolean
+                is_enrolled = mdm_enrollment.get('isEnrolled', False)
+                enrollment_status = 'Enrolled' if is_enrolled else 'Not Enrolled'
+                
+                devices.append({
+                    'id': serial_number,
+                    'deviceId': serial_number,
+                    'deviceName': device_name or computer_name or serial_number,
+                    'serialNumber': serial_number,
+                    'assetTag': asset_tag,
+                    'lastSeen': last_seen.isoformat() if last_seen else None,
+                    'collectedAt': collected_at.isoformat() if collected_at else None,
+                    'usage': usage,
+                    'catalog': catalog,
+                    'location': location,
+                    # Extract flattened MDM fields for table display (using actual field names from data)
+                    'provider': mdm_enrollment.get('provider', 'Unknown'),
+                    'enrollmentStatus': enrollment_status,
+                    'enrollmentType': mdm_enrollment.get('enrollmentType', 'N/A'),
+                    'intuneId': device_details.get('intuneDeviceId', 'N/A'),
+                    'tenantName': tenant_details.get('tenantName', 'N/A'),
+                    'isEnrolled': is_enrolled,
+                    'raw': management_data
+                })
+            except Exception as e:
+                logger.warning(f"Error processing management for device {row[0]}: {e}")
+                continue
+        
+        logger.info(f"Processed {len(devices)} devices with management data")
+        return devices
+        
+    except Exception as e:
+        logger.error(f"Failed to get bulk management: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to retrieve bulk management: {str(e)}")
+
+@app.get("/api/devices/inventory")
+async def get_bulk_inventory():
+    """
+    Bulk inventory endpoint for fleet-wide device inventory.
+    
+    Returns devices with inventory metadata (names, asset tags, locations, usage, etc.).
+    Used by /devices/inventory page for fleet-wide inventory management.
+    """
+    try:
+        logger.info("Fetching bulk inventory data")
+        
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        
+        query = """
+        SELECT DISTINCT ON (d.serial_number)
+            d.serial_number,
+            d.device_id,
+            d.last_seen,
+            inv.data as inventory_data,
+            inv.collected_at,
+            inv.data->>'deviceName' as device_name,
+            inv.data->>'computerName' as computer_name,
+            inv.data->>'usage' as usage,
+            inv.data->>'catalog' as catalog,
+            inv.data->>'location' as location,
+            inv.data->>'assetTag' as asset_tag,
+            inv.data->>'department' as department
+        FROM devices d
+        LEFT JOIN inventory inv ON d.id = inv.device_id
+        WHERE d.serial_number IS NOT NULL
+            AND d.serial_number NOT LIKE 'TEST-%'
+            AND d.serial_number != 'localhost'
+            AND inv.data IS NOT NULL
+        ORDER BY d.serial_number, inv.updated_at DESC
+        """
+        
+        cursor.execute(query)
+        rows = cursor.fetchall()
+        conn.close()
+        
+        logger.info(f"Retrieved {len(rows)} devices with inventory data")
+        
+        devices = []
+        for row in rows:
+            try:
+                serial_number, device_uuid, last_seen, inventory_data, collected_at, device_name, computer_name, usage, catalog, location, asset_tag, department = row
+                
+                devices.append({
+                    'id': serial_number,
+                    'deviceId': serial_number,
+                    'deviceName': device_name or computer_name or serial_number,
+                    'serialNumber': serial_number,
+                    'assetTag': asset_tag,
+                    'lastSeen': last_seen.isoformat() if last_seen else None,
+                    'collectedAt': collected_at.isoformat() if collected_at else None,
+                    'usage': usage,
+                    'catalog': catalog,
+                    'location': location,
+                    'department': department,
+                    'raw': inventory_data
+                })
+            except Exception as e:
+                logger.warning(f"Error processing inventory for device {row[0]}: {e}")
+                continue
+        
+        logger.info(f"Processed {len(devices)} devices with inventory data")
+        return devices
+        
+    except Exception as e:
+        logger.error(f"Failed to get bulk inventory: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to retrieve bulk inventory: {str(e)}")
+
+@app.get("/api/devices/system")
+async def get_bulk_system():
+    """
+    Bulk system endpoint for fleet-wide OS and system information.
+    
+    Returns devices with OS details, uptime, updates, services, etc.
+    Used by /devices/system page for fleet-wide system visibility.
+    """
+    try:
+        logger.info("Fetching bulk system data")
+        
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        
+        query = """
+        SELECT DISTINCT ON (d.serial_number)
+            d.serial_number,
+            d.device_id,
+            d.last_seen,
+            s.data as system_data,
+            s.collected_at,
+            inv.data->>'deviceName' as device_name,
+            inv.data->>'computerName' as computer_name,
+            inv.data->>'usage' as usage,
+            inv.data->>'catalog' as catalog,
+            inv.data->>'location' as location,
+            inv.data->>'assetTag' as asset_tag
+        FROM devices d
+        LEFT JOIN system s ON d.id = s.device_id
+        LEFT JOIN inventory inv ON d.id = inv.device_id
+        WHERE d.serial_number IS NOT NULL
+            AND d.serial_number NOT LIKE 'TEST-%'
+            AND d.serial_number != 'localhost'
+            AND s.data IS NOT NULL
+        ORDER BY d.serial_number, s.updated_at DESC
+        """
+        
+        cursor.execute(query)
+        rows = cursor.fetchall()
+        conn.close()
+        
+        logger.info(f"Retrieved {len(rows)} devices with system data")
+        
+        devices = []
+        for row in rows:
+            try:
+                serial_number, device_uuid, last_seen, system_data, collected_at, device_name, computer_name, usage, catalog, location, asset_tag = row
+                
+                # Extract system data (handle array format)
+                if isinstance(system_data, list) and len(system_data) > 0:
+                    system_data = system_data[0]
+                
+                devices.append({
+                    'id': serial_number,
+                    'deviceId': serial_number,
+                    'deviceName': device_name or computer_name or serial_number,
+                    'serialNumber': serial_number,
+                    'assetTag': asset_tag,
+                    'lastSeen': last_seen.isoformat() if last_seen else None,
+                    'collectedAt': collected_at.isoformat() if collected_at else None,
+                    'usage': usage,
+                    'catalog': catalog,
+                    'location': location,
+                    'raw': system_data
+                })
+            except Exception as e:
+                logger.warning(f"Error processing system for device {row[0]}: {e}")
+                continue
+        
+        logger.info(f"Processed {len(devices)} devices with system data")
+        return devices
+        
+    except Exception as e:
+        logger.error(f"Failed to get bulk system: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to retrieve bulk system: {str(e)}")
+
+@app.get("/api/devices/peripherals")
+async def get_bulk_peripherals():
+    """
+    Bulk peripherals endpoint for fleet-wide peripheral devices.
+    
+    Returns devices with connected peripherals (displays, printers, USB devices, etc.).
+    Used by /devices/peripherals page for fleet-wide peripheral visibility.
+    
+    NOTE: This combines displays and printers data into a unified peripherals view.
+    """
+    try:
+        logger.info("Fetching bulk peripherals data")
+        
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        
+        query = """
+        SELECT DISTINCT ON (d.serial_number)
+            d.serial_number,
+            d.device_id,
+            d.last_seen,
+            disp.data as displays_data,
+            print.data as printers_data,
+            GREATEST(disp.collected_at, print.collected_at) as collected_at,
+            inv.data->>'deviceName' as device_name,
+            inv.data->>'computerName' as computer_name,
+            inv.data->>'usage' as usage,
+            inv.data->>'catalog' as catalog,
+            inv.data->>'location' as location,
+            inv.data->>'assetTag' as asset_tag
+        FROM devices d
+        LEFT JOIN displays disp ON d.id = disp.device_id
+        LEFT JOIN printers print ON d.id = print.device_id
+        LEFT JOIN inventory inv ON d.id = inv.device_id
+        WHERE d.serial_number IS NOT NULL
+            AND d.serial_number NOT LIKE 'TEST-%'
+            AND d.serial_number != 'localhost'
+            AND (disp.data IS NOT NULL OR print.data IS NOT NULL)
+        ORDER BY d.serial_number, GREATEST(disp.updated_at, print.updated_at) DESC
+        """
+        
+        cursor.execute(query)
+        rows = cursor.fetchall()
+        conn.close()
+        
+        logger.info(f"Retrieved {len(rows)} devices with peripherals data")
+        
+        devices = []
+        for row in rows:
+            try:
+                serial_number, device_uuid, last_seen, displays_data, printers_data, collected_at, device_name, computer_name, usage, catalog, location, asset_tag = row
+                
+                # Combine displays and printers into unified peripherals structure
+                peripherals_data = {
+                    'displays': displays_data or [],
+                    'printers': printers_data or []
+                }
+                
+                devices.append({
+                    'id': serial_number,
+                    'deviceId': serial_number,
+                    'deviceName': device_name or computer_name or serial_number,
+                    'serialNumber': serial_number,
+                    'assetTag': asset_tag,
+                    'lastSeen': last_seen.isoformat() if last_seen else None,
+                    'collectedAt': collected_at.isoformat() if collected_at else None,
+                    'usage': usage,
+                    'catalog': catalog,
+                    'location': location,
+                    'raw': peripherals_data
+                })
+            except Exception as e:
+                logger.warning(f"Error processing peripherals for device {row[0]}: {e}")
+                continue
+        
+        logger.info(f"Processed {len(devices)} devices with peripherals data")
+        return devices
+        
+    except Exception as e:
+        logger.error(f"Failed to get bulk peripherals: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to retrieve bulk peripherals: {str(e)}")
 
 @app.get("/api/events")
 async def get_events(limit: int = 100):
@@ -1050,8 +1830,17 @@ async def submit_events(request: Request):
                         if event_type not in {'info', 'system'}:
                             event_type = 'warning'  # Default to warning for installs-related events
                 
-                # Store details as JSON
-                details_json = json.dumps(details)
+                # ENHANCED: For installs-related events, include full module data in details
+                # This ensures that when users expand the event, they see ALL install details
+                enhanced_details = details.copy() if isinstance(details, dict) else {}
+                
+                # If this is an installs event and we have installs module data, include it
+                if has_installs_module and 'installs' in modules_data:
+                    enhanced_details['full_installs_data'] = modules_data['installs']
+                    logger.debug(f"Enhanced event details with full installs module data for device {serial_number}")
+                
+                # Store enhanced details as JSON
+                details_json = json.dumps(enhanced_details)
                 
                 # NOTE: events.device_id references devices.id which equals serial_number
                 cursor.execute("""
