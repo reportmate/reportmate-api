@@ -1709,6 +1709,34 @@ async def submit_events(request: Request):
                 detail="Both deviceId (UUID) and serialNumber are required in metadata"
             )
         
+        # VALIDATION: Reject serial numbers that look like hostnames
+        # This prevents database pollution from client bugs where hostname is sent as serial
+        # Valid serial numbers should NOT match common hostname patterns
+        import re
+        hostname_patterns = [
+            r'^[A-Z]+-[A-Z]+$',  # All caps with hyphens (e.g., TOLUWANI-AGBI, AWI-JUMP)
+            r'^[A-Z]+\-[A-Z0-9]+\-[A-Z0-9]+$',  # Pattern like DESKTOP-ABC123
+            r'^WIN-[A-Z0-9]+$',  # Windows default hostnames
+            r'^[A-Z]{2,}\d{2,}$',  # Pattern like DESKTOP01, LAPTOP02
+        ]
+        
+        for pattern in hostname_patterns:
+            if re.match(pattern, serial_number, re.IGNORECASE):
+                logger.error(f"Rejected device registration: serial_number '{serial_number}' matches hostname pattern '{pattern}'")
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Invalid serial number: '{serial_number}' appears to be a hostname. Device must provide hardware serial number (BIOS/chassis serial)."
+                )
+        
+        # Additional validation: Serial numbers should not contain only letters and hyphens
+        # Real serials usually have numbers
+        if serial_number.replace('-', '').isalpha():
+            logger.error(f"Rejected device registration: serial_number '{serial_number}' contains only letters (likely a hostname)")
+            raise HTTPException(
+                status_code=400,
+                detail=f"Invalid serial number: '{serial_number}' contains only letters and appears to be a hostname. Device must provide hardware serial number."
+            )
+        
         logger.info(f"Processing unified payload for device {serial_number} (UUID: {device_uuid})")
         logger.info(f"Collection type: {collection_type}, Enabled modules: {enabled_modules}")
         
