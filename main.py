@@ -1717,7 +1717,9 @@ async def submit_events(request: Request):
             r'^[A-Z]+-[A-Z]+$',  # All caps with hyphens (e.g., TOLUWANI-AGBI, AWI-JUMP)
             r'^[A-Z]+\-[A-Z0-9]+\-[A-Z0-9]+$',  # Pattern like DESKTOP-ABC123
             r'^WIN-[A-Z0-9]+$',  # Windows default hostnames
-            r'^[A-Z]{2,}\d{2,}$',  # Pattern like DESKTOP01, LAPTOP02
+            r'^[A-Z]+-[A-Z]+-[A-Z]+-[0-9]+$',
+            r'^[A-Z]{4,}-[0-9]{4}$',
+            r'^[A-Z]{2,}\d{2,}$',
         ]
         
         for pattern in hostname_patterns:
