@@ -13,10 +13,10 @@ import json
 import logging
 import os
 from datetime import datetime, timezone, timedelta
-from typing import Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional, Union
 
 import pg8000
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException, Query, Request, Header, Depends
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
@@ -33,6 +33,54 @@ app = FastAPI(
 
 # Database connection configuration
 DATABASE_URL = os.getenv('DATABASE_URL', 'postgresql://reportmate:password@localhost:5432/reportmate')
+
+# Security: Authentication configuration
+REPORTMATE_PASSPHRASE = os.getenv('REPORTMATE_PASSPHRASE')  # For Windows clients
+AZURE_MANAGED_IDENTITY_HEADER = "X-MS-CLIENT-PRINCIPAL-ID"  # Azure Container Apps managed identity
+
+async def verify_authentication(
+    x_api_passphrase: str = Header(None, alias="X-API-PASSPHRASE"),
+    x_ms_client_principal_id: str = Header(None, alias="X-MS-CLIENT-PRINCIPAL-ID"),
+    user_agent: str = Header(None, alias="User-Agent")
+):
+    """
+    Verify authentication for API endpoints.
+    
+    Two authentication methods supported:
+    1. Windows Client: X-API-PASSPHRASE header (external clients)
+    2. Azure Resources: X-MS-CLIENT-PRINCIPAL-ID header (internal Azure services via Managed Identity)
+    
+    This ensures:
+    - Windows clients authenticate with passphrase
+    - Next.js frontend authenticates via Azure Managed Identity
+    - Random internet users get rejected
+    """
+    
+    # Method 1: Azure Managed Identity (for internal Azure resources like Next.js frontend)
+    if x_ms_client_principal_id:
+        logger.info(f"Authenticated via Azure Managed Identity: {x_ms_client_principal_id}")
+        return {"method": "managed_identity", "principal_id": x_ms_client_principal_id}
+    
+    # Method 2: Passphrase authentication (for Windows clients)
+    if x_api_passphrase:
+        if not REPORTMATE_PASSPHRASE:
+            logger.error("REPORTMATE_PASSPHRASE not configured but client attempted passphrase auth")
+            raise HTTPException(status_code=500, detail="Server authentication not configured")
+        
+        if x_api_passphrase != REPORTMATE_PASSPHRASE:
+            logger.warning(f"Invalid passphrase attempt from {user_agent}")
+            raise HTTPException(status_code=401, detail="Invalid authentication credentials")
+        
+        logger.info(f"Authenticated via passphrase from {user_agent}")
+        return {"method": "passphrase", "user_agent": user_agent}
+    
+    # No valid authentication method provided
+    logger.warning(f"Unauthenticated access attempt from {user_agent}")
+    raise HTTPException(
+        status_code=401,
+        detail="Authentication required. Provide either X-API-PASSPHRASE (Windows client) or X-MS-CLIENT-PRINCIPAL-ID (Azure Managed Identity)"
+    )
+
 
 def get_db_connection():
     """Get database connection using pg8000 driver."""
@@ -99,10 +147,22 @@ class SystemModule(BaseModel):
     """System module data model."""
     operatingSystem: Optional[DeviceOS] = None
 
+class InventorySummary(BaseModel):
+    """Trimmed inventory data returned in bulk responses."""
+    deviceName: Optional[str] = None
+    assetTag: Optional[str] = None
+    serialNumber: Optional[str] = None
+    location: Optional[str] = None
+    department: Optional[str] = None
+    usage: Optional[str] = None
+    catalog: Optional[str] = None
+    owner: Optional[str] = None
+
+
 class DeviceModules(BaseModel):
-    """Device modules container for bulk endpoint - only system and inventory."""
+    """Device modules container for bulk endpoint - lightweight summaries only."""
     system: Optional[SystemModule] = None
-    inventory: Optional[dict] = None  # Inventory data for bulk response
+    inventory: Optional[InventorySummary] = None  # Inventory summary for bulk response
 
 class DeviceInfo(BaseModel):
     """
@@ -113,9 +173,23 @@ class DeviceInfo(BaseModel):
     serialNumber: str  # PRIMARY KEY - Always use this
     deviceId: str      # UUID from device_id column
     deviceName: Optional[str] = None
+    name: Optional[str] = None
     lastSeen: Optional[str] = None
     createdAt: Optional[str] = None
     registrationDate: Optional[str] = None
+    status: Optional[str] = None
+    assetTag: Optional[str] = None
+    platform: Optional[str] = None
+    osName: Optional[str] = None
+    osVersion: Optional[str] = None
+    usage: Optional[str] = None
+    catalog: Optional[str] = None
+    department: Optional[str] = None
+    location: Optional[str] = None
+    owner: Optional[str] = None
+    lastEventTime: Optional[str] = None
+    totalEvents: Optional[int] = None
+    inventory: Optional[InventorySummary] = None
     modules: Optional[DeviceModules] = None
 
 class DevicesResponse(BaseModel):
@@ -123,6 +197,41 @@ class DevicesResponse(BaseModel):
     devices: List[DeviceInfo]
     total: int
     message: str
+    page: Optional[int] = None
+    pageSize: Optional[int] = None
+    hasMore: Optional[bool] = None
+
+
+def infer_platform(os_name: Optional[str]) -> Optional[str]:
+    """Infer platform from OS name."""
+    if not os_name:
+        return None
+
+    lower_name = os_name.lower()
+    if "windows" in lower_name:
+        return "Windows"
+    if "mac" in lower_name or "darwin" in lower_name:
+        return "macOS"
+    if "linux" in lower_name:
+        return "Linux"
+    return None
+
+
+def build_os_summary(os_name: Optional[str], os_version: Optional[str]) -> Dict[str, Optional[str]]:
+    """Construct a minimal operating system summary for bulk responses."""
+    summary: Dict[str, Optional[str]] = {
+        "name": os_name,
+        "version": os_version,
+    }
+
+    if os_version:
+        parts = [part for part in os_version.split('.') if part]
+        if len(parts) >= 3:
+            summary["build"] = parts[2]
+        if len(parts) >= 4:
+            summary["featureUpdate"] = parts[3]
+
+    return {key: value for key, value in summary.items() if value}
 
 @app.get("/")
 async def root():
@@ -172,18 +281,32 @@ async def health_check():
             }
         )
 
-@app.get("/api/devices", response_model=DevicesResponse)
-async def get_all_devices():
+@app.get("/api/devices", response_model=DevicesResponse, dependencies=[Depends(verify_authentication)])
+async def get_all_devices(
+    limit: Optional[int] = Query(default=None, ge=1, le=1000),
+    offset: int = Query(default=0, ge=0)
+):
     """
-    Bulk devices endpoint with standardized device identification
+    Bulk devices endpoint with standardized device identification and lightweight module payloads.
+    
+    **Authentication Required:**
+    - Windows clients: X-API-PASSPHRASE header
+    - Azure resources: X-MS-CLIENT-PRINCIPAL-ID header (Managed Identity)
     """
+    conn = None
     try:
-        print(f"[DEBUG] Starting get_all_devices endpoint")
-        
         conn = get_db_connection()
         cursor = conn.cursor()
-        
-        # CRITICAL FIX: Use same query approach as individual endpoint (which works)
+
+        total_devices = 0
+        try:
+            cursor.execute("SELECT COUNT(*) FROM devices")
+            total_result = cursor.fetchone()
+            if total_result and total_result[0] is not None:
+                total_devices = int(total_result[0])
+        except Exception as count_error:
+            logger.warning(f"Failed to get total device count: {count_error}")
+
         query = """
         SELECT 
             d.id,
@@ -201,93 +324,147 @@ async def get_all_devices():
         FROM devices d
         ORDER BY COALESCE(d.serial_number, d.device_id) ASC
         """
-        
-        print(f"[DEBUG] Executing devices query")
-        cursor.execute(query)
+
+        params: List[Any] = []
+        if limit is not None:
+            query += " LIMIT %s"
+            params.append(limit)
+        if offset and offset > 0:
+            query += " OFFSET %s"
+            params.append(offset)
+
+        if params:
+            cursor.execute(query, tuple(params))
+        else:
+            cursor.execute(query)
+
         rows = cursor.fetchall()
-        print(f"[DEBUG] Query returned {len(rows)} rows")
-        # Keep connection open for module queries
-        
-        devices = []
-        
-        for i, row in enumerate(rows):
-            print(f"[DEBUG] Processing row {i+1}/{len(rows)}")
+
+        devices: List[Dict[str, Any]] = []
+
+        for row in rows:
+            (
+                device_id,
+                device_uuid,
+                device_name,
+                serial_number,
+                last_seen,
+                created_at,
+                status,
+                _model,
+                _manufacturer,
+                os,
+                os_name,
+                os_version,
+            ) = row
+
+            serial = serial_number or str(device_id)
+            os_summary = build_os_summary(os_name or os, os_version)
+            platform = infer_platform(os_name or os)
+
+            inventory_summary: Optional[Dict[str, Any]] = None
+            device_display_name = device_name
+
             try:
-                device_id, device_uuid, device_name, serial_number, last_seen, created_at, status, model, manufacturer, os, os_name, os_version = row
-                
-                print(f"[DEBUG] Row {i+1}: serial={serial_number}, uuid={device_uuid}, name={device_name}")
-                
-                # Build basic device info (no inventory duplication)
-                device_info = {
-                    "serialNumber": serial_number or str(device_id),
-                    "deviceId": device_uuid or str(device_id),
-                    "lastSeen": last_seen.isoformat() if last_seen else None,
-                    "createdAt": created_at.isoformat() if created_at else None,
-                    "registrationDate": created_at.isoformat() if created_at else None,
-                }
-                
-                print(f"[DEBUG] Row {i+1}: Basic device info created")
-                
-                # Initialize modules structure
-                device_info["modules"] = {}
-                
-                # CRITICAL FIX: Handle system module first (like individual endpoint)
-                try:
-                    cursor.execute("SELECT data FROM system WHERE device_id = %s", (serial_number,))
-                    system_row = cursor.fetchone()
-                    if system_row:
-                        system_data = json.loads(system_row[0]) if isinstance(system_row[0], str) else system_row[0]
-                        if isinstance(system_data, list) and len(system_data) > 0:
-                            device_info["modules"]["system"] = system_data[0]
-                        else:
-                            device_info["modules"]["system"] = system_data
-                        print(f"[DEBUG] Row {i+1}: Added system module")
-                except Exception as e:
-                    print(f"[ERROR] Row {i+1}: Failed to get system data for {serial_number}: {e}")
-                
-                # BULK ENDPOINT OPTIMIZATION: Only fetch inventory module (not all 8 modules)
-                try:
-                    cursor.execute("SELECT data FROM inventory WHERE device_id = %s", (serial_number,))
-                    inventory_row = cursor.fetchone()
-                    
-                    if inventory_row:
-                        inventory_data = json.loads(inventory_row[0]) if isinstance(inventory_row[0], str) else inventory_row[0]
-                        device_info["modules"]["inventory"] = inventory_data
-                        print(f"[DEBUG] Row {i+1}: Added inventory module")
-                    else:
-                        print(f"[DEBUG] Row {i+1}: No inventory data found")
-                except Exception as e:
-                    print(f"[ERROR] Row {i+1}: Failed to get inventory data for {serial_number}: {e}")
-                
-                # All module processing is now done above using individual endpoint approach
-                devices.append(device_info)
-                print(f"[DEBUG] Row {i+1}: Device added successfully")
-                
-            except Exception as e:
-                print(f"[ERROR] Row {i+1}: Failed to process device row: {e}")
-                continue
-        
-        print(f"[DEBUG] Successfully processed {len(devices)} devices")
-        
-        conn.close()  # Close connection after all processing
-        
+                cursor.execute("SELECT data FROM inventory WHERE device_id = %s", (serial,))
+                inventory_row = cursor.fetchone()
+                if inventory_row:
+                    raw_inventory = inventory_row[0]
+                    if isinstance(raw_inventory, str):
+                        raw_inventory = json.loads(raw_inventory)
+                    if isinstance(raw_inventory, list) and raw_inventory:
+                        raw_inventory = raw_inventory[0]
+                    if isinstance(raw_inventory, dict):
+                        allowed_keys = [
+                            "deviceName",
+                            "assetTag",
+                            "serialNumber",
+                            "location",
+                            "department",
+                            "usage",
+                            "catalog",
+                            "owner",
+                        ]
+                        summary = {
+                            key: raw_inventory.get(key)
+                            for key in allowed_keys
+                            if raw_inventory.get(key) not in (None, "")
+                        }
+                        if summary:
+                            inventory_summary = summary
+                            device_display_name = summary.get("deviceName", device_display_name)
+            except Exception as inventory_error:
+                logger.warning(f"Failed to get inventory data for {serial}: {inventory_error}")
+
+            if not device_display_name:
+                device_display_name = serial
+
+            device_info: Dict[str, Any] = {
+                "serialNumber": serial,
+                "deviceId": device_uuid or str(device_id),
+                "deviceName": device_display_name,
+                "name": device_display_name,
+                "lastSeen": last_seen.isoformat() if last_seen else None,
+                "createdAt": created_at.isoformat() if created_at else None,
+                "registrationDate": created_at.isoformat() if created_at else None,
+                "status": status,
+                "platform": platform,
+                "osName": os_name or os,
+                "osVersion": os_version,
+                "lastEventTime": last_seen.isoformat() if last_seen else None,
+                "totalEvents": 0,
+            }
+
+            if inventory_summary:
+                device_info["inventory"] = inventory_summary
+                device_info["assetTag"] = inventory_summary.get("assetTag")
+                device_info["usage"] = inventory_summary.get("usage")
+                device_info["catalog"] = inventory_summary.get("catalog")
+                device_info["department"] = inventory_summary.get("department")
+                device_info["location"] = inventory_summary.get("location")
+                device_info["owner"] = inventory_summary.get("owner")
+
+            modules_payload: Dict[str, Any] = {}
+            if inventory_summary:
+                modules_payload["inventory"] = inventory_summary
+            if os_summary:
+                modules_payload["system"] = {"operatingSystem": os_summary}
+            if modules_payload:
+                device_info["modules"] = modules_payload
+
+            devices.append(device_info)
+
+        page_size = limit or len(devices) or total_devices or 1
+        page = (offset // page_size) + 1 if page_size else 1
+        has_more = bool(limit is not None and (offset + len(devices)) < total_devices)
+
         return {
             "devices": devices,
-            "total": len(devices),
-            "message": f"Successfully retrieved {len(devices)} devices"
+            "total": total_devices or len(devices),
+            "message": f"Successfully retrieved {len(devices)} devices",
+            "page": page,
+            "pageSize": page_size,
+            "hasMore": has_more,
         }
-        
+
     except Exception as e:
         print(f"[ERROR] get_all_devices failed: {e}")
         logger.error(f"Failed to retrieve devices: {e}")
         raise HTTPException(status_code=500, detail=f"Failed to retrieve devices: {str(e)}")
+    finally:
+        if conn:
+            conn.close()
 
-@app.get("/api/device/{serial_number}")
+@app.get("/api/device/{serial_number}", dependencies=[Depends(verify_authentication)])
 async def get_device_by_serial(serial_number: str):
     """
     Get individual device details with all modules.
     
-    Uses serialNumber consistently as primary identifier
+    Uses serialNumber consistently as primary identifier.
+    
+    **Authentication Required:**
+    - Windows clients: X-API-PASSPHRASE header
+    - Azure resources: X-MS-CLIENT-PRINCIPAL-ID header (Managed Identity)
     """
     try:
         conn = get_db_connection()
@@ -358,7 +535,7 @@ async def get_device_by_serial(serial_number: str):
         raise HTTPException(status_code=500, detail=f"Failed to retrieve device: {str(e)}")
 
 
-@app.get("/api/device/{serial_number}/events")
+@app.get("/api/device/{serial_number}/events", dependencies=[Depends(verify_authentication)])
 async def get_device_events(serial_number: str, limit: int = 100):
     """
     Get events for a specific device.
@@ -421,7 +598,7 @@ async def get_device_events(serial_number: str, limit: int = 100):
         raise HTTPException(status_code=500, detail=f"Failed to retrieve events: {str(e)}")
 
 
-@app.get("/api/device/{device_id}/info")
+@app.get("/api/device/{device_id}/info", dependencies=[Depends(verify_authentication)])
 async def get_device_info_fast(device_id: str):
     """
     Fast endpoint returning only InfoTab data for progressive loading.
@@ -513,7 +690,7 @@ async def get_device_info_fast(device_id: str):
         raise HTTPException(status_code=500, detail=f"Failed to retrieve device info: {str(e)}")
 
 
-@app.get("/api/device/{device_id}/modules/{module_name}")
+@app.get("/api/device/{device_id}/modules/{module_name}", dependencies=[Depends(verify_authentication)])
 async def get_device_module(device_id: str, module_name: str):
     """
     Get individual module data for progressive/on-demand loading.
@@ -588,7 +765,7 @@ async def get_device_module(device_id: str, module_name: str):
         raise HTTPException(status_code=500, detail=f"Failed to retrieve module: {str(e)}")
 
 
-@app.get("/api/devices/applications")
+@app.get("/api/devices/applications", dependencies=[Depends(verify_authentication)])
 async def get_bulk_applications(
     request: Request,
     deviceNames: Optional[str] = None,
@@ -743,7 +920,7 @@ async def get_bulk_applications(
         logger.error(f"Failed to get bulk applications: {e}")
         raise HTTPException(status_code=500, detail=f"Failed to retrieve bulk applications: {str(e)}")
 
-@app.get("/api/devices/hardware")
+@app.get("/api/devices/hardware", dependencies=[Depends(verify_authentication)])
 async def get_bulk_hardware():
     """
     Bulk hardware endpoint.
@@ -832,7 +1009,7 @@ async def get_bulk_hardware():
         logger.error(f"Failed to get bulk hardware: {e}")
         raise HTTPException(status_code=500, detail=f"Failed to retrieve bulk hardware: {str(e)}")
 
-@app.get("/api/devices/installs")
+@app.get("/api/devices/installs", dependencies=[Depends(verify_authentication)])
 async def get_bulk_installs():
     """
     Bulk installs endpoint for Cimian managed packages.
@@ -919,7 +1096,7 @@ async def get_bulk_installs():
         logger.error(f"Failed to get bulk installs: {e}")
         raise HTTPException(status_code=500, detail=f"Failed to retrieve bulk installs: {str(e)}")
 
-@app.get("/api/devices/network")
+@app.get("/api/devices/network", dependencies=[Depends(verify_authentication)])
 async def get_bulk_network():
     """
     Bulk network endpoint for fleet-wide network overview.
@@ -1005,7 +1182,7 @@ async def get_bulk_network():
         logger.error(f"Failed to get bulk network: {e}")
         raise HTTPException(status_code=500, detail=f"Failed to retrieve bulk network: {str(e)}")
 
-@app.get("/api/devices/security")
+@app.get("/api/devices/security", dependencies=[Depends(verify_authentication)])
 async def get_bulk_security():
     """
     Bulk security endpoint for fleet-wide security overview.
@@ -1077,7 +1254,7 @@ async def get_bulk_security():
         logger.error(f"Failed to get bulk security: {e}")
         raise HTTPException(status_code=500, detail=f"Failed to retrieve bulk security: {str(e)}")
 
-@app.get("/api/devices/profiles")
+@app.get("/api/devices/profiles", dependencies=[Depends(verify_authentication)])
 async def get_bulk_profiles():
     """
     Bulk profiles endpoint for fleet-wide configuration profiles.
@@ -1149,7 +1326,7 @@ async def get_bulk_profiles():
         logger.error(f"Failed to get bulk profiles: {e}")
         raise HTTPException(status_code=500, detail=f"Failed to retrieve bulk profiles: {str(e)}")
 
-@app.get("/api/devices/management")
+@app.get("/api/devices/management", dependencies=[Depends(verify_authentication)])
 async def get_bulk_management():
     """
     Bulk management endpoint for fleet-wide MDM status.
@@ -1237,7 +1414,7 @@ async def get_bulk_management():
         logger.error(f"Failed to get bulk management: {e}")
         raise HTTPException(status_code=500, detail=f"Failed to retrieve bulk management: {str(e)}")
 
-@app.get("/api/devices/inventory")
+@app.get("/api/devices/inventory", dependencies=[Depends(verify_authentication)])
 async def get_bulk_inventory():
     """
     Bulk inventory endpoint for fleet-wide device inventory.
@@ -1310,7 +1487,7 @@ async def get_bulk_inventory():
         logger.error(f"Failed to get bulk inventory: {e}")
         raise HTTPException(status_code=500, detail=f"Failed to retrieve bulk inventory: {str(e)}")
 
-@app.get("/api/devices/system")
+@app.get("/api/devices/system", dependencies=[Depends(verify_authentication)])
 async def get_bulk_system():
     """
     Bulk system endpoint for fleet-wide OS and system information.
@@ -1386,7 +1563,7 @@ async def get_bulk_system():
         logger.error(f"Failed to get bulk system: {e}")
         raise HTTPException(status_code=500, detail=f"Failed to retrieve bulk system: {str(e)}")
 
-@app.get("/api/devices/peripherals")
+@app.get("/api/devices/peripherals", dependencies=[Depends(verify_authentication)])
 async def get_bulk_peripherals():
     """
     Bulk peripherals endpoint for fleet-wide peripheral devices.
@@ -1468,7 +1645,7 @@ async def get_bulk_peripherals():
         logger.error(f"Failed to get bulk peripherals: {e}")
         raise HTTPException(status_code=500, detail=f"Failed to retrieve bulk peripherals: {str(e)}")
 
-@app.get("/api/events")
+@app.get("/api/events", dependencies=[Depends(verify_authentication)])
 async def get_events(limit: int = 100):
     """
     Get recent events with device names (optimized for dashboard).
@@ -1525,7 +1702,7 @@ async def get_events(limit: int = 100):
         logger.error(f"Failed to get events: {e}")
         raise HTTPException(status_code=500, detail=f"Failed to retrieve events: {str(e)}")
 
-@app.get("/api/events/{event_id}/payload")
+@app.get("/api/events/{event_id}/payload", dependencies=[Depends(verify_authentication)])
 async def get_event_payload(event_id: int):
     """
     Get the details/payload for a specific event (lazy-loaded).
@@ -1565,7 +1742,7 @@ async def get_event_payload(event_id: int):
         logger.error(f"Failed to get event payload: {e}")
         raise HTTPException(status_code=500, detail=f"Failed to retrieve event payload: {str(e)}")
 
-@app.get("/api/stats/installs")
+@app.get("/api/stats/installs", dependencies=[Depends(verify_authentication)])
 async def get_install_stats():
     """
     Get aggregated install statistics for dashboard widgets.
@@ -1656,7 +1833,7 @@ async def get_install_stats():
         logger.error(f"Failed to get install stats: {e}")
         raise HTTPException(status_code=500, detail=f"Failed to retrieve install statistics: {str(e)}")
 
-@app.post("/api/events")
+@app.post("/api/events", dependencies=[Depends(verify_authentication)])
 async def submit_events(request: Request):
     """
     Submit device events and unified module data.
