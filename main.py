@@ -35,50 +35,73 @@ app = FastAPI(
 DATABASE_URL = os.getenv('DATABASE_URL', 'postgresql://reportmate:password@localhost:5432/reportmate')
 
 # Security: Authentication configuration
-REPORTMATE_PASSPHRASE = os.getenv('REPORTMATE_PASSPHRASE')  # For Windows clients
+REPORTMATE_PASSPHRASE = os.getenv('REPORTMATE_PASSPHRASE')  # For Windows/Mac clients
 AZURE_MANAGED_IDENTITY_HEADER = "X-MS-CLIENT-PRINCIPAL-ID"  # Azure Container Apps managed identity
 
 async def verify_authentication(
+    request: Request,
     x_api_passphrase: str = Header(None, alias="X-API-PASSPHRASE"),
+    x_client_passphrase: str = Header(None, alias="X-Client-Passphrase"),
     x_ms_client_principal_id: str = Header(None, alias="X-MS-CLIENT-PRINCIPAL-ID"),
+    x_forwarded_for: str = Header(None, alias="X-Forwarded-For"),
     user_agent: str = Header(None, alias="User-Agent")
 ):
     """
     Verify authentication for API endpoints.
     
-    Two authentication methods supported:
-    1. Windows Client: X-API-PASSPHRASE header (external clients)
-    2. Azure Resources: X-MS-CLIENT-PRINCIPAL-ID header (internal Azure services via Managed Identity)
+    Three authentication methods supported (checked in order):
+    1. Internal Network: Requests from Container App internal network (100.x.x.x or 10.x.x.x IPs)
+    2. Azure Managed Identity: X-MS-CLIENT-PRINCIPAL-ID header (when Easy Auth is properly configured)
+    3. Passphrase: X-API-PASSPHRASE or X-Client-Passphrase header (for external Windows/macOS clients)
     
     This ensures:
-    - Windows clients authenticate with passphrase
-    - Next.js frontend authenticates via Azure Managed Identity
+    - Frontend (internal network) can access without passphrase
+    - Windows/macOS clients authenticate with passphrase (either header format)
     - Random internet users get rejected
     """
     
-    # Method 1: Azure Managed Identity (for internal Azure resources like Next.js frontend)
+    # Method 1: Internal Container App Network (highest priority)
+    # Container Apps internal network uses private IPs (100.x.x.x range or 10.x.x.x range)
+    client_host = request.client.host if request.client else None
+    
+    if client_host:
+        if client_host.startswith('100.') or client_host.startswith('10.'):
+            logger.info(f"✅ Authenticated via internal network: {client_host} (User-Agent: {user_agent})")
+            return {"method": "internal_network", "client_ip": client_host, "user_agent": user_agent}
+    
+    # Also check X-Forwarded-For for proxied requests
+    if x_forwarded_for:
+        forwarded_ip = x_forwarded_for.split(',')[0].strip()
+        if forwarded_ip.startswith('100.') or forwarded_ip.startswith('10.'):
+            logger.info(f"✅ Authenticated via internal network (forwarded): {forwarded_ip} (User-Agent: {user_agent})")
+            return {"method": "internal_network_forwarded", "client_ip": forwarded_ip, "user_agent": user_agent}
+    
+    # Method 2: Azure Managed Identity (for when Easy Auth is properly configured)
     if x_ms_client_principal_id:
-        logger.info(f"Authenticated via Azure Managed Identity: {x_ms_client_principal_id}")
+        logger.info(f"✅ Authenticated via Azure Managed Identity: {x_ms_client_principal_id}")
         return {"method": "managed_identity", "principal_id": x_ms_client_principal_id}
     
-    # Method 2: Passphrase authentication (for Windows clients)
-    if x_api_passphrase:
+    # Method 3: Passphrase authentication (for external Windows/macOS clients)
+    # Accept both X-API-PASSPHRASE (frontend/testing) and X-Client-Passphrase (Windows/Mac clients)
+    passphrase_header = x_api_passphrase or x_client_passphrase
+    if passphrase_header:
         if not REPORTMATE_PASSPHRASE:
-            logger.error("REPORTMATE_PASSPHRASE not configured but client attempted passphrase auth")
+            logger.error("❌ REPORTMATE_PASSPHRASE not configured but client attempted passphrase auth")
             raise HTTPException(status_code=500, detail="Server authentication not configured")
         
-        if x_api_passphrase != REPORTMATE_PASSPHRASE:
-            logger.warning(f"Invalid passphrase attempt from {user_agent}")
+        if passphrase_header != REPORTMATE_PASSPHRASE:
+            logger.warning(f"❌ Invalid passphrase attempt from {user_agent} (IP: {client_host})")
             raise HTTPException(status_code=401, detail="Invalid authentication credentials")
         
-        logger.info(f"Authenticated via passphrase from {user_agent}")
-        return {"method": "passphrase", "user_agent": user_agent}
+        header_type = "X-API-PASSPHRASE" if x_api_passphrase else "X-Client-Passphrase"
+        logger.info(f"✅ Authenticated via passphrase ({header_type}) from {user_agent} (IP: {client_host})")
+        return {"method": "passphrase", "user_agent": user_agent, "client_ip": client_host}
     
     # No valid authentication method provided
-    logger.warning(f"Unauthenticated access attempt from {user_agent}")
+    logger.warning(f"❌ Unauthenticated access attempt from {user_agent} (IP: {client_host}, X-Forwarded-For: {x_forwarded_for})")
     raise HTTPException(
         status_code=401,
-        detail="Authentication required. Provide either X-API-PASSPHRASE (Windows client) or X-MS-CLIENT-PRINCIPAL-ID (Azure Managed Identity)"
+        detail="Authentication required. Internal network, X-MS-CLIENT-PRINCIPAL-ID (Managed Identity), or X-API-PASSPHRASE/X-Client-Passphrase required."
     )
 
 
