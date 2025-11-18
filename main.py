@@ -105,6 +105,103 @@ async def verify_authentication(
     )
 
 
+def normalize_app_name(app_name: str) -> str:
+    """
+    Normalize application name by removing versions, editions, and architecture info.
+    This matches the TypeScript normalization in the frontend filters API.
+    """
+    import re
+    
+    if not app_name or not isinstance(app_name, str):
+        return ''
+    
+    normalized = app_name.strip()
+    if not normalized:
+        return ''
+    
+    # Remove placeholder/junk entries
+    if '${{' in normalized or '}}' in normalized:
+        return ''
+    if normalized in ['Unknown', 'N/A']:
+        return ''
+    
+    # Handle specific product lines
+    if re.search(r'Microsoft Visual C\+\+ \d{4}', normalized, re.IGNORECASE):
+        return 'Microsoft Visual C++ Redistributable'
+    
+    if normalized.startswith('Microsoft.NET') or 'Microsoft ASP.NET Core' in normalized:
+        if 'Workload' in normalized:
+            return 'Microsoft .NET Workload'
+        if 'Sdk' in normalized or 'SDK' in normalized:
+            return 'Microsoft .NET SDK'
+        if 'ASP.NET Core' in normalized:
+            return 'Microsoft ASP.NET Core'
+        if any(x in normalized for x in ['Runtime', 'AppHost', 'Targeting Pack', 'Host FX Resolver']):
+            return 'Microsoft .NET Runtime'
+        return 'Microsoft .NET'
+    
+    if 'Microsoft Visual Studio Tools' in normalized:
+        return 'Microsoft Visual Studio Tools'
+    
+    if re.search(r'Microsoft (365|Office 365)', normalized, re.IGNORECASE):
+        return 'Microsoft 365'
+    
+    if re.search(r'Kinect for Windows Speech Recognition Language Pack', normalized, re.IGNORECASE):
+        return 'Kinect for Windows Speech Recognition Language Pack'
+    
+    if re.search(r'Microsoft.*Language Pack', normalized, re.IGNORECASE):
+        return 'Microsoft Language Pack'
+    
+    if re.search(r'Kits Configuration Installer', normalized, re.IGNORECASE):
+        return 'Kits Configuration Installer'
+    
+    if re.search(r'Kofax VRS', normalized, re.IGNORECASE):
+        return 'Kofax VRS'
+    
+    if normalized.startswith('Adobe '):
+        match = re.search(r'Adobe ([A-Za-z\s]+)', normalized)
+        if match:
+            product = match.group(1).split()[0]
+            if product != 'AIR':
+                return f'Adobe {product}'
+    
+    if re.search(r'^7-Zip', normalized, re.IGNORECASE):
+        return '7-Zip'
+    
+    if re.search(r'Google Chrome|Chrome', normalized, re.IGNORECASE):
+        return 'Google Chrome'
+    
+    if re.search(r'Mozilla Firefox|Firefox', normalized, re.IGNORECASE):
+        return 'Mozilla Firefox'
+    
+    # Generic version number removal
+    normalized = re.sub(r'\s+v?\d+(\.\d+)*(\.\d+)*(\.\d+)*$', '', normalized, flags=re.IGNORECASE)
+    normalized = re.sub(r'\s+\d{4}(\.\d+)*$', '', normalized, flags=re.IGNORECASE)
+    normalized = re.sub(r'\s+-\s+\d+(\.\d+)*$', '', normalized, flags=re.IGNORECASE)
+    normalized = re.sub(r'\s+\(\d+(\.\d+)*(\.\d+)*\)$', '', normalized, flags=re.IGNORECASE)
+    normalized = re.sub(r'\s+build\s+\d+', '', normalized, flags=re.IGNORECASE)
+    normalized = re.sub(r'\s+\d+(\.\d+)*(\.\d+)*(\.\d+)*$', '', normalized, flags=re.IGNORECASE)
+    
+    # Remove architecture and platform info
+    normalized = re.sub(r'\s+(x64|x86|64-bit|32-bit|amd64|i386)$', '', normalized, flags=re.IGNORECASE)
+    normalized = re.sub(r'\s+\((x64|x86|64-bit|32-bit|amd64|i386)\)$', '', normalized, flags=re.IGNORECASE)
+    normalized = re.sub(r'\s+\(Python\s+[\d\.]+\s+(64-bit|32-bit)\)$', '', normalized, flags=re.IGNORECASE)
+    normalized = re.sub(r'\s+\(git\s+[a-f0-9]+\)$', '', normalized, flags=re.IGNORECASE)
+    normalized = re.sub(r'\s+\([^)]*bit[^)]*\)', '', normalized, flags=re.IGNORECASE)
+    normalized = re.sub(r'\s+\([^)]*\d+\.\d+\.\d+[^)]*\)', '', normalized, flags=re.IGNORECASE)
+    
+    # Final cleanup
+    normalized = re.sub(r'\s+', ' ', normalized)
+    normalized = re.sub(r'\s*-\s*$', '', normalized)
+    normalized = re.sub(r'^\s*-\s*', '', normalized)
+    normalized = normalized.strip()
+    
+    if not normalized or len(normalized) < 2:
+        return ''
+    
+    return normalized
+
+
 def get_db_connection():
     """Get database connection using pg8000 driver."""
     try:
@@ -892,8 +989,13 @@ async def get_bulk_applications(
                     app_install_date = app.get('installDate') or app.get('install_date') or app.get('last_modified')
                     
                     # Apply application-level filters (if provided)
-                    if app_name_list and not any(name.lower() in app_name.lower() for name in app_name_list):
-                        continue
+                    # CRITICAL: Use EXACT normalized name matching, not substring matching
+                    # Frontend sends normalized names like "Bifrost", "Toon Boom Harmony"
+                    # We normalize the app name and check if it matches exactly
+                    if app_name_list:
+                        normalized_app_name = normalize_app_name(app_name)
+                        if not any(normalize_app_name(filter_name) == normalized_app_name for filter_name in app_name_list):
+                            continue
                     if publisher_list and not any(pub.lower() in app_publisher.lower() for pub in publisher_list):
                         continue
                     if category_list and app_category not in category_list:
