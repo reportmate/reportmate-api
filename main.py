@@ -989,13 +989,9 @@ async def get_bulk_applications(
                     app_install_date = app.get('installDate') or app.get('install_date') or app.get('last_modified')
                     
                     # Apply application-level filters (if provided)
-                    # CRITICAL: Use EXACT normalized name matching, not substring matching
-                    # Frontend sends normalized names like "Bifrost", "Toon Boom Harmony"
-                    # We normalize the app name and check if it matches exactly
-                    if app_name_list:
-                        normalized_app_name = normalize_app_name(app_name)
-                        if not any(normalize_app_name(filter_name) == normalized_app_name for filter_name in app_name_list):
-                            continue
+                    # Note: Using substring matching to be more inclusive (shows "Bifrost" AND "Bifrost Extension" when "Bifrost" selected)
+                    if app_name_list and not any(name.lower() in app_name.lower() for name in app_name_list):
+                        continue
                     if publisher_list and not any(pub.lower() in app_publisher.lower() for pub in publisher_list):
                         continue
                     if category_list and app_category not in category_list:
