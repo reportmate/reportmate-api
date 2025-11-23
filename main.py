@@ -623,7 +623,13 @@ async def get_device_by_serial(serial_number: str):
         for table in module_tables:
             try:
                 # Use serial_number as device_id since module tables store serial numbers
-                cursor.execute(f"SELECT data FROM {table} WHERE device_id = %s", (serial_num,))
+                if table == "installs":
+                    # Exclude runLog from main payload to keep response light
+                    # Note: This requires Postgres JSONB column type
+                    cursor.execute(f"SELECT data - 'runLog' FROM {table} WHERE device_id = %s", (serial_num,))
+                else:
+                    cursor.execute(f"SELECT data FROM {table} WHERE device_id = %s", (serial_num,))
+                
                 module_row = cursor.fetchone()
                 if module_row:
                     module_data = json.loads(module_row[0]) if isinstance(module_row[0], str) else module_row[0]
@@ -653,6 +659,38 @@ async def get_device_by_serial(serial_number: str):
     except Exception as e:
         logger.error(f"Failed to get device {serial_number}: {e}")
         raise HTTPException(status_code=500, detail=f"Failed to retrieve device: {str(e)}")
+
+
+@app.get("/api/device/{serial_number}/installs/log", dependencies=[Depends(verify_authentication)])
+async def get_device_installs_log(serial_number: str):
+    """
+    Get the full run log for the installs module.
+    
+    This data is lazy-loaded because it can be very large (MBs of text).
+    """
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        
+        # Query uses correct schema columns
+        cursor.execute("""
+            SELECT data->>'runLog' as run_log
+            FROM installs 
+            WHERE device_id = %s
+        """, (serial_number,))
+        
+        row = cursor.fetchone()
+        conn.close()
+        
+        if not row:
+            # Return empty log if no record found, not 404 to avoid frontend errors
+            return {"runLog": None}
+        
+        return {"runLog": row[0]}
+        
+    except Exception as e:
+        logger.error(f"Failed to get installs log for {serial_number}: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to retrieve installs log: {str(e)}")
 
 
 @app.get("/api/device/{serial_number}/events", dependencies=[Depends(verify_authentication)])
@@ -2202,8 +2240,8 @@ async def submit_events(request: Request):
                 sanitized_payload = payload.copy()
                 if 'metadata' in sanitized_payload and isinstance(sanitized_payload['metadata'], dict):
                     sanitized_payload_metadata = sanitized_payload['metadata'].copy()
-                    if 'additional' in sanitized_payload_metadata and isinstance(sanitized_payload_metadata['additional'], dict):
-                        sanitized_payload_additional = sanitized_payload_metadata['additional'].copy()
+                    if 'additional' in sanitized_payload_metadata and isinstance(sanitized_payloadMetadata['additional'], dict):
+                        sanitized_payload_additional = sanitized_payloadMetadata['additional'].copy()
                         sanitized_payload_additional.pop('passphrase', None)
                         sanitized_payload_metadata['additional'] = sanitized_payload_additional
                     sanitized_payload['metadata'] = sanitized_payload_metadata
