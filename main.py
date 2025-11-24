@@ -440,8 +440,10 @@ async def get_all_devices(
             d.manufacturer,
             d.os,
             d.os_name,
-            d.os_version
+            d.os_version,
+            s.data
         FROM devices d
+        LEFT JOIN system s ON s.device_id = COALESCE(d.serial_number, d.device_id)
         ORDER BY COALESCE(d.serial_number, d.device_id) ASC
         """
 
@@ -476,33 +478,35 @@ async def get_all_devices(
                 os,
                 os_name,
                 os_version,
+                system_data_raw,
             ) = row
 
             serial = serial_number or str(device_id)
 
-            # Fallback: If OS info is missing in devices table, try to get it from system module
-            if not os_name and not os:
+            # System module is the authoritative source for OS info
+            if system_data_raw:
                 try:
-                    cursor.execute("SELECT data FROM system WHERE device_id = %s", (serial,))
-                    system_row = cursor.fetchone()
-                    if system_row:
-                        system_data = system_row[0]
-                        if isinstance(system_data, str):
-                            system_data = json.loads(system_data)
+                    system_data = system_data_raw
+                    if isinstance(system_data, str):
+                        system_data = json.loads(system_data)
+                    
+                    # Handle list format (osquery often returns list)
+                    if isinstance(system_data, list) and len(system_data) > 0:
+                        system_data = system_data[0]
                         
-                        # Handle list format (osquery often returns list)
-                        if isinstance(system_data, list) and len(system_data) > 0:
-                            system_data = system_data[0]
+                    if isinstance(system_data, dict):
+                        os_info = system_data.get('operatingSystem', {})
+                        if os_info:
+                            sys_os_name = os_info.get('name')
+                            sys_os_version = os_info.get('version') or os_info.get('displayVersion')
                             
-                        if isinstance(system_data, dict):
-                            os_info = system_data.get('operatingSystem', {})
-                            if os_info:
-                                os_name = os_info.get('name')
-                                os_version = os_info.get('version') or os_info.get('displayVersion')
-                                # Update local variables for this request
-                                os = os_name
+                            if sys_os_name:
+                                os_name = sys_os_name
+                                os = sys_os_name
+                            if sys_os_version:
+                                os_version = sys_os_version
                 except Exception as sys_error:
-                    logger.warning(f"Failed to get system data for {serial}: {sys_error}")
+                    logger.warning(f"Failed to parse system data for {serial}: {sys_error}")
 
             os_summary = build_os_summary(os_name or os, os_version)
             platform = infer_platform(os_name or os)
