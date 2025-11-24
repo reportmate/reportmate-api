@@ -691,8 +691,6 @@ async def get_device_installs_log(serial_number: str):
     except Exception as e:
         logger.error(f"Failed to get installs log for {serial_number}: {e}")
         raise HTTPException(status_code=500, detail=f"Failed to retrieve installs log: {str(e)}")
-
-
 @app.get("/api/device/{serial_number}/events", dependencies=[Depends(verify_authentication)])
 async def get_device_events(serial_number: str, limit: int = 100):
     """
