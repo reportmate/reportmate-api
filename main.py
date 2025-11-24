@@ -479,6 +479,31 @@ async def get_all_devices(
             ) = row
 
             serial = serial_number or str(device_id)
+
+            # Fallback: If OS info is missing in devices table, try to get it from system module
+            if not os_name and not os:
+                try:
+                    cursor.execute("SELECT data FROM system WHERE device_id = %s", (serial,))
+                    system_row = cursor.fetchone()
+                    if system_row:
+                        system_data = system_row[0]
+                        if isinstance(system_data, str):
+                            system_data = json.loads(system_data)
+                        
+                        # Handle list format (osquery often returns list)
+                        if isinstance(system_data, list) and len(system_data) > 0:
+                            system_data = system_data[0]
+                            
+                        if isinstance(system_data, dict):
+                            os_info = system_data.get('operatingSystem', {})
+                            if os_info:
+                                os_name = os_info.get('name')
+                                os_version = os_info.get('version') or os_info.get('displayVersion')
+                                # Update local variables for this request
+                                os = os_name
+                except Exception as sys_error:
+                    logger.warning(f"Failed to get system data for {serial}: {sys_error}")
+
             os_summary = build_os_summary(os_name or os, os_version)
             platform = infer_platform(os_name or os)
 
@@ -2165,6 +2190,27 @@ async def submit_events(request: Request):
                     conn.commit()
                     modules_processed.append(module_name)
                     logger.info(f"Stored {module_name} module for device {serial_number}")
+                    
+                    # Update devices table with OS info if system module
+                    if module_name == 'system':
+                        try:
+                            # Handle list format
+                            sys_data = module_data[0] if isinstance(module_data, list) and len(module_data) > 0 else module_data
+                            if isinstance(sys_data, dict):
+                                os_info = sys_data.get('operatingSystem', {})
+                                os_name = os_info.get('name')
+                                os_version = os_info.get('version') or os_info.get('displayVersion')
+                                
+                                if os_name:
+                                    cursor.execute("""
+                                        UPDATE devices 
+                                        SET os_name = %s, os_version = %s, os = %s
+                                        WHERE serial_number = %s
+                                    """, (os_name, os_version, os_name, serial_number))
+                                    conn.commit()
+                                    logger.info(f"Updated OS info for device {serial_number}: {os_name} {os_version}")
+                        except Exception as os_update_error:
+                            logger.error(f"Failed to update OS info for device {serial_number}: {os_update_error}")
                     
                 except Exception as module_error:
                     logger.error(f"Failed to store {module_name} module: {module_error}")
