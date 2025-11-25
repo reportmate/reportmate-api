@@ -1858,7 +1858,7 @@ async def get_events(limit: int = 100):
                 e.timestamp
             FROM events e
             LEFT JOIN inventory i ON e.device_id = i.device_id
-            ORDER BY e.created_at DESC 
+            ORDER BY e.timestamp DESC 
             LIMIT %s
         """, (limit,))
         
