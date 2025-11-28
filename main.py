@@ -404,10 +404,14 @@ async def health_check():
 @app.get("/api/devices", response_model=DevicesResponse, dependencies=[Depends(verify_authentication)])
 async def get_all_devices(
     limit: Optional[int] = Query(default=None, ge=1, le=1000),
-    offset: int = Query(default=0, ge=0)
+    offset: int = Query(default=0, ge=0),
+    include_archived: bool = Query(default=False, alias="includeArchived")
 ):
     """
     Bulk devices endpoint with standardized device identification and lightweight module payloads.
+    
+    By default, archived devices are excluded from results.
+    Use includeArchived=true to show archived devices.
     
     **Authentication Required:**
     - Windows clients: X-API-PASSPHRASE header
@@ -418,16 +422,22 @@ async def get_all_devices(
         conn = get_db_connection()
         cursor = conn.cursor()
 
+        # Build archive filter for count query
+        archive_filter = "" if include_archived else "WHERE archived = FALSE"
+        
         total_devices = 0
         try:
-            cursor.execute("SELECT COUNT(*) FROM devices")
+            cursor.execute(f"SELECT COUNT(*) FROM devices {archive_filter}")
             total_result = cursor.fetchone()
             if total_result and total_result[0] is not None:
                 total_devices = int(total_result[0])
         except Exception as count_error:
             logger.warning(f"Failed to get total device count: {count_error}")
 
-        query = """
+        # Build archive filter for main query
+        archive_filter_where = "" if include_archived else "WHERE d.archived = FALSE"
+        
+        query = f"""
         SELECT 
             d.id,
             d.device_id,
@@ -441,9 +451,12 @@ async def get_all_devices(
             d.os,
             d.os_name,
             d.os_version,
-            s.data
+            s.data,
+            d.archived,
+            d.archived_at
         FROM devices d
         LEFT JOIN system s ON s.device_id = COALESCE(d.serial_number, d.device_id)
+        {archive_filter_where}
         ORDER BY COALESCE(d.serial_number, d.device_id) ASC
         """
 
@@ -479,6 +492,8 @@ async def get_all_devices(
                 os_name,
                 os_version,
                 system_data_raw,
+                archived,
+                archived_at,
             ) = row
 
             serial = serial_number or str(device_id)
@@ -557,6 +572,8 @@ async def get_all_devices(
                 "createdAt": created_at.isoformat() if created_at else None,
                 "registrationDate": created_at.isoformat() if created_at else None,
                 "status": status,
+                "archived": archived,
+                "archivedAt": archived_at.isoformat() if archived_at else None,
                 "platform": platform,
                 "osName": os_name or os,
                 "osVersion": os_version,
@@ -619,10 +636,11 @@ async def get_device_by_serial(serial_number: str):
         conn = get_db_connection()
         cursor = conn.cursor()
         
-        # Query uses correct schema columns
+        # Query uses correct schema columns - include archived status
         cursor.execute("""
             SELECT id, device_id, name, serial_number, last_seen, status, 
-                   model, manufacturer, os, os_name, os_version, created_at
+                   model, manufacturer, os, os_name, os_version, created_at,
+                   archived, archived_at
             FROM devices 
             WHERE serial_number = %s OR id = %s
         """, (serial_number, serial_number))
@@ -632,7 +650,7 @@ async def get_device_by_serial(serial_number: str):
             conn.close()
             raise HTTPException(status_code=404, detail="Device not found")
         
-        device_id, device_uuid, device_name, serial_num, last_seen, status, model, manufacturer, os, os_name, os_version, created_at = device_row
+        device_id, device_uuid, device_name, serial_num, last_seen, status, model, manufacturer, os, os_name, os_version, created_at, archived, archived_at = device_row
         
         # Get all module data for this device using device ID
         modules = {}
@@ -677,6 +695,8 @@ async def get_device_by_serial(serial_number: str):
                 "lastSeen": last_seen.isoformat() if last_seen else None,
                 "createdAt": created_at.isoformat() if created_at else None,
                 "registrationDate": created_at.isoformat() if created_at else None,
+                "archived": archived or False,
+                "archivedAt": archived_at.isoformat() if archived_at else None,
                 "modules": modules
             }
         }
@@ -963,16 +983,19 @@ async def get_bulk_applications(
     installDateTo: Optional[str] = None,
     sizeMin: Optional[int] = None,
     sizeMax: Optional[int] = None,
-    loadAll: bool = False
+    loadAll: bool = False,
+    include_archived: bool = Query(default=False, alias="includeArchived")
 ):
     """
     Bulk applications endpoint with filtering support.
     
     Returns flattened list of applications across all devices with filtering.
     Frontend is responsible for search/filtering logic - this is just data retrieval.
+    
+    By default, archived devices are excluded. Use includeArchived=true to include them.
     """
     try:
-        logger.info(f"Fetching bulk applications (loadAll={loadAll}, filters={dict(request.query_params)})")
+        logger.info(f"Fetching bulk applications (loadAll={loadAll}, includeArchived={include_archived}, filters={dict(request.query_params)})")
         
         conn = get_db_connection()
         cursor = conn.cursor()
@@ -984,8 +1007,17 @@ async def get_bulk_applications(
         category_list = categories.split(',') if categories else []
         version_list = versions.split(',') if versions else []
         
-        # Build WHERE clause for device filtering
-        where_conditions = ["d.serial_number IS NOT NULL", "d.serial_number NOT LIKE 'TEST-%'", "d.serial_number != 'localhost'"]
+        # Build WHERE clause for device filtering (including archive filter)
+        where_conditions = [
+            "d.serial_number IS NOT NULL", 
+            "d.serial_number NOT LIKE 'TEST-%'", 
+            "d.serial_number != 'localhost'"
+        ]
+        
+        # Add archive filter
+        if not include_archived:
+            where_conditions.append("d.archived = FALSE")
+        
         query_params = []
         param_index = 1
         
@@ -1107,11 +1139,14 @@ async def get_bulk_applications(
         raise HTTPException(status_code=500, detail=f"Failed to retrieve bulk applications: {str(e)}")
 
 @app.get("/api/devices/hardware", dependencies=[Depends(verify_authentication)])
-async def get_bulk_hardware():
+async def get_bulk_hardware(
+    include_archived: bool = Query(default=False, alias="includeArchived")
+):
     """
     Bulk hardware endpoint.
     
     Returns flattened list of hardware details across all devices.
+    By default, archived devices are excluded. Use includeArchived=true to include them.
     """
     try:
         logger.info("Fetching bulk hardware data")
@@ -1136,8 +1171,13 @@ async def get_bulk_hardware():
         WHERE d.serial_number IS NOT NULL
             AND d.serial_number NOT LIKE 'TEST-%'
             AND h.data IS NOT NULL
-        ORDER BY d.serial_number, h.updated_at DESC
         """
+        
+        # Add archive filter
+        if not include_archived:
+            query += " AND d.archived = FALSE"
+        
+        query += " ORDER BY d.serial_number, h.updated_at DESC"
         
         cursor.execute(query)
         rows = cursor.fetchall()
@@ -1196,11 +1236,14 @@ async def get_bulk_hardware():
         raise HTTPException(status_code=500, detail=f"Failed to retrieve bulk hardware: {str(e)}")
 
 @app.get("/api/devices/installs", dependencies=[Depends(verify_authentication)])
-async def get_bulk_installs():
+async def get_bulk_installs(
+    include_archived: bool = Query(default=False, alias="includeArchived")
+):
     """
     Bulk installs endpoint for Cimian managed packages.
     
     Returns flattened list of managed installs across all devices.
+    By default, archived devices are excluded. Use includeArchived=true to include them.
     """
     try:
         logger.info("Fetching bulk installs data")
@@ -1226,8 +1269,13 @@ async def get_bulk_installs():
         WHERE d.serial_number IS NOT NULL
             AND d.serial_number NOT LIKE 'TEST-%'
             AND i.data IS NOT NULL
-        ORDER BY d.serial_number, i.updated_at DESC
         """
+        
+        # Add archive filter
+        if not include_archived:
+            query += " AND d.archived = FALSE"
+        
+        query += " ORDER BY d.serial_number, i.updated_at DESC"
         
         cursor.execute(query)
         rows = cursor.fetchall()
@@ -1283,12 +1331,15 @@ async def get_bulk_installs():
         raise HTTPException(status_code=500, detail=f"Failed to retrieve bulk installs: {str(e)}")
 
 @app.get("/api/devices/network", dependencies=[Depends(verify_authentication)])
-async def get_bulk_network():
+async def get_bulk_network(
+    include_archived: bool = Query(default=False, alias="includeArchived")
+):
     """
     Bulk network endpoint for fleet-wide network overview.
     
     Returns devices with network configuration data (interfaces, IPs, MACs, DNS, etc.).
     Used by /devices/network page for fleet-wide network visibility.
+    By default, archived devices are excluded. Use includeArchived=true to include them.
     """
     try:
         logger.info("Fetching bulk network data")
@@ -1322,8 +1373,13 @@ async def get_bulk_network():
             AND d.serial_number NOT LIKE 'TEST-%'
             AND d.serial_number != 'localhost'
             AND n.data IS NOT NULL
-        ORDER BY d.serial_number, n.updated_at DESC
         """
+        
+        # Add archive filter
+        if not include_archived:
+            query += " AND d.archived = FALSE"
+        
+        query += " ORDER BY d.serial_number, n.updated_at DESC"
         
         cursor.execute(query)
         rows = cursor.fetchall()
@@ -1369,12 +1425,15 @@ async def get_bulk_network():
         raise HTTPException(status_code=500, detail=f"Failed to retrieve bulk network: {str(e)}")
 
 @app.get("/api/devices/security", dependencies=[Depends(verify_authentication)])
-async def get_bulk_security():
+async def get_bulk_security(
+    include_archived: bool = Query(default=False, alias="includeArchived")
+):
     """
     Bulk security endpoint for fleet-wide security overview.
     
     Returns devices with security configuration (TPM, BitLocker, EDR, AV, etc.).
     Used by /devices/security page for fleet-wide security visibility.
+    By default, archived devices are excluded. Use includeArchived=true to include them.
     """
     try:
         logger.info("Fetching bulk security data")
@@ -1402,8 +1461,13 @@ async def get_bulk_security():
             AND d.serial_number NOT LIKE 'TEST-%'
             AND d.serial_number != 'localhost'
             AND sec.data IS NOT NULL
-        ORDER BY d.serial_number, sec.updated_at DESC
         """
+        
+        # Add archive filter
+        if not include_archived:
+            query += " AND d.archived = FALSE"
+        
+        query += " ORDER BY d.serial_number, sec.updated_at DESC"
         
         cursor.execute(query)
         rows = cursor.fetchall()
@@ -1441,12 +1505,15 @@ async def get_bulk_security():
         raise HTTPException(status_code=500, detail=f"Failed to retrieve bulk security: {str(e)}")
 
 @app.get("/api/devices/profiles", dependencies=[Depends(verify_authentication)])
-async def get_bulk_profiles():
+async def get_bulk_profiles(
+    include_archived: bool = Query(default=False, alias="includeArchived")
+):
     """
     Bulk profiles endpoint for fleet-wide configuration profiles.
     
     Returns devices with MDM profiles and configuration policies.
     Used by /devices/profiles page for fleet-wide profile visibility.
+    By default, archived devices are excluded. Use includeArchived=true to include them.
     """
     try:
         logger.info("Fetching bulk profiles data")
@@ -1474,8 +1541,13 @@ async def get_bulk_profiles():
             AND d.serial_number NOT LIKE 'TEST-%'
             AND d.serial_number != 'localhost'
             AND p.data IS NOT NULL
-        ORDER BY d.serial_number, p.updated_at DESC
         """
+        
+        # Add archive filter
+        if not include_archived:
+            query += " AND d.archived = FALSE"
+        
+        query += " ORDER BY d.serial_number, p.updated_at DESC"
         
         cursor.execute(query)
         rows = cursor.fetchall()
@@ -1513,12 +1585,15 @@ async def get_bulk_profiles():
         raise HTTPException(status_code=500, detail=f"Failed to retrieve bulk profiles: {str(e)}")
 
 @app.get("/api/devices/management", dependencies=[Depends(verify_authentication)])
-async def get_bulk_management():
+async def get_bulk_management(
+    include_archived: bool = Query(default=False, alias="includeArchived")
+):
     """
     Bulk management endpoint for fleet-wide MDM status.
     
     Returns devices with MDM enrollment status and management configuration.
     Used by /devices/management page for fleet-wide MDM visibility.
+    By default, archived devices are excluded. Use includeArchived=true to include them.
     """
     try:
         logger.info("Fetching bulk management data")
@@ -1546,8 +1621,13 @@ async def get_bulk_management():
             AND d.serial_number NOT LIKE 'TEST-%'
             AND d.serial_number != 'localhost'
             AND m.data IS NOT NULL
-        ORDER BY d.serial_number, m.updated_at DESC
         """
+        
+        # Add archive filter
+        if not include_archived:
+            query += " AND d.archived = FALSE"
+        
+        query += " ORDER BY d.serial_number, m.updated_at DESC"
         
         cursor.execute(query)
         rows = cursor.fetchall()
@@ -1601,12 +1681,15 @@ async def get_bulk_management():
         raise HTTPException(status_code=500, detail=f"Failed to retrieve bulk management: {str(e)}")
 
 @app.get("/api/devices/inventory", dependencies=[Depends(verify_authentication)])
-async def get_bulk_inventory():
+async def get_bulk_inventory(
+    include_archived: bool = Query(default=False, alias="includeArchived")
+):
     """
     Bulk inventory endpoint for fleet-wide device inventory.
     
     Returns devices with inventory metadata (names, asset tags, locations, usage, etc.).
     Used by /devices/inventory page for fleet-wide inventory management.
+    By default, archived devices are excluded. Use includeArchived=true to include them.
     """
     try:
         logger.info("Fetching bulk inventory data")
@@ -1634,8 +1717,13 @@ async def get_bulk_inventory():
             AND d.serial_number NOT LIKE 'TEST-%'
             AND d.serial_number != 'localhost'
             AND inv.data IS NOT NULL
-        ORDER BY d.serial_number, inv.updated_at DESC
         """
+        
+        # Add archive filter
+        if not include_archived:
+            query += " AND d.archived = FALSE"
+        
+        query += " ORDER BY d.serial_number, inv.updated_at DESC"
         
         cursor.execute(query)
         rows = cursor.fetchall()
@@ -1674,12 +1762,15 @@ async def get_bulk_inventory():
         raise HTTPException(status_code=500, detail=f"Failed to retrieve bulk inventory: {str(e)}")
 
 @app.get("/api/devices/system", dependencies=[Depends(verify_authentication)])
-async def get_bulk_system():
+async def get_bulk_system(
+    include_archived: bool = Query(default=False, alias="includeArchived")
+):
     """
     Bulk system endpoint for fleet-wide OS and system information.
     
     Returns devices with OS details, uptime, updates, services, etc.
     Used by /devices/system page for fleet-wide system visibility.
+    By default, archived devices are excluded. Use includeArchived=true to include them.
     """
     try:
         logger.info("Fetching bulk system data")
@@ -1707,8 +1798,13 @@ async def get_bulk_system():
             AND d.serial_number NOT LIKE 'TEST-%'
             AND d.serial_number != 'localhost'
             AND s.data IS NOT NULL
-        ORDER BY d.serial_number, s.updated_at DESC
         """
+        
+        # Add archive filter
+        if not include_archived:
+            query += " AND d.archived = FALSE"
+        
+        query += " ORDER BY d.serial_number, s.updated_at DESC"
         
         cursor.execute(query)
         rows = cursor.fetchall()
@@ -1750,12 +1846,15 @@ async def get_bulk_system():
         raise HTTPException(status_code=500, detail=f"Failed to retrieve bulk system: {str(e)}")
 
 @app.get("/api/devices/peripherals", dependencies=[Depends(verify_authentication)])
-async def get_bulk_peripherals():
+async def get_bulk_peripherals(
+    include_archived: bool = Query(default=False, alias="includeArchived")
+):
     """
     Bulk peripherals endpoint for fleet-wide peripheral devices.
     
     Returns devices with connected peripherals (displays, printers, USB devices, etc.).
     Used by /devices/peripherals page for fleet-wide peripheral visibility.
+    By default, archived devices are excluded. Use includeArchived=true to include them.
     
     NOTE: This combines displays and printers data into a unified peripherals view.
     """
@@ -1787,8 +1886,13 @@ async def get_bulk_peripherals():
             AND d.serial_number NOT LIKE 'TEST-%'
             AND d.serial_number != 'localhost'
             AND (disp.data IS NOT NULL OR print.data IS NOT NULL)
-        ORDER BY d.serial_number, GREATEST(disp.updated_at, print.updated_at) DESC
         """
+        
+        # Add archive filter
+        if not include_archived:
+            query += " AND d.archived = FALSE"
+        
+        query += " ORDER BY d.serial_number, GREATEST(disp.updated_at, print.updated_at) DESC"
         
         cursor.execute(query)
         rows = cursor.fetchall()
@@ -2352,6 +2456,270 @@ async def signalr_negotiate():
         "url": "wss://reportmate-signalr.service.signalr.net/client/?hub=events",
         "accessToken": "mock-token-for-development"
     }
+
+@app.patch("/api/device/{serial_number}/archive", dependencies=[Depends(verify_authentication)])
+async def archive_device(serial_number: str):
+    """
+    Archive a device (soft delete).
+    
+    Archived devices:
+    - Are hidden from all bulk endpoints by default
+    - Still exist in database with all module data intact
+    - Can be unarchived later
+    - Do NOT receive new data submissions (rejected at ingestion)
+    
+    This is useful for:
+    - Decommissioned devices
+    - Devices being retired/replaced
+    - Test devices no longer needed
+    - Keeping historical data while hiding from active reports
+    
+    **Authentication Required:**
+    - Windows clients: X-API-PASSPHRASE header
+    - Azure resources: X-MS-CLIENT-PRINCIPAL-ID header (Managed Identity)
+    """
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        
+        # Check if device exists
+        cursor.execute("""
+            SELECT id, archived FROM devices 
+            WHERE serial_number = %s OR id = %s
+        """, (serial_number, serial_number))
+        
+        device_row = cursor.fetchone()
+        if not device_row:
+            conn.close()
+            raise HTTPException(status_code=404, detail=f"Device {serial_number} not found")
+        
+        device_id, currently_archived = device_row
+        
+        # Check if already archived
+        if currently_archived:
+            conn.close()
+            return {
+                "success": True,
+                "message": f"Device {serial_number} is already archived",
+                "serialNumber": serial_number,
+                "archived": True,
+                "timestamp": datetime.now(timezone.utc).isoformat()
+            }
+        
+        # Archive the device
+        cursor.execute("""
+            UPDATE devices 
+            SET archived = TRUE, 
+                archived_at = %s,
+                status = 'archived',
+                updated_at = %s
+            WHERE serial_number = %s OR id = %s
+        """, (datetime.now(timezone.utc), datetime.now(timezone.utc), serial_number, serial_number))
+        
+        conn.commit()
+        conn.close()
+        
+        logger.info(f"✅ Archived device: {serial_number}")
+        
+        return {
+            "success": True,
+            "message": f"Device {serial_number} has been archived",
+            "serialNumber": serial_number,
+            "archived": True,
+            "archivedAt": datetime.now(timezone.utc).isoformat(),
+            "timestamp": datetime.now(timezone.utc).isoformat()
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Failed to archive device {serial_number}: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to archive device: {str(e)}")
+
+
+@app.patch("/api/device/{serial_number}/unarchive", dependencies=[Depends(verify_authentication)])
+async def unarchive_device(serial_number: str):
+    """
+    Unarchive a device (restore from soft delete).
+    
+    Unarchived devices:
+    - Become visible in all bulk endpoints again
+    - Can receive new data submissions
+    - Restore to 'active' status
+    - Retain all historical data
+    
+    **Authentication Required:**
+    - Windows clients: X-API-PASSPHRASE header
+    - Azure resources: X-MS-CLIENT-PRINCIPAL-ID header (Managed Identity)
+    """
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        
+        # Check if device exists
+        cursor.execute("""
+            SELECT id, archived FROM devices 
+            WHERE serial_number = %s OR id = %s
+        """, (serial_number, serial_number))
+        
+        device_row = cursor.fetchone()
+        if not device_row:
+            conn.close()
+            raise HTTPException(status_code=404, detail=f"Device {serial_number} not found")
+        
+        device_id, currently_archived = device_row
+        
+        # Check if not archived
+        if not currently_archived:
+            conn.close()
+            return {
+                "success": True,
+                "message": f"Device {serial_number} is not archived",
+                "serialNumber": serial_number,
+                "archived": False,
+                "timestamp": datetime.now(timezone.utc).isoformat()
+            }
+        
+        # Unarchive the device
+        cursor.execute("""
+            UPDATE devices 
+            SET archived = FALSE, 
+                archived_at = NULL,
+                status = 'active',
+                updated_at = %s
+            WHERE serial_number = %s OR id = %s
+        """, (datetime.now(timezone.utc), serial_number, serial_number))
+        
+        conn.commit()
+        conn.close()
+        
+        logger.info(f"✅ Unarchived device: {serial_number}")
+        
+        return {
+            "success": True,
+            "message": f"Device {serial_number} has been unarchived",
+            "serialNumber": serial_number,
+            "archived": False,
+            "timestamp": datetime.now(timezone.utc).isoformat()
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Failed to unarchive device {serial_number}: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to unarchive device: {str(e)}")
+
+
+@app.delete("/api/device/{serial_number}", dependencies=[Depends(verify_authentication)])
+async def delete_device(serial_number: str, confirm: bool = Query(False)):
+    """
+    Permanently delete a device and all its data.
+    
+    **WARNING: This is a DESTRUCTIVE operation!**
+    
+    Deletion removes:
+    - Device record from devices table
+    - All module data (cascading delete via foreign keys)
+    - All events history
+    - ALL historical data - cannot be recovered
+    
+    This should only be used for:
+    - Test devices that should not exist
+    - Duplicate records
+    - Data cleanup/GDPR compliance
+    
+    **RECOMMENDATION:** Use archive instead of delete to preserve historical data!
+    
+    Query Parameters:
+    - confirm: Must be set to true to confirm deletion (safety check)
+    
+    **Authentication Required:**
+    - Windows clients: X-API-PASSPHRASE header
+    - Azure resources: X-MS-CLIENT-PRINCIPAL-ID header (Managed Identity)
+    """
+    try:
+        # Safety check: require explicit confirmation
+        if not confirm:
+            raise HTTPException(
+                status_code=400,
+                detail="Deletion requires confirmation. Add ?confirm=true to the request. WARNING: This permanently deletes all device data!"
+            )
+        
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        
+        # Check if device exists and get details for logging
+        cursor.execute("""
+            SELECT id, device_id, name, archived FROM devices 
+            WHERE serial_number = %s OR id = %s
+        """, (serial_number, serial_number))
+        
+        device_row = cursor.fetchone()
+        if not device_row:
+            conn.close()
+            raise HTTPException(status_code=404, detail=f"Device {serial_number} not found")
+        
+        device_id, device_uuid, device_name, is_archived = device_row
+        
+        # Get module counts for logging
+        module_tables = ["system", "hardware", "applications", "installs", "network", "security", 
+                        "inventory", "management", "profiles", "displays", "printers"]
+        module_counts = {}
+        
+        for table in module_tables:
+            try:
+                cursor.execute(f"SELECT COUNT(*) FROM {table} WHERE device_id = %s", (device_id,))
+                count_result = cursor.fetchone()
+                module_counts[table] = count_result[0] if count_result else 0
+            except Exception:
+                module_counts[table] = 0
+        
+        # Get event count
+        cursor.execute("SELECT COUNT(*) FROM events WHERE device_id = %s", (device_id,))
+        event_count_result = cursor.fetchone()
+        event_count = event_count_result[0] if event_count_result else 0
+        
+        # Delete the device (CASCADE will delete all related module data and events)
+        cursor.execute("""
+            DELETE FROM devices 
+            WHERE serial_number = %s OR id = %s
+        """, (serial_number, serial_number))
+        
+        deleted_count = cursor.rowcount
+        
+        conn.commit()
+        conn.close()
+        
+        if deleted_count == 0:
+            raise HTTPException(status_code=404, detail=f"Device {serial_number} not found")
+        
+        logger.warning(f"🗑️ DELETED device: {serial_number} (UUID: {device_uuid}, Name: {device_name})")
+        logger.warning(f"   - Archived status: {is_archived}")
+        logger.warning(f"   - Events deleted: {event_count}")
+        logger.warning(f"   - Modules deleted: {sum(module_counts.values())} records across {len([k for k, v in module_counts.items() if v > 0])} tables")
+        
+        return {
+            "success": True,
+            "message": f"Device {serial_number} and all associated data has been permanently deleted",
+            "serialNumber": serial_number,
+            "deviceId": device_uuid,
+            "deviceName": device_name,
+            "wasArchived": is_archived,
+            "deletedData": {
+                "events": event_count,
+                "modules": module_counts,
+                "totalModuleRecords": sum(module_counts.values())
+            },
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "warning": "This data cannot be recovered"
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Failed to delete device {serial_number}: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to delete device: {str(e)}")
+
 
 @app.get("/api/debug/database")
 async def debug_database():
