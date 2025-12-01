@@ -20,6 +20,14 @@ from fastapi import FastAPI, HTTPException, Query, Request, Header, Depends
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
+# Azure Web PubSub for real-time events
+try:
+    from azure.messaging.webpubsubservice import WebPubSubServiceClient
+    WEBPUBSUB_AVAILABLE = True
+except ImportError:
+    WEBPUBSUB_AVAILABLE = False
+    WebPubSubServiceClient = None
+
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -2364,10 +2372,26 @@ async def submit_events(request: Request):
                 cursor.execute("""
                     INSERT INTO events (device_id, event_type, message, details, timestamp, created_at)
                     VALUES (%s, %s, %s, %s::jsonb, %s, %s)
+                    RETURNING id
                 """, (serial_number, event_type, message, details_json, collected_at, datetime.now(timezone.utc)))
+                
+                event_row = cursor.fetchone()
+                event_id = event_row[0] if event_row else None
                 
                 events_stored += 1
                 logger.debug(f"Stored {event_type} event for device {serial_number}: {message}")
+                
+                # Broadcast event to connected WebSocket clients
+                try:
+                    await broadcast_event({
+                        "id": str(event_id) if event_id else str(datetime.now(timezone.utc).timestamp()),
+                        "device": serial_number,
+                        "kind": event_type,
+                        "ts": collected_at.isoformat() if hasattr(collected_at, 'isoformat') else str(collected_at),
+                        "payload": enhanced_details
+                    })
+                except Exception as broadcast_error:
+                    logger.warning(f"Failed to broadcast event: {broadcast_error}")
                 
             except Exception as event_error:
                 logger.error(f"Failed to store event: {event_error}")
@@ -2416,10 +2440,26 @@ async def submit_events(request: Request):
                 cursor.execute("""
                     INSERT INTO events (device_id, event_type, message, details, timestamp, created_at)
                     VALUES (%s, 'info', %s, %s::jsonb, %s, %s)
+                    RETURNING id
                 """, (serial_number, collection_message, collection_details, collected_at, datetime.now(timezone.utc)))
+                
+                event_row = cursor.fetchone()
+                event_id = event_row[0] if event_row else None
                 
                 events_stored += 1
                 logger.info(f"Created fallback system event with full payload (no events in payload)")
+                
+                # Broadcast fallback event to connected WebSocket clients
+                try:
+                    await broadcast_event({
+                        "id": str(event_id) if event_id else str(datetime.now(timezone.utc).timestamp()),
+                        "device": serial_number,
+                        "kind": "info",
+                        "ts": collected_at.isoformat() if hasattr(collected_at, 'isoformat') else str(collected_at),
+                        "payload": {"message": collection_message, "modules": modules_processed}
+                    })
+                except Exception as broadcast_error:
+                    logger.warning(f"Failed to broadcast fallback event: {broadcast_error}")
             except Exception as system_event_error:
                 logger.error(f"Failed to create system event: {system_event_error}")
         elif has_installs_module and events_stored == 0:
@@ -2449,13 +2489,109 @@ async def submit_events(request: Request):
         logger.error(f"Failed to submit events: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"Failed to process events: {str(e)}")
 
+# Web PubSub connection string from environment
+EVENTS_CONNECTION = os.getenv('EVENTS_CONNECTION')
+WEB_PUBSUB_HUB = "events"  # Hub name for real-time events
+
+# Cached WebPubSub service client for broadcasting
+_webpubsub_service = None
+
+def get_webpubsub_service():
+    """Get or create a cached WebPubSub service client."""
+    global _webpubsub_service
+    if _webpubsub_service is None and WEBPUBSUB_AVAILABLE and EVENTS_CONNECTION:
+        try:
+            _webpubsub_service = WebPubSubServiceClient.from_connection_string(
+                connection_string=EVENTS_CONNECTION,
+                hub=WEB_PUBSUB_HUB
+            )
+        except Exception as e:
+            logger.error(f"Failed to create WebPubSub service: {e}")
+    return _webpubsub_service
+
+async def broadcast_event(event_data: dict):
+    """
+    Broadcast an event to all connected WebSocket clients.
+    
+    Args:
+        event_data: Event dictionary with id, device, kind, ts, payload
+    """
+    service = get_webpubsub_service()
+    if not service:
+        return  # WebPubSub not available, skip broadcasting
+    
+    try:
+        # Send to all connected clients
+        # The event name "event" matches what the frontend listens for
+        service.send_to_all(
+            message=json.dumps({"target": "event", "arguments": [event_data]}),
+            content_type="application/json"
+        )
+        logger.info(f"📡 Broadcast event to WebPubSub: {event_data.get('kind', 'unknown')} for {event_data.get('device', 'unknown')}")
+    except Exception as e:
+        logger.error(f"Failed to broadcast event: {e}")
+
 @app.get("/api/negotiate")
-async def signalr_negotiate():
-    """SignalR negotiate endpoint."""
-    return {
-        "url": "wss://reportmate-signalr.service.signalr.net/client/?hub=events",
-        "accessToken": "mock-token-for-development"
-    }
+async def signalr_negotiate(device: str = Query(default="dashboard")):
+    """
+    SignalR/WebPubSub negotiate endpoint.
+    
+    Generates a client access token for Azure Web PubSub connection.
+    The token allows clients to connect and receive real-time events.
+    
+    Args:
+        device: Optional device/client identifier for user tracking
+    
+    Returns:
+        url: WebSocket URL with embedded access token
+        accessToken: JWT token for authentication (also embedded in url)
+    """
+    if not WEBPUBSUB_AVAILABLE:
+        logger.warning("Azure Web PubSub SDK not available, falling back to mock")
+        return {
+            "url": "wss://reportmate-signalr.webpubsub.azure.com/client/hubs/events",
+            "accessToken": None,
+            "error": "WebPubSub SDK not installed"
+        }
+    
+    if not EVENTS_CONNECTION:
+        logger.warning("EVENTS_CONNECTION not configured, SignalR unavailable")
+        return {
+            "url": None,
+            "accessToken": None,
+            "error": "EVENTS_CONNECTION not configured"
+        }
+    
+    try:
+        # Create Web PubSub service client from connection string
+        service = WebPubSubServiceClient.from_connection_string(
+            connection_string=EVENTS_CONNECTION,
+            hub=WEB_PUBSUB_HUB
+        )
+        
+        # Generate client access token with 60-minute expiry
+        # The token allows the client to receive messages from the hub
+        token_response = service.get_client_access_token(
+            user_id=device,
+            minutes_to_expire=60,
+            roles=["webpubsub.joinLeaveGroup.events"]  # Allow joining the events group
+        )
+        
+        logger.info(f"Generated WebPubSub token for client: {device}")
+        
+        return {
+            "url": token_response.get("url"),
+            "accessToken": token_response.get("token"),
+            "expiresOn": (datetime.now(timezone.utc) + timedelta(minutes=60)).isoformat()
+        }
+        
+    except Exception as e:
+        logger.error(f"Failed to generate WebPubSub token: {e}", exc_info=True)
+        return {
+            "url": None,
+            "accessToken": None,
+            "error": f"Token generation failed: {str(e)}"
+        }
 
 @app.patch("/api/device/{serial_number}/archive", dependencies=[Depends(verify_authentication)])
 async def archive_device(serial_number: str):
