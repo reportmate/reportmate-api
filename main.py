@@ -2521,10 +2521,11 @@ async def broadcast_event(event_data: dict):
         return  # WebPubSub not available, skip broadcasting
     
     try:
-        # Send to all connected clients
-        # The event name "event" matches what the frontend listens for
+        # Send to all connected clients using the JSON subprotocol format
+        # Azure Web PubSub will wrap this as: {"type": "message", "from": "server", "data": event_data}
+        # The client receives it and extracts event_data from message.data
         service.send_to_all(
-            message=json.dumps({"target": "event", "arguments": [event_data]}),
+            message=event_data,  # Send the event data directly, WebPubSub wraps it
             content_type="application/json"
         )
         logger.info(f"📡 Broadcast event to WebPubSub: {event_data.get('kind', 'unknown')} for {event_data.get('device', 'unknown')}")
