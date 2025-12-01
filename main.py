@@ -2382,12 +2382,14 @@ async def submit_events(request: Request):
                 logger.debug(f"Stored {event_type} event for device {serial_number}: {message}")
                 
                 # Broadcast event to connected WebSocket clients
+                # CRITICAL: Include the message field so frontend shows proper description immediately
                 try:
                     await broadcast_event({
                         "id": str(event_id) if event_id else str(datetime.now(timezone.utc).timestamp()),
                         "device": serial_number,
                         "kind": event_type,
                         "ts": collected_at.isoformat() if hasattr(collected_at, 'isoformat') else str(collected_at),
+                        "message": message,  # Include the formatted message for immediate display
                         "payload": enhanced_details
                     })
                 except Exception as broadcast_error:
@@ -2450,12 +2452,14 @@ async def submit_events(request: Request):
                 logger.info(f"Created fallback system event with full payload (no events in payload)")
                 
                 # Broadcast fallback event to connected WebSocket clients
+                # Include message field for proper display
                 try:
                     await broadcast_event({
                         "id": str(event_id) if event_id else str(datetime.now(timezone.utc).timestamp()),
                         "device": serial_number,
                         "kind": "info",
                         "ts": collected_at.isoformat() if hasattr(collected_at, 'isoformat') else str(collected_at),
+                        "message": collection_message,  # Include the formatted message
                         "payload": {"message": collection_message, "modules": modules_processed}
                     })
                 except Exception as broadcast_error:
