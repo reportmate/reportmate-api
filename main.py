@@ -535,7 +535,7 @@ async def get_dashboard_data(
             }
             devices.append(device)
         
-        # === INSTALL STATS QUERY (from /api/stats/installs) ===
+        # === INSTALL STATS QUERY (from cimian->items->currentStatus) ===
         install_stats = {
             "devicesWithErrors": 0,
             "devicesWithWarnings": 0,
@@ -544,49 +544,53 @@ async def get_dashboard_data(
         }
         
         try:
-            # Count devices with install errors
+            # Count devices with install errors (items with failed/error status)
             cursor.execute("""
                 SELECT COUNT(DISTINCT i.device_id)
                 FROM installs i
-                CROSS JOIN LATERAL jsonb_array_elements(i.data->'cimian'->'events') as event
-                WHERE event->>'status' IN ('Error', 'Failed')
-                   OR event->>'level' = 'ERROR'
+                CROSS JOIN LATERAL jsonb_array_elements(i.data->'cimian'->'items') as item
+                WHERE LOWER(item->>'currentStatus') IN ('failed', 'error', 'needs_reinstall')
+                   OR LOWER(item->>'mappedStatus') IN ('failed', 'error')
             """)
             install_stats["devicesWithErrors"] = cursor.fetchone()[0] or 0
             
-            # Count devices with warnings (no errors)
+            # Count devices with warnings (pending/update status, but no errors)
             cursor.execute("""
                 SELECT COUNT(DISTINCT i.device_id)
                 FROM installs i
-                CROSS JOIN LATERAL jsonb_array_elements(i.data->'cimian'->'events') as event
-                WHERE (event->>'status' = 'Warning' OR event->>'level' = 'WARN')
+                CROSS JOIN LATERAL jsonb_array_elements(i.data->'cimian'->'items') as item
+                WHERE (LOWER(item->>'currentStatus') LIKE '%%pending%%'
+                    OR LOWER(item->>'currentStatus') LIKE '%%update%%'
+                    OR LOWER(item->>'currentStatus') = 'warning')
                 AND i.device_id NOT IN (
+                    -- Exclude devices that have any errors
                     SELECT DISTINCT device_id
                     FROM installs
-                    CROSS JOIN LATERAL jsonb_array_elements(data->'cimian'->'events') as err_event
-                    WHERE err_event->>'status' IN ('Error', 'Failed')
-                       OR err_event->>'level' = 'ERROR'
+                    CROSS JOIN LATERAL jsonb_array_elements(data->'cimian'->'items') as err_item
+                    WHERE LOWER(err_item->>'currentStatus') IN ('failed', 'error', 'needs_reinstall')
+                       OR LOWER(err_item->>'mappedStatus') IN ('failed', 'error')
                 )
             """)
             install_stats["devicesWithWarnings"] = cursor.fetchone()[0] or 0
             
-            # Total failed installs
+            # Total failed install items across all devices
             cursor.execute("""
                 SELECT COUNT(*)
                 FROM installs i
-                CROSS JOIN LATERAL jsonb_array_elements(i.data->'cimian'->'events') as event
-                WHERE event->>'status' IN ('Error', 'Failed')
-                   OR event->>'level' = 'ERROR'
+                CROSS JOIN LATERAL jsonb_array_elements(i.data->'cimian'->'items') as item
+                WHERE LOWER(item->>'currentStatus') IN ('failed', 'error', 'needs_reinstall')
+                   OR LOWER(item->>'mappedStatus') IN ('failed', 'error')
             """)
             install_stats["totalFailedInstalls"] = cursor.fetchone()[0] or 0
             
-            # Total warnings
+            # Total warning items across all devices
             cursor.execute("""
                 SELECT COUNT(*)
                 FROM installs i
-                CROSS JOIN LATERAL jsonb_array_elements(i.data->'cimian'->'events') as event
-                WHERE event->>'status' = 'Warning'
-                   OR event->>'level' = 'WARN'
+                CROSS JOIN LATERAL jsonb_array_elements(i.data->'cimian'->'items') as item
+                WHERE LOWER(item->>'currentStatus') LIKE '%%pending%%'
+                   OR LOWER(item->>'currentStatus') LIKE '%%update%%'
+                   OR LOWER(item->>'currentStatus') = 'warning'
             """)
             install_stats["totalWarnings"] = cursor.fetchone()[0] or 0
             
@@ -2299,56 +2303,60 @@ async def get_install_stats():
         conn = get_db_connection()
         cursor = conn.cursor()
         
-        # Count devices with install errors from Cimian event logs
-        logger.debug("Counting devices with install errors...")
+        # Count devices with install errors from Cimian items (not events)
+        # Items have currentStatus field with values like: failed, error, Pending Update, etc.
+        logger.debug("Counting devices with install errors from cimian->items...")
         cursor.execute("""
             SELECT COUNT(DISTINCT i.device_id)
             FROM installs i
-            CROSS JOIN LATERAL jsonb_array_elements(i.data->'cimian'->'events') as event
-            WHERE event->>'status' IN ('Error', 'Failed')
-               OR event->>'level' = 'ERROR'
+            CROSS JOIN LATERAL jsonb_array_elements(i.data->'cimian'->'items') as item
+            WHERE LOWER(item->>'currentStatus') IN ('failed', 'error', 'needs_reinstall')
+               OR LOWER(item->>'mappedStatus') IN ('failed', 'error')
         """)
         devices_with_errors = cursor.fetchone()[0] or 0
         logger.debug(f"Devices with errors: {devices_with_errors}")
         
-        # Count devices with warnings but NO errors from Cimian event logs
+        # Count devices with warnings (pending/update status, but NO errors)
         logger.debug("Counting devices with warnings (excluding devices with errors)...")
         cursor.execute("""
             SELECT COUNT(DISTINCT i.device_id)
             FROM installs i
-            CROSS JOIN LATERAL jsonb_array_elements(i.data->'cimian'->'events') as event
-            WHERE (event->>'status' = 'Warning' OR event->>'level' = 'WARN')
+            CROSS JOIN LATERAL jsonb_array_elements(i.data->'cimian'->'items') as item
+            WHERE (LOWER(item->>'currentStatus') LIKE '%%pending%%'
+                OR LOWER(item->>'currentStatus') LIKE '%%update%%'
+                OR LOWER(item->>'currentStatus') = 'warning')
             AND i.device_id NOT IN (
                 -- Exclude devices that have any errors
                 SELECT DISTINCT device_id
                 FROM installs
-                CROSS JOIN LATERAL jsonb_array_elements(data->'cimian'->'events') as err_event
-                WHERE err_event->>'status' IN ('Error', 'Failed')
-                   OR err_event->>'level' = 'ERROR'
+                CROSS JOIN LATERAL jsonb_array_elements(data->'cimian'->'items') as err_item
+                WHERE LOWER(err_item->>'currentStatus') IN ('failed', 'error', 'needs_reinstall')
+                   OR LOWER(err_item->>'mappedStatus') IN ('failed', 'error')
             )
         """)
         devices_with_warnings = cursor.fetchone()[0] or 0
         logger.debug(f"Devices with warnings: {devices_with_warnings}")
         
-        # Count total failed install events across all devices
+        # Count total failed install items across all devices
         logger.debug("Counting total failed installs...")
         cursor.execute("""
             SELECT COUNT(*)
             FROM installs i
-            CROSS JOIN LATERAL jsonb_array_elements(i.data->'cimian'->'events') as event
-            WHERE event->>'status' IN ('Error', 'Failed')
-               OR event->>'level' = 'ERROR'
+            CROSS JOIN LATERAL jsonb_array_elements(i.data->'cimian'->'items') as item
+            WHERE LOWER(item->>'currentStatus') IN ('failed', 'error', 'needs_reinstall')
+               OR LOWER(item->>'mappedStatus') IN ('failed', 'error')
         """)
         total_failed = cursor.fetchone()[0] or 0
         
-        # Count total warning events across all devices
+        # Count total warning items across all devices
         logger.debug("Counting total warnings...")
         cursor.execute("""
             SELECT COUNT(*)
             FROM installs i
-            CROSS JOIN LATERAL jsonb_array_elements(i.data->'cimian'->'events') as event
-            WHERE event->>'status' = 'Warning'
-               OR event->>'level' = 'WARN'
+            CROSS JOIN LATERAL jsonb_array_elements(i.data->'cimian'->'items') as item
+            WHERE LOWER(item->>'currentStatus') LIKE '%%pending%%'
+               OR LOWER(item->>'currentStatus') LIKE '%%update%%'
+               OR LOWER(item->>'currentStatus') = 'warning'
         """)
         total_warnings = cursor.fetchone()[0] or 0
         
