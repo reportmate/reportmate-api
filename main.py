@@ -2190,15 +2190,16 @@ async def get_events(limit: int = 100):
         conn = get_db_connection()
         cursor = conn.cursor()
         
-        # JOIN with inventory to get device names in single query
-        # Return only 4 fields needed for dashboard Recent Events widget
+        # JOIN with inventory to get device names and assetTag in single query
+        # Return only essential fields needed for events list
         # Note: device_id in both tables IS the serial number
-        # deviceName is stored in inventory.data JSONB column
+        # deviceName and assetTag are stored in inventory.data JSONB column
         cursor.execute("""
             SELECT 
                 e.id,
                 e.device_id,
                 i.data->>'deviceName' as device_name,
+                i.data->>'assetTag' as asset_tag,
                 e.event_type,
                 e.message,
                 e.timestamp
@@ -2213,12 +2214,13 @@ async def get_events(limit: int = 100):
         
         events = []
         for row in rows:
-            event_id, device_id, device_name, event_type, message, timestamp = row
+            event_id, device_id, device_name, asset_tag, event_type, message, timestamp = row
             events.append({
-                # 4 essential fields for dashboard
+                # Essential fields for events page
                 "id": event_id,
                 "device": device_id,  # Serial number (used for links)
                 "deviceName": device_name or device_id,  # Friendly name from inventory
+                "assetTag": asset_tag,  # Asset tag for display
                 "kind": event_type,  # Event type (success/warning/error/info)
                 "message": message,  # User-friendly message
                 "ts": timestamp.isoformat() if timestamp else None,  # Timestamp
