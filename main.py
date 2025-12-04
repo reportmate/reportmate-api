@@ -409,6 +409,240 @@ async def health_check():
             }
         )
 
+@app.get("/api/dashboard", dependencies=[Depends(verify_authentication)])
+async def get_dashboard_data(
+    events_limit: int = Query(default=50, ge=1, le=200, alias="eventsLimit"),
+    include_archived: bool = Query(default=False, alias="includeArchived")
+):
+    """
+    Consolidated dashboard endpoint - fetches all dashboard data in a single API call.
+    
+    Combines:
+    - All devices with full OS data (eliminates need for individual device fetches)
+    - Install statistics (devicesWithErrors, devicesWithWarnings, totalFailedInstalls)
+    - Recent events (for dashboard event widget)
+    
+    This eliminates 10+ separate API calls from the dashboard, dramatically improving load time.
+    
+    Returns:
+        {
+            "devices": [...],           # Full device list with OS data
+            "totalDevices": int,        # Total device count
+            "installStats": {...},      # Install error/warning counts
+            "events": [...],            # Recent events for widget
+            "totalEvents": int,         # Total recent events count
+            "lastUpdated": str          # ISO8601 timestamp
+        }
+    """
+    conn = None
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        
+        # === DEVICES QUERY (from /api/devices) ===
+        archive_filter_where = "" if include_archived else "WHERE d.archived = FALSE"
+        
+        # Get total device count
+        total_devices = 0
+        try:
+            archive_filter = "" if include_archived else "WHERE archived = FALSE"
+            cursor.execute(f"SELECT COUNT(*) FROM devices {archive_filter}")
+            total_result = cursor.fetchone()
+            if total_result and total_result[0] is not None:
+                total_devices = int(total_result[0])
+        except Exception as count_error:
+            logger.warning(f"Failed to get total device count: {count_error}")
+
+        # Fetch all devices with inventory and system data for OS info
+        device_query = f"""
+        SELECT 
+            d.id,
+            d.device_id,
+            d.serial_number,
+            d.os,
+            d.os_name,
+            d.os_version,
+            d.last_seen,
+            d.archived,
+            i.data as inventory_data,
+            s.data as system_data,
+            h.data as hardware_data
+        FROM devices d
+        LEFT JOIN inventory i ON d.serial_number = i.device_id
+        LEFT JOIN system s ON d.serial_number = s.device_id
+        LEFT JOIN hardware h ON d.serial_number = h.device_id
+        {archive_filter_where}
+        ORDER BY d.last_seen DESC NULLS LAST
+        """
+        
+        cursor.execute(device_query)
+        device_rows = cursor.fetchall()
+        
+        devices = []
+        for row in device_rows:
+            db_id, device_id, serial_number, os_val, os_name_db, os_version_db, last_seen, archived, inventory_data, system_data, hardware_data = row
+            
+            # Parse JSONB data
+            inv_data = inventory_data if isinstance(inventory_data, dict) else {}
+            sys_data = system_data if isinstance(system_data, dict) else {}
+            hw_data = hardware_data if isinstance(hardware_data, dict) else {}
+            
+            # Extract OS info from system data or fall back to DB columns
+            os_info = sys_data.get("operatingSystem", {})
+            final_os_name = os_info.get("name") or os_name_db or os_val or "Unknown"
+            final_os_version = os_info.get("version") or os_version_db or ""
+            
+            # Determine platform from OS name
+            platform = "Windows" if "windows" in (final_os_name or "").lower() else "macOS" if "mac" in (final_os_name or "").lower() else "Unknown"
+            
+            # Determine status based on last_seen
+            status = "online"
+            if last_seen:
+                time_diff = datetime.now(timezone.utc) - last_seen.replace(tzinfo=timezone.utc) if last_seen.tzinfo is None else datetime.now(timezone.utc) - last_seen
+                if time_diff.total_seconds() > 86400:  # 24 hours
+                    status = "offline"
+                elif time_diff.total_seconds() > 3600:  # 1 hour
+                    status = "idle"
+            
+            device = {
+                "id": db_id,
+                "deviceId": device_id,
+                "serialNumber": serial_number,
+                "name": inv_data.get("deviceName") or serial_number,
+                "platform": platform,
+                "osName": final_os_name,
+                "osVersion": final_os_version,
+                "status": status,
+                "archived": archived or False,
+                "lastSeen": last_seen.isoformat() if last_seen else None,
+                # Module data for dashboard widgets (platform distribution needs inventory + hardware)
+                "modules": {
+                    "system": {
+                        "operatingSystem": os_info if os_info else {"name": final_os_name, "version": final_os_version}
+                    },
+                    "inventory": {
+                        "catalog": inv_data.get("catalog"),
+                        "usage": inv_data.get("usage"),
+                        "department": inv_data.get("department"),
+                        "location": inv_data.get("location")
+                    } if inv_data else None,
+                    "hardware": {
+                        "processor": hw_data.get("processor", {})
+                    } if hw_data else None
+                }
+            }
+            devices.append(device)
+        
+        # === INSTALL STATS QUERY (from /api/stats/installs) ===
+        install_stats = {
+            "devicesWithErrors": 0,
+            "devicesWithWarnings": 0,
+            "totalFailedInstalls": 0,
+            "totalWarnings": 0
+        }
+        
+        try:
+            # Count devices with install errors
+            cursor.execute("""
+                SELECT COUNT(DISTINCT i.device_id)
+                FROM installs i
+                CROSS JOIN LATERAL jsonb_array_elements(i.data->'cimian'->'events') as event
+                WHERE event->>'status' IN ('Error', 'Failed')
+                   OR event->>'level' = 'ERROR'
+            """)
+            install_stats["devicesWithErrors"] = cursor.fetchone()[0] or 0
+            
+            # Count devices with warnings (no errors)
+            cursor.execute("""
+                SELECT COUNT(DISTINCT i.device_id)
+                FROM installs i
+                CROSS JOIN LATERAL jsonb_array_elements(i.data->'cimian'->'events') as event
+                WHERE (event->>'status' = 'Warning' OR event->>'level' = 'WARN')
+                AND i.device_id NOT IN (
+                    SELECT DISTINCT device_id
+                    FROM installs
+                    CROSS JOIN LATERAL jsonb_array_elements(data->'cimian'->'events') as err_event
+                    WHERE err_event->>'status' IN ('Error', 'Failed')
+                       OR err_event->>'level' = 'ERROR'
+                )
+            """)
+            install_stats["devicesWithWarnings"] = cursor.fetchone()[0] or 0
+            
+            # Total failed installs
+            cursor.execute("""
+                SELECT COUNT(*)
+                FROM installs i
+                CROSS JOIN LATERAL jsonb_array_elements(i.data->'cimian'->'events') as event
+                WHERE event->>'status' IN ('Error', 'Failed')
+                   OR event->>'level' = 'ERROR'
+            """)
+            install_stats["totalFailedInstalls"] = cursor.fetchone()[0] or 0
+            
+            # Total warnings
+            cursor.execute("""
+                SELECT COUNT(*)
+                FROM installs i
+                CROSS JOIN LATERAL jsonb_array_elements(i.data->'cimian'->'events') as event
+                WHERE event->>'status' = 'Warning'
+                   OR event->>'level' = 'WARN'
+            """)
+            install_stats["totalWarnings"] = cursor.fetchone()[0] or 0
+            
+        except Exception as stats_error:
+            logger.warning(f"Failed to get install stats for dashboard: {stats_error}")
+        
+        # === EVENTS QUERY (from /api/events) ===
+        events = []
+        try:
+            cursor.execute("""
+                SELECT 
+                    e.id,
+                    e.device_id,
+                    i.data->>'deviceName' as device_name,
+                    e.event_type,
+                    e.message,
+                    e.timestamp
+                FROM events e
+                LEFT JOIN inventory i ON e.device_id = i.device_id
+                ORDER BY e.timestamp DESC 
+                LIMIT %s
+            """, (events_limit,))
+            
+            event_rows = cursor.fetchall()
+            for row in event_rows:
+                event_id, device_id, device_name, event_type, message, timestamp = row
+                events.append({
+                    "id": event_id,
+                    "device": device_id,
+                    "deviceName": device_name or device_id,
+                    "kind": event_type,
+                    "message": message,
+                    "ts": timestamp.isoformat() if timestamp else None,
+                    "serialNumber": device_id,
+                    "eventType": event_type,
+                    "timestamp": timestamp.isoformat() if timestamp else None
+                })
+        except Exception as events_error:
+            logger.warning(f"Failed to get events for dashboard: {events_error}")
+        
+        conn.close()
+        
+        # Return consolidated dashboard data
+        return {
+            "devices": devices,
+            "totalDevices": total_devices,
+            "installStats": install_stats,
+            "events": events,
+            "totalEvents": len(events),
+            "lastUpdated": datetime.now(timezone.utc).isoformat()
+        }
+        
+    except Exception as e:
+        logger.error(f"Failed to get dashboard data: {e}")
+        if conn:
+            conn.close()
+        raise HTTPException(status_code=500, detail=f"Failed to retrieve dashboard data: {str(e)}")
+
 @app.get("/api/devices", response_model=DevicesResponse, dependencies=[Depends(verify_authentication)])
 async def get_all_devices(
     limit: Optional[int] = Query(default=None, ge=1, le=1000),
