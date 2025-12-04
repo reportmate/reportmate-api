@@ -464,6 +464,7 @@ async def get_dashboard_data(
             d.os_version,
             d.last_seen,
             d.archived,
+            d.created_at,
             i.data as inventory_data,
             s.data as system_data,
             h.data as hardware_data
@@ -480,7 +481,7 @@ async def get_dashboard_data(
         
         devices = []
         for row in device_rows:
-            db_id, device_id, serial_number, os_val, os_name_db, os_version_db, last_seen, archived, inventory_data, system_data, hardware_data = row
+            db_id, device_id, serial_number, os_val, os_name_db, os_version_db, last_seen, archived, created_at, inventory_data, system_data, hardware_data = row
             
             # Parse JSONB data
             inv_data = inventory_data if isinstance(inventory_data, dict) else {}
@@ -515,6 +516,7 @@ async def get_dashboard_data(
                 "status": status,
                 "archived": archived or False,
                 "lastSeen": last_seen.isoformat() if last_seen else None,
+                "createdAt": created_at.isoformat() if created_at else None,
                 # Module data for dashboard widgets (platform distribution needs inventory + hardware)
                 "modules": {
                     "system": {
