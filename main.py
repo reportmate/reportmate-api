@@ -2628,7 +2628,7 @@ async def submit_events(request: Request):
                 logger.debug(f"Stored {event_type} event for device {serial_number}: {message}")
                 
                 # Broadcast event to connected WebSocket clients
-                # CRITICAL: Include the message field so frontend shows proper description immediately
+                # Include the message field so frontend shows proper description immediately
                 try:
                     await broadcast_event({
                         "id": str(event_id) if event_id else str(datetime.now(timezone.utc).timestamp()),
@@ -2670,7 +2670,7 @@ async def submit_events(request: Request):
                         sanitized_payload_metadata['additional'] = sanitized_payload_additional
                     sanitized_payload['metadata'] = sanitized_payload_metadata
                 
-                # CRITICAL: Store COMPLETE original payload in details column for full payload retrieval
+                # Store COMPLETE original payload in details column for full payload retrieval
                 # Include all metadata, modules, and original request data (with passphrase removed)
                 collection_details = json.dumps({
                     # Summary fields (for display in list view)
