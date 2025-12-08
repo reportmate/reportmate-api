@@ -74,19 +74,19 @@ async def verify_authentication(
     
     if client_host:
         if client_host.startswith('100.') or client_host.startswith('10.'):
-            logger.info(f"✅ Authenticated via internal network: {client_host} (User-Agent: {user_agent})")
+            logger.info(f"[OK] Authenticated via internal network: {client_host} (User-Agent: {user_agent})")
             return {"method": "internal_network", "client_ip": client_host, "user_agent": user_agent}
     
     # Also check X-Forwarded-For for proxied requests
     if x_forwarded_for:
         forwarded_ip = x_forwarded_for.split(',')[0].strip()
         if forwarded_ip.startswith('100.') or forwarded_ip.startswith('10.'):
-            logger.info(f"✅ Authenticated via internal network (forwarded): {forwarded_ip} (User-Agent: {user_agent})")
+            logger.info(f"[OK] Authenticated via internal network (forwarded): {forwarded_ip} (User-Agent: {user_agent})")
             return {"method": "internal_network_forwarded", "client_ip": forwarded_ip, "user_agent": user_agent}
     
     # Method 2: Azure Managed Identity (for when Easy Auth is properly configured)
     if x_ms_client_principal_id:
-        logger.info(f"✅ Authenticated via Azure Managed Identity: {x_ms_client_principal_id}")
+        logger.info(f"[OK] Authenticated via Azure Managed Identity: {x_ms_client_principal_id}")
         return {"method": "managed_identity", "principal_id": x_ms_client_principal_id}
     
     # Method 3: Passphrase authentication (for external Windows/macOS clients)
@@ -94,19 +94,19 @@ async def verify_authentication(
     passphrase_header = x_api_passphrase or x_client_passphrase
     if passphrase_header:
         if not REPORTMATE_PASSPHRASE:
-            logger.error("❌ REPORTMATE_PASSPHRASE not configured but client attempted passphrase auth")
+            logger.error("[ERR] REPORTMATE_PASSPHRASE not configured but client attempted passphrase auth")
             raise HTTPException(status_code=500, detail="Server authentication not configured")
         
         if passphrase_header != REPORTMATE_PASSPHRASE:
-            logger.warning(f"❌ Invalid passphrase attempt from {user_agent} (IP: {client_host})")
+            logger.warning(f"[ERR] Invalid passphrase attempt from {user_agent} (IP: {client_host})")
             raise HTTPException(status_code=401, detail="Invalid authentication credentials")
         
         header_type = "X-API-PASSPHRASE" if x_api_passphrase else "X-Client-Passphrase"
-        logger.info(f"✅ Authenticated via passphrase ({header_type}) from {user_agent} (IP: {client_host})")
+        logger.info(f"[OK] Authenticated via passphrase ({header_type}) from {user_agent} (IP: {client_host})")
         return {"method": "passphrase", "user_agent": user_agent, "client_ip": client_host}
     
     # No valid authentication method provided
-    logger.warning(f"❌ Unauthenticated access attempt from {user_agent} (IP: {client_host}, X-Forwarded-For: {x_forwarded_for})")
+    logger.warning(f"[ERR] Unauthenticated access attempt from {user_agent} (IP: {client_host}, X-Forwarded-For: {x_forwarded_for})")
     raise HTTPException(
         status_code=401,
         detail="Authentication required. Internal network, X-MS-CLIENT-PRINCIPAL-ID (Managed Identity), or X-API-PASSPHRASE/X-Client-Passphrase required."
@@ -2713,14 +2713,14 @@ async def submit_events(request: Request):
             except Exception as system_event_error:
                 logger.error(f"Failed to create system event: {system_event_error}")
         elif has_installs_module and events_stored == 0:
-            logger.warning(f"⚠️ INSTALLS MODULE PRESENT but NO events sent - this should not happen! Device: {serial_number}")
+            logger.warning(f"[WARN] INSTALLS MODULE PRESENT but NO events sent - this should not happen! Device: {serial_number}")
         else:
             logger.info(f"Skipped system event creation - {events_stored} events already in payload")
         
         conn.commit()
         conn.close()
         
-        logger.info(f"✅ Successfully processed device {serial_number}: {len(modules_processed)} modules, {events_stored} events")
+        logger.info(f"[OK] Successfully processed device {serial_number}: {len(modules_processed)} modules, {events_stored} events")
         
         return {
             "success": True,
@@ -2778,7 +2778,7 @@ async def broadcast_event(event_data: dict):
             message=event_data,  # Send the event data directly, WebPubSub wraps it
             content_type="application/json"
         )
-        logger.info(f"📡 Broadcast event to WebPubSub: {event_data.get('kind', 'unknown')} for {event_data.get('device', 'unknown')}")
+        logger.info(f"Broadcast event to WebPubSub: {event_data.get('kind', 'unknown')} for {event_data.get('device', 'unknown')}")
     except Exception as e:
         logger.error(f"Failed to broadcast event: {e}")
 
@@ -2906,7 +2906,7 @@ async def archive_device(serial_number: str):
         conn.commit()
         conn.close()
         
-        logger.info(f"✅ Archived device: {serial_number}")
+        logger.info(f"[OK] Archived device: {serial_number}")
         
         return {
             "success": True,
@@ -2980,7 +2980,7 @@ async def unarchive_device(serial_number: str):
         conn.commit()
         conn.close()
         
-        logger.info(f"✅ Unarchived device: {serial_number}")
+        logger.info(f"[OK] Unarchived device: {serial_number}")
         
         return {
             "success": True,
