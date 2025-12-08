@@ -1510,7 +1510,10 @@ async def get_bulk_installs(
             inv.data->>'computerName' as computer_name,
             inv.data->>'usage' as usage,
             inv.data->>'catalog' as catalog,
-            inv.data->>'location' as location
+            inv.data->>'location' as location,
+            inv.data->>'assetTag' as asset_tag,
+            inv.data->>'fleet' as fleet,
+            inv.data->>'platform' as platform
         FROM devices d
         LEFT JOIN installs i ON d.id = i.device_id
         LEFT JOIN inventory inv ON d.id = inv.device_id
@@ -1536,7 +1539,7 @@ async def get_bulk_installs(
         
         for row in rows:
             try:
-                serial_number, device_uuid, last_seen, installs_data, collected_at, device_name, computer_name, usage, catalog, location = row
+                serial_number, device_uuid, last_seen, installs_data, collected_at, device_name, computer_name, usage, catalog, location, asset_tag, fleet, platform = row
                 
                 device_display_name = device_name or computer_name or serial_number
                 
@@ -1563,6 +1566,9 @@ async def get_bulk_installs(
                         'usage': usage,
                         'catalog': catalog,
                         'location': location,
+                        'assetTag': asset_tag,
+                        'fleet': fleet,
+                        'platform': platform,
                         'raw': item
                     })
             
