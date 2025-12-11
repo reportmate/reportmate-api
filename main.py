@@ -45,6 +45,7 @@ DATABASE_URL = os.getenv('DATABASE_URL', 'postgresql://reportmate:password@local
 # Security: Authentication configuration
 REPORTMATE_PASSPHRASE = os.getenv('REPORTMATE_PASSPHRASE')  # For Windows/Mac clients
 AZURE_MANAGED_IDENTITY_HEADER = "X-MS-CLIENT-PRINCIPAL-ID"  # Azure Container Apps managed identity
+DISABLE_AUTH = os.getenv('DISABLE_AUTH', 'false').lower() in ('true', '1', 'yes')
 
 async def verify_authentication(
     request: Request,
@@ -57,7 +58,10 @@ async def verify_authentication(
     """
     Verify authentication for API endpoints.
     
-    Three authentication methods supported (checked in order):
+    Authentication can be disabled via DISABLE_AUTH=true environment variable.
+    
+    Four authentication methods supported (checked in order):
+    0. Disabled: If DISABLE_AUTH=true, all requests are allowed
     1. Internal Network: Requests from Container App internal network (100.x.x.x or 10.x.x.x IPs)
     2. Azure Managed Identity: X-MS-CLIENT-PRINCIPAL-ID header (when Easy Auth is properly configured)
     3. Passphrase: X-API-PASSPHRASE or X-Client-Passphrase header (for external Windows/macOS clients)
@@ -65,8 +69,13 @@ async def verify_authentication(
     This ensures:
     - Frontend (internal network) can access without passphrase
     - Windows/macOS clients authenticate with passphrase (either header format)
-    - Random internet users get rejected
+    - Random internet users get rejected (unless auth disabled)
     """
+    
+    # Method 0: Authentication disabled via environment variable
+    if DISABLE_AUTH:
+        logger.debug(f"[OK] Authentication disabled via DISABLE_AUTH env var (User-Agent: {user_agent})")
+        return {"method": "auth_disabled", "user_agent": user_agent}
     
     # Method 1: Internal Container App Network (highest priority)
     # Container Apps internal network uses private IPs (100.x.x.x range or 10.x.x.x range)
