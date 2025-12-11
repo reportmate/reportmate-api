@@ -1593,6 +1593,113 @@ async def get_bulk_installs(
         logger.error(f"Failed to get bulk installs: {e}")
         raise HTTPException(status_code=500, detail=f"Failed to retrieve bulk installs: {str(e)}")
 
+
+
+@app.get("/api/devices/installs/full", dependencies=[Depends(verify_authentication)])
+async def get_bulk_installs_full(
+    include_archived: bool = Query(default=False, alias="includeArchived")
+):
+    """
+    Bulk installs endpoint returning FULL device records with nested structure.
+    
+    Unlike /api/devices/installs (flat items), this returns devices with complete
+    modules.installs structure including config, version, sessions etc.
+    Used by /devices/installs page for full UI rendering.
+    
+    By default, archived devices are excluded. Use includeArchived=true to include them.
+    """
+    try:
+        logger.info("Fetching bulk installs (full structure)")
+        
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        
+        # PERFORMANCE: Same query structure as working flat endpoint
+        # Use d.id = i.device_id which is how installs are stored
+        query = """
+        SELECT DISTINCT ON (d.serial_number)
+            d.serial_number,
+            d.device_id,
+            d.last_seen,
+            i.data as installs_data,
+            inv.data->>'deviceName' as device_name,
+            inv.data->>'usage' as usage,
+            inv.data->>'catalog' as catalog,
+            inv.data->>'location' as location,
+            inv.data->>'assetTag' as asset_tag
+        FROM devices d
+        LEFT JOIN installs i ON d.id = i.device_id
+        LEFT JOIN inventory inv ON d.id = inv.device_id
+        WHERE d.serial_number IS NOT NULL
+            AND d.serial_number NOT LIKE 'TEST-%'
+            AND i.data IS NOT NULL
+        """
+        
+        # Add archive filter
+        if not include_archived:
+            query += " AND d.archived = FALSE"
+        
+        query += " ORDER BY d.serial_number, i.updated_at DESC"
+        
+        cursor.execute(query)
+        rows = cursor.fetchall()
+        conn.close()
+        
+        logger.info(f"Retrieved {len(rows)} devices with full installs data")
+        
+        # Build full device records with nested structure
+        devices = []
+        
+        for row in rows:
+            try:
+                serial_number, device_uuid, last_seen, installs_data, device_name, usage, catalog, location, asset_tag = row
+                
+                # Extract only what UI needs from installs_data
+                installs_obj = installs_data if isinstance(installs_data, dict) else {}
+                cimian_data = installs_obj.get('cimian', {})
+                
+                # Build lightweight installs structure (exclude runLog which is huge)
+                lightweight_installs = {
+                    'cimian': {
+                        'items': cimian_data.get('items', []),
+                        'config': cimian_data.get('config', {}),
+                        'version': cimian_data.get('version'),
+                        'status': cimian_data.get('status'),
+                        'sessions': cimian_data.get('sessions', [])[:5],  # Only last 5 sessions
+                    }
+                }
+                
+                devices.append({
+                    'serialNumber': serial_number,
+                    'deviceId': device_uuid,
+                    'deviceName': device_name or serial_number,
+                    'lastSeen': last_seen.isoformat() if last_seen else None,
+                    'platform': None,
+                    'modules': {
+                        'installs': lightweight_installs,
+                        'inventory': {
+                            'deviceName': device_name,
+                            'usage': usage,
+                            'catalog': catalog,
+                            'location': location,
+                            'assetTag': asset_tag
+                        }
+                    }
+                })
+            
+            except Exception as e:
+                logger.warning(f"Error processing full installs for device {row[0]}: {e}")
+                continue
+        
+        logger.info(f"Processed {len(devices)} devices with full installs structure")
+        
+        return devices
+        
+    except Exception as e:
+        logger.error(f"Failed to get bulk installs (full): {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to retrieve bulk installs: {str(e)}")
+
+
 @app.get("/api/devices/network", dependencies=[Depends(verify_authentication)])
 async def get_bulk_network(
     include_archived: bool = Query(default=False, alias="includeArchived")
@@ -1876,7 +1983,8 @@ async def get_bulk_management(
             inv.data->>'usage' as usage,
             inv.data->>'catalog' as catalog,
             inv.data->>'location' as location,
-            inv.data->>'assetTag' as asset_tag
+            inv.data->>'assetTag' as asset_tag,
+            inv.data->>'department' as department
         FROM devices d
         LEFT JOIN management m ON d.id = m.device_id
         LEFT JOIN inventory inv ON d.id = inv.device_id
@@ -1901,7 +2009,7 @@ async def get_bulk_management(
         devices = []
         for row in rows:
             try:
-                serial_number, device_uuid, last_seen, management_data, collected_at, device_name, computer_name, usage, catalog, location, asset_tag = row
+                serial_number, device_uuid, last_seen, management_data, collected_at, device_name, computer_name, usage, catalog, location, asset_tag, department = row
                 
                 # Extract key management fields from the raw data for easy frontend access
                 mdm_enrollment = management_data.get('mdmEnrollment', {}) if management_data else {}
@@ -1923,6 +2031,7 @@ async def get_bulk_management(
                     'usage': usage,
                     'catalog': catalog,
                     'location': location,
+                    'department': department,
                     # Extract flattened MDM fields for table display (using actual field names from data)
                     'provider': mdm_enrollment.get('provider', 'Unknown'),
                     'enrollmentStatus': enrollment_status,
