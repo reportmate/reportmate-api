@@ -893,11 +893,11 @@ async def get_device_by_serial(serial_number: str):
         conn = get_db_connection()
         cursor = conn.cursor()
         
-        # Query uses correct schema columns - include archived status
+        # Query uses correct schema columns - include archived status and client_version
         cursor.execute("""
             SELECT id, device_id, name, serial_number, last_seen, status, 
                    model, manufacturer, os, os_name, os_version, created_at,
-                   archived, archived_at
+                   archived, archived_at, client_version
             FROM devices 
             WHERE serial_number = %s OR id = %s
         """, (serial_number, serial_number))
@@ -907,7 +907,7 @@ async def get_device_by_serial(serial_number: str):
             conn.close()
             raise HTTPException(status_code=404, detail="Device not found")
         
-        device_id, device_uuid, device_name, serial_num, last_seen, status, model, manufacturer, os, os_name, os_version, created_at, archived, archived_at = device_row
+        device_id, device_uuid, device_name, serial_num, last_seen, status, model, manufacturer, os, os_name, os_version, created_at, archived, archived_at, client_version = device_row
         
         # Get all module data for this device using device ID
         modules = {}
@@ -949,6 +949,7 @@ async def get_device_by_serial(serial_number: str):
             "device": {
                 "serialNumber": serial_num or device_id,
                 "deviceId": device_uuid or device_id,
+                "clientVersion": client_version,
                 "lastSeen": last_seen.isoformat() if last_seen else None,
                 "createdAt": created_at.isoformat() if created_at else None,
                 "registrationDate": created_at.isoformat() if created_at else None,
@@ -2601,22 +2602,22 @@ async def submit_events(request: Request):
             device_exists = cursor.fetchone()
             
             if device_exists:
-                # Update existing device
+                # Update existing device - include client_version
                 cursor.execute("""
                     UPDATE devices 
-                    SET device_id = %s, last_seen = %s, updated_at = %s
+                    SET device_id = %s, last_seen = %s, updated_at = %s, client_version = %s
                     WHERE serial_number = %s
-                """, (device_uuid, collected_at, datetime.now(timezone.utc), serial_number))
-                logger.info(f"Updated existing device: {serial_number}")
+                """, (device_uuid, collected_at, datetime.now(timezone.utc), client_version, serial_number))
+                logger.info(f"Updated existing device: {serial_number} (client v{client_version})")
             else:
                 # Insert new device
                 # NOTE: devices.id is VARCHAR and equals serial_number (per schema design)
                 # Set name to 'Unknown' as placeholder (will be populated from system module data)
                 cursor.execute("""
-                    INSERT INTO devices (id, device_id, serial_number, name, status, last_seen, created_at, updated_at)
-                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
-                """, (serial_number, device_uuid, serial_number, 'Unknown', 'online', collected_at, datetime.now(timezone.utc), datetime.now(timezone.utc)))
-                logger.info(f"Created new device: {serial_number}")
+                    INSERT INTO devices (id, device_id, serial_number, name, status, last_seen, created_at, updated_at, client_version)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                """, (serial_number, device_uuid, serial_number, 'Unknown', 'online', collected_at, datetime.now(timezone.utc), datetime.now(timezone.utc), client_version))
+                logger.info(f"Created new device: {serial_number} (client v{client_version})")
             
             conn.commit()
         except Exception as device_error:
