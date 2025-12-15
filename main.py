@@ -2370,27 +2370,29 @@ async def get_events(limit: int = 100):
 @app.get("/api/events/{event_id}/payload", dependencies=[Depends(verify_authentication)])
 async def get_event_payload(event_id: int):
     """
-    Get the details/payload for a specific event (lazy-loaded).
+    Get the FULL payload for a specific event including related module data.
     
     This endpoint is called when user clicks to expand an event in the dashboard.
+    It fetches the event details AND the actual module data from the module tables.
     """
     try:
         conn = get_db_connection()
         cursor = conn.cursor()
         
+        # First get the event details and device_id
         cursor.execute("""
-            SELECT details
+            SELECT details, device_id, timestamp
             FROM events 
             WHERE id = %s
         """, (event_id,))
         
         row = cursor.fetchone()
-        conn.close()
         
         if not row:
+            conn.close()
             raise HTTPException(status_code=404, detail=f"Event {event_id} not found")
         
-        details = row[0]
+        details, device_id, event_timestamp = row
         
         # If details is a string, try to parse as JSON
         if isinstance(details, str):
@@ -2399,13 +2401,791 @@ async def get_event_payload(event_id: int):
             except json.JSONDecodeError:
                 details = {"raw": details}
         
-        return {"payload": details or {}}
+        # Build full payload with actual module data
+        full_payload = details.copy() if isinstance(details, dict) else {"metadata": details}
+        
+        # Get the modules list from the event details
+        modules_list = []
+        if isinstance(details, dict):
+            modules_list = details.get('modules', [])
+            if isinstance(modules_list, str):
+                modules_list = [modules_list]
+        
+        # Fetch actual data from each module table mentioned in this event
+        module_data = {}
+        for module_name in modules_list:
+            try:
+                table_name = module_name.lower()
+                # Validate table name to prevent SQL injection
+                valid_tables = ['applications', 'displays', 'hardware', 'installs', 'inventory', 
+                               'management', 'network', 'printers', 'profiles', 'security', 'system']
+                if table_name not in valid_tables:
+                    continue
+                
+                # Fetch the module data for this device around the event timestamp
+                # Use a time window to find the closest module data to the event
+                cursor.execute(f"""
+                    SELECT data, collected_at
+                    FROM {table_name}
+                    WHERE device_id = %s
+                    ORDER BY ABS(EXTRACT(EPOCH FROM (collected_at - %s::timestamp)))
+                    LIMIT 1
+                """, (device_id, event_timestamp))
+                
+                module_row = cursor.fetchone()
+                if module_row:
+                    module_content = module_row[0]
+                    if isinstance(module_content, str):
+                        try:
+                            module_content = json.loads(module_content)
+                        except json.JSONDecodeError:
+                            pass
+                    module_data[module_name] = module_content
+                    
+            except Exception as module_error:
+                logger.warning(f"Failed to fetch {module_name} data for event {event_id}: {module_error}")
+                continue
+        
+        conn.close()
+        
+        # Include the actual module data in the payload
+        if module_data:
+            full_payload['moduleData'] = module_data
+        
+        return {"payload": full_payload}
         
     except HTTPException:
         raise
     except Exception as e:
         logger.error(f"Failed to get event payload: {e}")
         raise HTTPException(status_code=500, detail=f"Failed to retrieve event payload: {str(e)}")
+
+
+@app.get("/api/stats/applications/usage", dependencies=[Depends(verify_authentication)])
+async def get_application_usage_stats(
+    days: int = Query(default=30, ge=1, le=365, description="Number of days to look back for usage data"),
+    include_archived: bool = Query(default=False, alias="includeArchived")
+):
+    """
+    Get aggregated application usage statistics for fleet-wide analytics.
+    
+    Returns:
+        - Top applications by total usage time
+        - Top applications by launch count
+        - Top users by usage time
+        - Unused applications (no usage in specified days)
+        - Summary statistics
+    
+    This endpoint queries the application_usage_events and application_usage_summary tables
+    populated by the Windows client's kernel process telemetry.
+    """
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        
+        # Check if usage tables exist
+        cursor.execute("""
+            SELECT EXISTS (
+                SELECT FROM information_schema.tables 
+                WHERE table_name = 'application_usage_events'
+            )
+        """)
+        usage_tables_exist = cursor.fetchone()[0]
+        
+        if not usage_tables_exist:
+            # Usage tables don't exist yet - return empty stats with appropriate message
+            logger.info("Application usage tables not yet created - returning empty stats")
+            conn.close()
+            return {
+                "status": "unavailable",
+                "message": "Application usage tracking not yet deployed. Run schema migration 005-application-usage-tracking.sql to enable.",
+                "topAppsByTime": [],
+                "topAppsByLaunches": [],
+                "topUsers": [],
+                "unusedApps": [],
+                "summary": {
+                    "totalAppsTracked": 0,
+                    "totalUsageHours": 0,
+                    "totalLaunches": 0,
+                    "uniqueUsers": 0,
+                    "devicesWithUsageData": 0,
+                    "appsWithNoRecentUsage": 0
+                },
+                "lastUpdated": datetime.now(timezone.utc).isoformat(),
+                "lookbackDays": days
+            }
+        
+        cutoff_date = datetime.now(timezone.utc) - timedelta(days=days)
+        
+        # Archive filter clause
+        archive_join = ""
+        archive_where = ""
+        if not include_archived:
+            archive_join = "INNER JOIN devices d ON e.device_id = d.serial_number"
+            archive_where = "AND d.archived = FALSE"
+        
+        # Top applications by total usage time
+        cursor.execute(f"""
+            SELECT 
+                e.application_name,
+                SUM(e.duration_seconds) as total_seconds,
+                COUNT(*) as launch_count,
+                COUNT(DISTINCT e.username) as unique_users,
+                MAX(e.end_time) as last_used
+            FROM application_usage_events e
+            {archive_join}
+            WHERE e.start_time >= $1
+            {archive_where}
+            GROUP BY e.application_name
+            ORDER BY total_seconds DESC
+            LIMIT 20
+        """, (cutoff_date,))
+        
+        top_by_time = []
+        for row in cursor.fetchall():
+            app_name, total_secs, launches, users, last_used = row
+            top_by_time.append({
+                "name": app_name,
+                "totalSeconds": int(total_secs) if total_secs else 0,
+                "launchCount": launches,
+                "uniqueUsers": users,
+                "lastUsed": last_used.isoformat() if last_used else None
+            })
+        
+        # Top applications by launch count
+        cursor.execute(f"""
+            SELECT 
+                e.application_name,
+                COUNT(*) as launch_count,
+                SUM(e.duration_seconds) as total_seconds,
+                COUNT(DISTINCT e.username) as unique_users,
+                MAX(e.end_time) as last_used
+            FROM application_usage_events e
+            {archive_join}
+            WHERE e.start_time >= $1
+            {archive_where}
+            GROUP BY e.application_name
+            ORDER BY launch_count DESC
+            LIMIT 20
+        """, (cutoff_date,))
+        
+        top_by_launches = []
+        for row in cursor.fetchall():
+            app_name, launches, total_secs, users, last_used = row
+            top_by_launches.append({
+                "name": app_name,
+                "launchCount": launches,
+                "totalSeconds": int(total_secs) if total_secs else 0,
+                "uniqueUsers": users,
+                "lastUsed": last_used.isoformat() if last_used else None
+            })
+        
+        # Top users by total usage time
+        cursor.execute(f"""
+            SELECT 
+                e.username,
+                SUM(e.duration_seconds) as total_seconds,
+                COUNT(*) as launch_count,
+                COUNT(DISTINCT e.application_name) as apps_used
+            FROM application_usage_events e
+            {archive_join}
+            WHERE e.start_time >= $1
+                AND e.username IS NOT NULL
+                AND e.username != ''
+            {archive_where}
+            GROUP BY e.username
+            ORDER BY total_seconds DESC
+            LIMIT 15
+        """, (cutoff_date,))
+        
+        top_users = []
+        for row in cursor.fetchall():
+            username, total_secs, launches, apps = row
+            top_users.append({
+                "username": username,
+                "totalSeconds": int(total_secs) if total_secs else 0,
+                "launchCount": launches,
+                "appsUsed": apps
+            })
+        
+        # Summary statistics
+        cursor.execute(f"""
+            SELECT 
+                COUNT(DISTINCT application_name) as total_apps,
+                COALESCE(SUM(duration_seconds), 0) as total_seconds,
+                COUNT(*) as total_launches,
+                COUNT(DISTINCT username) as unique_users,
+                COUNT(DISTINCT device_id) as devices
+            FROM application_usage_events e
+            {archive_join.replace('e.device_id', 'e.device_id') if archive_join else ''}
+            WHERE start_time >= $1
+            {archive_where}
+        """, (cutoff_date,))
+        
+        summary_row = cursor.fetchone()
+        total_apps, total_secs, total_launches, unique_users, devices = summary_row
+        
+        # Get count of installed apps with no recent usage
+        # This requires joining with the applications table
+        cursor.execute(f"""
+            WITH recent_usage AS (
+                SELECT DISTINCT application_name 
+                FROM application_usage_events 
+                WHERE start_time >= $1
+            )
+            SELECT COUNT(DISTINCT a.data->>'name')
+            FROM applications a
+            INNER JOIN devices d ON a.device_id = d.id
+            WHERE NOT EXISTS (
+                SELECT 1 FROM recent_usage ru 
+                WHERE LOWER(ru.application_name) = LOWER(a.data->>'name')
+            )
+            {'AND d.archived = FALSE' if not include_archived else ''}
+        """, (cutoff_date,))
+        
+        unused_count = cursor.fetchone()[0] or 0
+        
+        conn.close()
+        
+        return {
+            "status": "available",
+            "topAppsByTime": top_by_time,
+            "topAppsByLaunches": top_by_launches,
+            "topUsers": top_users,
+            "summary": {
+                "totalAppsTracked": total_apps or 0,
+                "totalUsageHours": round((total_secs or 0) / 3600, 1),
+                "totalLaunches": total_launches or 0,
+                "uniqueUsers": unique_users or 0,
+                "devicesWithUsageData": devices or 0,
+                "appsWithNoRecentUsage": unused_count
+            },
+            "lastUpdated": datetime.now(timezone.utc).isoformat(),
+            "lookbackDays": days
+        }
+        
+    except Exception as e:
+        logger.error(f"Failed to get application usage stats: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to retrieve application usage statistics: {str(e)}")
+
+
+@app.get("/api/devices/applications/usage", dependencies=[Depends(verify_authentication)])
+async def get_fleet_application_usage(
+    days: int = Query(default=30, ge=1, le=365, description="Number of days to look back for usage data"),
+    applicationNames: Optional[str] = Query(default=None, description="Comma-separated list of application names to filter"),
+    usages: Optional[str] = Query(default=None, description="Comma-separated list of usage types (assigned, shared)"),
+    catalogs: Optional[str] = Query(default=None, description="Comma-separated list of catalogs (curriculum, staff, faculty, kiosk)"),
+    locations: Optional[str] = Query(default=None, description="Comma-separated list of locations/rooms"),
+    minHours: Optional[float] = Query(default=None, description="Minimum total hours threshold"),
+    minLaunches: Optional[int] = Query(default=None, description="Minimum launch count threshold"),
+    includeUnused: bool = Query(default=True, description="Include apps with zero usage in period"),
+    include_archived: bool = Query(default=False, alias="includeArchived")
+):
+    """
+    Fleet-wide application utilization report with filtering support.
+    
+    Extracts usage data from the applications module JSONB stored on each device.
+    The Windows client collects process telemetry and stores it as:
+    - applications.data.usage.activeSessions[] - array of individual session records
+    - Each session has: name, path, user, durationSeconds, startTime, etc.
+    
+    This endpoint aggregates activeSessions by app name across all devices.
+    """
+    try:
+        logger.info(f"Fetching fleet application usage from applications module (days={days}, includeArchived={include_archived})")
+        
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        
+        # Parse filter values
+        app_name_list = [a.strip() for a in applicationNames.split(',')] if applicationNames else []
+        usage_list = [u.lower().strip() for u in usages.split(',')] if usages else []
+        catalog_list = [c.lower().strip() for c in catalogs.split(',')] if catalogs else []
+        location_list = [l.strip() for l in locations.split(',')] if locations else []
+        
+        cutoff_date = datetime.now(timezone.utc) - timedelta(days=days)
+        
+        # Build inventory filter WHERE clause
+        inventory_where_parts = []
+        if usage_list:
+            placeholders = ', '.join([f"'{u}'" for u in usage_list])
+            inventory_where_parts.append(f"LOWER(inv.data->>'usage') IN ({placeholders})")
+        if catalog_list:
+            placeholders = ', '.join([f"'{c}'" for c in catalog_list])
+            inventory_where_parts.append(f"LOWER(inv.data->>'catalog') IN ({placeholders})")
+        if location_list:
+            loc_conditions = [f"inv.data->>'location' ILIKE '%{loc}%'" for loc in location_list]
+            inventory_where_parts.append(f"({' OR '.join(loc_conditions)})")
+        
+        inventory_filter = f"AND {' AND '.join(inventory_where_parts)}" if inventory_where_parts else ""
+        archive_filter = "AND d.archived = FALSE" if not include_archived else ""
+        
+        # Query: Extract usage data from applications module JSONB
+        # ACTUAL data structure from Windows client:
+        # applications.data.usage.activeSessions[] - array of session records
+        # Each session: {name, path, user, durationSeconds, startTime, isActive, ...}
+        # NOTE: Only include usage data for apps that exist in the device's installed applications
+        cursor.execute(f"""
+            WITH device_usage AS (
+                SELECT 
+                    d.serial_number,
+                    a.data->'usage' as usage_data,
+                    a.data->'installedApplications' as installed_apps,
+                    a.collected_at
+                FROM applications a
+                INNER JOIN devices d ON a.device_id = d.serial_number
+                LEFT JOIN inventory inv ON inv.device_id = d.serial_number
+                WHERE a.collected_at >= %s
+                    {archive_filter}
+                    {inventory_filter}
+            ),
+            sessions_extracted AS (
+                SELECT 
+                    du.serial_number,
+                    session->>'name' as app_name,
+                    session->>'path' as app_path,
+                    session->>'user' as username,
+                    COALESCE((session->>'durationSeconds')::numeric, 0) as duration_seconds,
+                    session->>'startTime' as start_time
+                FROM device_usage du,
+                LATERAL jsonb_array_elements(
+                    CASE 
+                        WHEN du.usage_data->'activeSessions' IS NOT NULL 
+                             AND jsonb_typeof(du.usage_data->'activeSessions') = 'array'
+                        THEN du.usage_data->'activeSessions'
+                        ELSE '[]'::jsonb
+                    END
+                ) as session
+                WHERE du.usage_data IS NOT NULL 
+                  AND du.usage_data != 'null'::jsonb
+                  AND (du.usage_data->>'isCaptureEnabled')::boolean = true
+                  -- Only include sessions that match an installed application
+                  AND EXISTS (
+                      SELECT 1 FROM jsonb_array_elements(du.installed_apps) ia
+                      WHERE ia->>'name' = session->>'name'
+                  )
+            ),
+            app_summary AS (
+                SELECT 
+                    app_name,
+                    app_path,
+                    serial_number,
+                    username,
+                    SUM(duration_seconds) as total_seconds,
+                    COUNT(*) as session_count,
+                    MAX(start_time) as last_used,
+                    MIN(start_time) as first_seen
+                FROM sessions_extracted
+                WHERE app_name IS NOT NULL AND app_name != ''
+                GROUP BY app_name, app_path, serial_number, username
+            )
+            SELECT 
+                app_name,
+                MAX(app_path) as executable,
+                '' as publisher,
+                SUM(total_seconds) as total_seconds,
+                SUM(session_count) as total_launches,
+                COUNT(DISTINCT serial_number) as device_count,
+                COUNT(DISTINCT username) FILTER (WHERE username IS NOT NULL) as unique_user_count,
+                MAX(last_used) as last_used,
+                MIN(first_seen) as first_seen,
+                array_agg(DISTINCT serial_number) as devices,
+                array_agg(DISTINCT username) FILTER (WHERE username IS NOT NULL) as users
+            FROM app_summary
+            WHERE total_seconds > 0
+            GROUP BY app_name
+            ORDER BY SUM(total_seconds) DESC
+        """, (cutoff_date,))
+        
+        applications = []
+        all_users = set()
+        total_usage_seconds = 0
+        total_launch_count = 0
+        
+        for row in cursor.fetchall():
+            app_name, executable, publisher, total_secs, launches, devices, user_count, last_used, first_seen, device_list, user_list = row
+            
+            total_secs = float(total_secs or 0)
+            launches = int(launches or 0)
+            
+            # Apply filters
+            if app_name_list:
+                if not any(filter_name.lower() in app_name.lower() for filter_name in app_name_list):
+                    continue
+            
+            if minHours and total_secs < (minHours * 3600):
+                continue
+            
+            if minLaunches and launches < minLaunches:
+                continue
+            
+            total_usage_seconds += total_secs
+            total_launch_count += launches
+            
+            # Track all users
+            if user_list:
+                for user in user_list:
+                    if user:
+                        all_users.add(user)
+            
+            applications.append({
+                "name": app_name,
+                "executable": executable or "",
+                "publisher": publisher or "",
+                "totalSeconds": int(total_secs),
+                "totalHours": round(total_secs / 3600, 2),
+                "launchCount": launches,
+                "deviceCount": devices or 0,
+                "userCount": user_count or 0,
+                "lastUsed": last_used,
+                "firstUsed": first_seen,
+                "devices": device_list[:10] if device_list else [],
+                "users": user_list[:10] if user_list else [],
+                "isSingleUser": (user_count or 0) == 1
+            })
+        
+        # Get unique devices and users from the query results
+        unique_device_serials = set()
+        for app in applications:
+            for serial in app.get("devices", []):
+                unique_device_serials.add(serial)
+        
+        # Get top users by aggregating from activeSessions
+        try:
+            cursor.execute(f"""
+                WITH installed_apps_for_users AS (
+                    -- Get installed applications from each device to filter usage
+                    SELECT DISTINCT 
+                        d.serial_number,
+                        app_item->>'name' as app_name
+                    FROM applications a
+                    INNER JOIN devices d ON a.device_id = d.serial_number,
+                    LATERAL jsonb_array_elements(
+                        CASE 
+                            WHEN a.data->'installedApplications' IS NOT NULL 
+                                 AND jsonb_typeof(a.data->'installedApplications') = 'array'
+                            THEN a.data->'installedApplications'
+                            ELSE '[]'::jsonb
+                        END
+                    ) as app_item
+                    WHERE a.collected_at >= %s
+                ),
+                device_sessions AS (
+                    SELECT 
+                        d.serial_number,
+                        session->>'user' as username,
+                        COALESCE((session->>'durationSeconds')::numeric, 0) as duration_seconds,
+                        session->>'name' as app_name
+                    FROM applications a
+                    INNER JOIN devices d ON a.device_id = d.serial_number
+                    LEFT JOIN inventory inv ON inv.device_id = d.serial_number,
+                    LATERAL jsonb_array_elements(
+                        CASE 
+                            WHEN a.data->'usage'->'activeSessions' IS NOT NULL 
+                                 AND jsonb_typeof(a.data->'usage'->'activeSessions') = 'array'
+                            THEN a.data->'usage'->'activeSessions'
+                            ELSE '[]'::jsonb
+                        END
+                    ) as session
+                    WHERE a.collected_at >= %s
+                        AND (a.data->'usage'->>'isCaptureEnabled')::boolean = true
+                        -- Only include sessions for apps that exist in installed applications
+                        AND EXISTS (
+                            SELECT 1 FROM installed_apps_for_users ia 
+                            WHERE ia.serial_number = d.serial_number 
+                            AND ia.app_name = session->>'name'
+                        )
+                        {archive_filter}
+                        {inventory_filter}
+                ),
+                user_stats AS (
+                    SELECT 
+                        username,
+                        SUM(duration_seconds) as total_seconds,
+                        COUNT(*) as session_count,
+                        COUNT(DISTINCT app_name) as apps_used,
+                        COUNT(DISTINCT serial_number) as devices_used
+                    FROM device_sessions
+                    WHERE username IS NOT NULL AND username != ''
+                    GROUP BY username
+                )
+                SELECT username, total_seconds, session_count, apps_used, devices_used
+                FROM user_stats
+                ORDER BY total_seconds DESC
+                LIMIT 25
+            """, (cutoff_date, cutoff_date))
+            
+            # Aggregate and normalize usernames in Python
+            user_data = {}
+            for row in cursor.fetchall():
+                raw_username, total_secs, sessions, apps_used, devices_used = row
+                total_secs = float(total_secs or 0)
+                
+                # Normalize username: extract just the user part, skip machine accounts
+                if not raw_username:
+                    continue
+                if raw_username.endswith('$'):  # Skip machine accounts like MACHINE$
+                    continue
+                    
+                # Extract username after backslash (DOMAIN\user -> user)
+                if '\\' in raw_username:
+                    normalized = raw_username.split('\\')[-1].lower()
+                else:
+                    normalized = raw_username.lower()
+                
+                # Aggregate if same normalized username
+                if normalized in user_data:
+                    user_data[normalized]['totalSeconds'] += int(total_secs)
+                    user_data[normalized]['launchCount'] += sessions or 0
+                    user_data[normalized]['appsUsed'] = max(user_data[normalized]['appsUsed'], apps_used or 0)
+                    user_data[normalized]['devicesUsed'] += devices_used or 0
+                else:
+                    user_data[normalized] = {
+                        "username": normalized,
+                        "totalSeconds": int(total_secs),
+                        "launchCount": sessions or 0,
+                        "appsUsed": apps_used or 0,
+                        "devicesUsed": devices_used or 0
+                    }
+            
+            # Convert to list and add totalHours
+            top_users = []
+            for udata in sorted(user_data.values(), key=lambda x: x['totalSeconds'], reverse=True)[:25]:
+                udata['totalHours'] = round(udata['totalSeconds'] / 3600, 2)
+                top_users.append(udata)
+        except Exception as e:
+            logger.warning(f"Failed to get top users: {e}")
+            top_users = list({"username": u, "totalSeconds": 0, "totalHours": 0, "launchCount": 0, "appsUsed": 0, "devicesUsed": 1} for u in all_users)[:25]
+        
+        # Get single-user applications
+        single_user_apps = [
+            {"name": app["name"], "totalHours": app["totalHours"]}
+            for app in applications
+            if app.get("isSingleUser", False)
+        ][:20]
+        
+        # Get unused apps - apps installed but with no usage data in activeSessions
+        unused_apps = []
+        if includeUnused:
+            try:
+                cursor.execute(f"""
+                    WITH installed_apps AS (
+                        SELECT DISTINCT 
+                            COALESCE(
+                                jsonb_array_elements(a.data->'installedApplications')->>'name',
+                                jsonb_array_elements(a.data->'InstalledApplications')->>'name',
+                                jsonb_array_elements(a.data->'installed_applications')->>'name'
+                            ) as app_name,
+                            d.serial_number
+                        FROM applications a
+                        INNER JOIN devices d ON a.device_id = d.serial_number
+                        WHERE d.archived = FALSE
+                    ),
+                    used_apps AS (
+                        SELECT DISTINCT session->>'name' as app_name
+                        FROM applications a
+                        INNER JOIN devices d ON a.device_id = d.serial_number,
+                        LATERAL jsonb_array_elements(
+                            CASE 
+                                WHEN a.data->'usage'->'activeSessions' IS NOT NULL 
+                                     AND jsonb_typeof(a.data->'usage'->'activeSessions') = 'array'
+                                THEN a.data->'usage'->'activeSessions'
+                                ELSE '[]'::jsonb
+                            END
+                        ) as session
+                        WHERE d.archived = FALSE
+                          AND (a.data->'usage'->>'isCaptureEnabled')::boolean = true
+                    )
+                    SELECT 
+                        ia.app_name,
+                        COUNT(DISTINCT ia.serial_number) as device_count
+                    FROM installed_apps ia
+                    WHERE ia.app_name IS NOT NULL
+                      AND ia.app_name != ''
+                      AND NOT EXISTS (
+                          SELECT 1 FROM used_apps ua 
+                          WHERE LOWER(ua.app_name) = LOWER(ia.app_name)
+                      )
+                    GROUP BY ia.app_name
+                    ORDER BY device_count DESC
+                    LIMIT 50
+                """)
+                
+                for row in cursor.fetchall():
+                    app_name, devices = row
+                    unused_apps.append({
+                        "name": app_name,
+                        "deviceCount": devices,
+                        "daysSinceUsed": days
+                    })
+            except Exception as e:
+                logger.warning(f"Failed to get unused apps: {e}")
+        
+        conn.close()
+        
+        return {
+            "status": "available",
+            "dataSource": "applications_module",  # Indicate we're using module data
+            "applications": applications,
+            "topUsers": top_users,
+            "singleUserApps": single_user_apps,
+            "unusedApps": unused_apps,
+            "summary": {
+                "totalAppsTracked": len(applications),
+                "totalUsageHours": round(total_usage_seconds / 3600, 1),
+                "totalLaunches": total_launch_count,
+                "uniqueUsers": len(top_users),
+                "uniqueDevices": len(unique_device_serials),
+                "singleUserAppCount": len(single_user_apps),
+                "unusedAppCount": len(unused_apps)
+            },
+            "filters": {
+                "days": days,
+                "applicationNames": app_name_list,
+                "usages": usage_list,
+                "catalogs": catalog_list,
+                "locations": location_list,
+                "minHours": minHours,
+                "minLaunches": minLaunches
+            },
+            "lastUpdated": datetime.now(timezone.utc).isoformat()
+        }
+        
+    except Exception as e:
+        logger.error(f"Failed to get fleet application usage: {e}")
+        import traceback
+        logger.error(f"Traceback: {traceback.format_exc()}")
+        raise HTTPException(status_code=500, detail=f"Failed to retrieve fleet application usage: {str(e)}")
+
+
+@app.get("/api/device/{serial_number}/applications/usage", dependencies=[Depends(verify_authentication)])
+async def get_device_application_usage(
+    serial_number: str,
+    days: int = Query(default=30, ge=1, le=365, description="Number of days to look back for usage data")
+):
+    """
+    Get application usage statistics for a specific device.
+    
+    Returns usage data collected via kernel process telemetry for the specified device.
+    """
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        
+        # Check if usage tables exist
+        cursor.execute("""
+            SELECT EXISTS (
+                SELECT FROM information_schema.tables 
+                WHERE table_name = 'application_usage_events'
+            )
+        """)
+        usage_tables_exist = cursor.fetchone()[0]
+        
+        if not usage_tables_exist:
+            conn.close()
+            return {
+                "status": "unavailable",
+                "message": "Application usage tracking not yet deployed",
+                "applications": [],
+                "users": [],
+                "summary": {}
+            }
+        
+        cutoff_date = datetime.now(timezone.utc) - timedelta(days=days)
+        
+        # Get usage data aggregated by application
+        cursor.execute("""
+            SELECT 
+                application_name,
+                SUM(duration_seconds) as total_seconds,
+                COUNT(*) as launch_count,
+                array_agg(DISTINCT username) FILTER (WHERE username IS NOT NULL AND username != '') as users,
+                MAX(end_time) as last_used,
+                MIN(start_time) as first_seen,
+                AVG(duration_seconds) as avg_session
+            FROM application_usage_events
+            WHERE device_id = $1
+                AND start_time >= $2
+            GROUP BY application_name
+            ORDER BY total_seconds DESC
+        """, (serial_number, cutoff_date))
+        
+        applications = []
+        for row in cursor.fetchall():
+            app_name, total_secs, launches, users, last_used, first_seen, avg_session = row
+            applications.append({
+                "name": app_name,
+                "totalSeconds": int(total_secs) if total_secs else 0,
+                "launchCount": launches,
+                "users": users or [],
+                "uniqueUserCount": len(users) if users else 0,
+                "lastUsed": last_used.isoformat() if last_used else None,
+                "firstSeen": first_seen.isoformat() if first_seen else None,
+                "averageSessionSeconds": int(avg_session) if avg_session else 0
+            })
+        
+        # Get usage by user for this device
+        cursor.execute("""
+            SELECT 
+                username,
+                SUM(duration_seconds) as total_seconds,
+                COUNT(*) as launch_count,
+                COUNT(DISTINCT application_name) as apps_used
+            FROM application_usage_events
+            WHERE device_id = $1
+                AND start_time >= $2
+                AND username IS NOT NULL
+                AND username != ''
+            GROUP BY username
+            ORDER BY total_seconds DESC
+        """, (serial_number, cutoff_date))
+        
+        users = []
+        for row in cursor.fetchall():
+            username, total_secs, launches, apps_used = row
+            users.append({
+                "username": username,
+                "totalSeconds": int(total_secs) if total_secs else 0,
+                "launchCount": launches,
+                "appsUsed": apps_used
+            })
+        
+        # Summary for device
+        cursor.execute("""
+            SELECT 
+                COUNT(DISTINCT application_name) as total_apps,
+                COALESCE(SUM(duration_seconds), 0) as total_seconds,
+                COUNT(*) as total_launches,
+                COUNT(DISTINCT username) as unique_users
+            FROM application_usage_events
+            WHERE device_id = $1
+                AND start_time >= $2
+        """, (serial_number, cutoff_date))
+        
+        summary_row = cursor.fetchone()
+        total_apps, total_secs, total_launches, unique_users = summary_row
+        
+        conn.close()
+        
+        return {
+            "status": "available",
+            "serialNumber": serial_number,
+            "applications": applications,
+            "users": users,
+            "summary": {
+                "totalAppsUsed": total_apps or 0,
+                "totalUsageHours": round((total_secs or 0) / 3600, 1),
+                "totalLaunches": total_launches or 0,
+                "uniqueUsers": unique_users or 0
+            },
+            "lookbackDays": days,
+            "lastUpdated": datetime.now(timezone.utc).isoformat()
+        }
+        
+    except Exception as e:
+        logger.error(f"Failed to get device application usage for {serial_number}: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to retrieve device application usage: {str(e)}")
+
 
 @app.get("/api/stats/installs", dependencies=[Depends(verify_authentication)])
 async def get_install_stats():
