@@ -256,8 +256,14 @@ def get_db_connection():
                 database=database,
                 user=username,
                 password=password,
-                ssl_context=True
+                ssl_context=True,
+                timeout=30  # 30 second connection timeout
             )
+            # Set query timeout - increased for diagnostics
+            cursor = conn.cursor()
+            cursor.execute("SET statement_timeout = '120s'")  # 120 second query timeout
+            conn.commit()
+            cursor.close()
             return conn
     except Exception as e:
         logger.error(f"Database connection failed: {e}")
@@ -462,25 +468,22 @@ async def get_dashboard_data(
         except Exception as count_error:
             logger.warning(f"Failed to get total device count: {count_error}")
 
-        # Fetch all devices with inventory and system data for OS info
+        # Fetch all devices with inventory data for catalog/usage/department/location
         device_query = f"""
         SELECT 
             d.id,
             d.device_id,
             d.serial_number,
+            d.name,
             d.os,
             d.os_name,
             d.os_version,
             d.last_seen,
             d.archived,
             d.created_at,
-            i.data as inventory_data,
-            s.data as system_data,
-            h.data as hardware_data
+            i.data as inventory_data
         FROM devices d
         LEFT JOIN inventory i ON d.serial_number = i.device_id
-        LEFT JOIN system s ON d.serial_number = s.device_id
-        LEFT JOIN hardware h ON d.serial_number = h.device_id
         {archive_filter_where}
         ORDER BY d.last_seen DESC NULLS LAST
         """
@@ -490,17 +493,12 @@ async def get_dashboard_data(
         
         devices = []
         for row in device_rows:
-            db_id, device_id, serial_number, os_val, os_name_db, os_version_db, last_seen, archived, created_at, inventory_data, system_data, hardware_data = row
+            (db_id, device_id, serial_number, device_name, os_val, os_name_db, os_version_db, 
+             last_seen, archived, created_at, inventory_data_raw) = row
             
-            # Parse JSONB data
-            inv_data = inventory_data if isinstance(inventory_data, dict) else {}
-            sys_data = system_data if isinstance(system_data, dict) else {}
-            hw_data = hardware_data if isinstance(hardware_data, dict) else {}
-            
-            # Extract OS info from system data or fall back to DB columns
-            os_info = sys_data.get("operatingSystem", {})
-            final_os_name = os_info.get("name") or os_name_db or os_val or "Unknown"
-            final_os_version = os_info.get("version") or os_version_db or ""
+            # Use device table fields directly
+            final_os_name = os_name_db or os_val or "Unknown"
+            final_os_version = os_version_db or ""
             
             # Determine platform from OS name
             platform = "Windows" if "windows" in (final_os_name or "").lower() else "macOS" if "mac" in (final_os_name or "").lower() else "Unknown"
@@ -514,11 +512,29 @@ async def get_dashboard_data(
                 elif time_diff.total_seconds() > 3600:  # 1 hour
                     status = "idle"
             
+            # Extract inventory data (catalog, usage, department, location)
+            inv_device_name = device_name
+            inv_catalog = None
+            inv_usage = None
+            inv_department = None
+            inv_location = None
+            
+            if inventory_data_raw:
+                try:
+                    inventory = inventory_data_raw if isinstance(inventory_data_raw, dict) else json.loads(inventory_data_raw)
+                    inv_device_name = inventory.get("deviceName") or device_name
+                    inv_catalog = inventory.get("catalog")
+                    inv_usage = inventory.get("usage")
+                    inv_department = inventory.get("department")
+                    inv_location = inventory.get("location")
+                except Exception as inv_error:
+                    logger.warning(f"Failed to parse inventory for {serial_number}: {inv_error}")
+            
             device = {
                 "id": db_id,
                 "deviceId": device_id,
                 "serialNumber": serial_number,
-                "name": inv_data.get("deviceName") or serial_number,
+                "name": inv_device_name or serial_number,
                 "platform": platform,
                 "osName": final_os_name,
                 "osVersion": final_os_version,
@@ -526,25 +542,23 @@ async def get_dashboard_data(
                 "archived": archived or False,
                 "lastSeen": last_seen.isoformat() if last_seen else None,
                 "createdAt": created_at.isoformat() if created_at else None,
-                # Module data for dashboard widgets (platform distribution needs inventory + hardware)
                 "modules": {
                     "system": {
-                        "operatingSystem": os_info if os_info else {"name": final_os_name, "version": final_os_version}
+                        "operatingSystem": {"name": final_os_name, "version": final_os_version}
                     },
                     "inventory": {
-                        "catalog": inv_data.get("catalog"),
-                        "usage": inv_data.get("usage"),
-                        "department": inv_data.get("department"),
-                        "location": inv_data.get("location")
-                    } if inv_data else None,
-                    "hardware": {
-                        "processor": hw_data.get("processor", {})
-                    } if hw_data else None
+                        "catalog": inv_catalog,
+                        "usage": inv_usage,
+                        "department": inv_department,
+                        "location": inv_location
+                    } if any([inv_catalog, inv_usage, inv_department, inv_location]) else None
                 }
             }
             devices.append(device)
         
         # === INSTALL STATS QUERY (from cimian->items->currentStatus) ===
+        # NOTE: JSONB lateral join queries are too slow for dashboard - disabled temporarily
+        # TODO: Create materialized view or pre-aggregated stats table for fast lookups
         install_stats = {
             "devicesWithErrors": 0,
             "devicesWithWarnings": 0,
@@ -552,61 +566,10 @@ async def get_dashboard_data(
             "totalWarnings": 0
         }
         
-        try:
-            # Count devices with install errors (items with failed/error status)
-            cursor.execute("""
-                SELECT COUNT(DISTINCT i.device_id)
-                FROM installs i
-                CROSS JOIN LATERAL jsonb_array_elements(i.data->'cimian'->'items') as item
-                WHERE LOWER(item->>'currentStatus') IN ('failed', 'error', 'needs_reinstall')
-                   OR LOWER(item->>'mappedStatus') IN ('failed', 'error')
-            """)
-            install_stats["devicesWithErrors"] = cursor.fetchone()[0] or 0
-            
-            # Count devices with warnings (pending/update status, but no errors)
-            cursor.execute("""
-                SELECT COUNT(DISTINCT i.device_id)
-                FROM installs i
-                CROSS JOIN LATERAL jsonb_array_elements(i.data->'cimian'->'items') as item
-                WHERE (LOWER(item->>'currentStatus') LIKE '%%pending%%'
-                    OR LOWER(item->>'currentStatus') LIKE '%%update%%'
-                    OR LOWER(item->>'currentStatus') = 'warning')
-                AND i.device_id NOT IN (
-                    -- Exclude devices that have any errors
-                    SELECT DISTINCT device_id
-                    FROM installs
-                    CROSS JOIN LATERAL jsonb_array_elements(data->'cimian'->'items') as err_item
-                    WHERE LOWER(err_item->>'currentStatus') IN ('failed', 'error', 'needs_reinstall')
-                       OR LOWER(err_item->>'mappedStatus') IN ('failed', 'error')
-                )
-            """)
-            install_stats["devicesWithWarnings"] = cursor.fetchone()[0] or 0
-            
-            # Total failed install items across all devices
-            cursor.execute("""
-                SELECT COUNT(*)
-                FROM installs i
-                CROSS JOIN LATERAL jsonb_array_elements(i.data->'cimian'->'items') as item
-                WHERE LOWER(item->>'currentStatus') IN ('failed', 'error', 'needs_reinstall')
-                   OR LOWER(item->>'mappedStatus') IN ('failed', 'error')
-            """)
-            install_stats["totalFailedInstalls"] = cursor.fetchone()[0] or 0
-            
-            # Total warning items across all devices
-            cursor.execute("""
-                SELECT COUNT(*)
-                FROM installs i
-                CROSS JOIN LATERAL jsonb_array_elements(i.data->'cimian'->'items') as item
-                WHERE LOWER(item->>'currentStatus') LIKE '%%pending%%'
-                   OR LOWER(item->>'currentStatus') LIKE '%%update%%'
-                   OR LOWER(item->>'currentStatus') = 'warning'
-            """)
-            install_stats["totalWarnings"] = cursor.fetchone()[0] or 0
-            
-        except Exception as stats_error:
-            logger.warning(f"Failed to get install stats for dashboard: {stats_error}")
+        # Skip slow JSONB queries for now - these lateral joins time out
+        # The stats will need to be computed via a background job or materialized view
         
-        # === EVENTS QUERY (from /api/events) ===
+        # === EVENTS QUERY ===
         events = []
         try:
             cursor.execute("""
@@ -708,11 +671,11 @@ async def get_all_devices(
             d.os,
             d.os_name,
             d.os_version,
-            s.data,
             d.archived,
-            d.archived_at
+            d.archived_at,
+            i.data as inventory_data
         FROM devices d
-        LEFT JOIN system s ON s.device_id = COALESCE(d.serial_number, d.device_id)
+        LEFT JOIN inventory i ON i.device_id = COALESCE(d.serial_number, d.device_id)
         {archive_filter_where}
         ORDER BY COALESCE(d.serial_number, d.device_id) ASC
         """
@@ -748,37 +711,12 @@ async def get_all_devices(
                 os,
                 os_name,
                 os_version,
-                system_data_raw,
                 archived,
                 archived_at,
+                inventory_data_raw,
             ) = row
 
             serial = serial_number or str(device_id)
-
-            # System module is the authoritative source for OS info
-            if system_data_raw:
-                try:
-                    system_data = system_data_raw
-                    if isinstance(system_data, str):
-                        system_data = json.loads(system_data)
-                    
-                    # Handle list format (osquery often returns list)
-                    if isinstance(system_data, list) and len(system_data) > 0:
-                        system_data = system_data[0]
-                        
-                    if isinstance(system_data, dict):
-                        os_info = system_data.get('operatingSystem', {})
-                        if os_info:
-                            sys_os_name = os_info.get('name')
-                            sys_os_version = os_info.get('version') or os_info.get('displayVersion')
-                            
-                            if sys_os_name:
-                                os_name = sys_os_name
-                                os = sys_os_name
-                            if sys_os_version:
-                                os_version = sys_os_version
-                except Exception as sys_error:
-                    logger.warning(f"Failed to parse system data for {serial}: {sys_error}")
 
             os_summary = build_os_summary(os_name or os, os_version)
             platform = infer_platform(os_name or os)
@@ -786,11 +724,10 @@ async def get_all_devices(
             inventory_summary: Optional[Dict[str, Any]] = None
             device_display_name = device_name
 
-            try:
-                cursor.execute("SELECT data FROM inventory WHERE device_id = %s", (serial,))
-                inventory_row = cursor.fetchone()
-                if inventory_row:
-                    raw_inventory = inventory_row[0]
+            # Process inventory data from JOIN
+            if inventory_data_raw:
+                try:
+                    raw_inventory = inventory_data_raw
                     if isinstance(raw_inventory, str):
                         raw_inventory = json.loads(raw_inventory)
                     if isinstance(raw_inventory, list) and raw_inventory:
@@ -814,8 +751,8 @@ async def get_all_devices(
                         if summary:
                             inventory_summary = summary
                             device_display_name = summary.get("deviceName", device_display_name)
-            except Exception as inventory_error:
-                logger.warning(f"Failed to get inventory data for {serial}: {inventory_error}")
+                except Exception as inventory_error:
+                    logger.warning(f"Failed to parse inventory data for {serial}: {inventory_error}")
 
             if not device_display_name:
                 device_display_name = serial
@@ -923,7 +860,7 @@ async def get_device_by_serial(serial_number: str):
                 modules["system"] = system_data
         
         # CRITICAL FIX: Use serial number for module queries (module tables use serial as device_id)
-        module_tables = ["applications", "hardware", "installs", "network", "security", "inventory", "management", "profiles"]
+        module_tables = ["applications", "hardware", "installs", "network", "security", "inventory", "management"]
         for table in module_tables:
             try:
                 # Use serial_number as device_id since module tables store serial numbers
@@ -940,6 +877,61 @@ async def get_device_by_serial(serial_number: str):
                     modules[table] = module_data
             except Exception as e:
                 logger.warning(f"Failed to get {table} data for {serial_num}: {e}")
+        
+        # SPECIAL HANDLING: Profiles module - reconstruct from policy references
+        try:
+            cursor.execute("""
+                SELECT intune_policy_hashes, security_policy_hashes, mdm_policy_hashes, metadata
+                FROM profiles
+                WHERE device_id = %s
+            """, (serial_num,))
+            
+            profile_row = cursor.fetchone()
+            if profile_row:
+                intune_hashes, security_hashes, mdm_hashes, metadata = profile_row
+                
+                # Reconstruct profile by fetching policies from catalog
+                profile_data = json.loads(metadata) if isinstance(metadata, str) else metadata or {}
+                
+                # Fetch Intune policies
+                if intune_hashes:
+                    cursor.execute("""
+                        SELECT policy_data FROM policy_catalog 
+                        WHERE policy_hash = ANY(%s)
+                        ORDER BY policy_name
+                    """, (intune_hashes,))
+                    profile_data['intunePolicies'] = [
+                        json.loads(row[0]) if isinstance(row[0], str) else row[0]
+                        for row in cursor.fetchall()
+                    ]
+                
+                # Fetch security policies
+                if security_hashes:
+                    cursor.execute("""
+                        SELECT policy_data FROM policy_catalog 
+                        WHERE policy_hash = ANY(%s)
+                        ORDER BY policy_name
+                    """, (security_hashes,))
+                    profile_data['securityPolicies'] = [
+                        json.loads(row[0]) if isinstance(row[0], str) else row[0]
+                        for row in cursor.fetchall()
+                    ]
+                
+                # Fetch MDM configurations
+                if mdm_hashes:
+                    cursor.execute("""
+                        SELECT policy_data FROM policy_catalog 
+                        WHERE policy_hash = ANY(%s)
+                        ORDER BY policy_name
+                    """, (mdm_hashes,))
+                    profile_data['mdmConfigurations'] = [
+                        json.loads(row[0]) if isinstance(row[0], str) else row[0]
+                        for row in cursor.fetchall()
+                    ]
+                
+                modules["profiles"] = profile_data
+        except Exception as e:
+            logger.warning(f"Failed to get profiles data for {serial_num}: {e}")
         
         conn.close()
         
@@ -3429,6 +3421,109 @@ async def submit_events(request: Request):
                 try:
                     module_data = modules_data[module_name]
                     
+                    # SPECIAL HANDLING: Policy-level deduplication to reduce 6.7 GB → ~500 MB
+                    # Same policy NAME = same policy CONTENT (deduplicate at policy level, not profile level)
+                    if module_name == 'profiles':
+                        import hashlib
+                        
+                        # Extract metadata (non-policy fields)
+                        metadata = {
+                            'deviceId': module_data.get('deviceId'),
+                            'collectedAt': module_data.get('collectedAt'),
+                            'lastPolicyUpdate': module_data.get('lastPolicyUpdate'),
+                            'version': module_data.get('version'),
+                            'moduleId': module_data.get('moduleId'),
+                            'totalPoliciesApplied': module_data.get('totalPoliciesApplied')
+                        }
+                        
+                        policy_hashes = {
+                            'intune': [],
+                            'security': [],
+                            'mdm': []
+                        }
+                        
+                        # Process Intune policies
+                        if 'intunePolicies' in module_data and module_data['intunePolicies']:
+                            for policy in module_data['intunePolicies']:
+                                # Remove timestamps, hash normalized content
+                                normalized = {k: v for k, v in policy.items() 
+                                            if k not in ['lastSync', 'assignedDate']}
+                                policy_json = json.dumps(normalized, sort_keys=True)
+                                policy_hash = hashlib.md5(policy_json.encode()).hexdigest()
+                                
+                                # Store unique policy in catalog
+                                cursor.execute("""
+                                    INSERT INTO policy_catalog (policy_hash, policy_type, policy_name, policy_data, last_seen, device_count)
+                                    VALUES (%s, 'intune', %s, %s::jsonb, %s, 1)
+                                    ON CONFLICT (policy_hash) DO UPDATE 
+                                    SET last_seen = %s,
+                                        device_count = policy_catalog.device_count + 1
+                                """, (policy_hash, policy.get('policyName'), policy_json, collected_at, collected_at))
+                                
+                                policy_hashes['intune'].append(policy_hash)
+                        
+                        # Process security policies
+                        if 'securityPolicies' in module_data and module_data['securityPolicies']:
+                            for policy in module_data['securityPolicies']:
+                                normalized = {k: v for k, v in policy.items() 
+                                            if k not in ['lastApplied']}
+                                policy_json = json.dumps(normalized, sort_keys=True)
+                                policy_hash = hashlib.md5(policy_json.encode()).hexdigest()
+                                
+                                cursor.execute("""
+                                    INSERT INTO policy_catalog (policy_hash, policy_type, policy_name, policy_data, last_seen, device_count)
+                                    VALUES (%s, 'security', %s, %s::jsonb, %s, 1)
+                                    ON CONFLICT (policy_hash) DO UPDATE 
+                                    SET last_seen = %s,
+                                        device_count = policy_catalog.device_count + 1
+                                """, (policy_hash, policy.get('policyName'), policy_json, collected_at, collected_at))
+                                
+                                policy_hashes['security'].append(policy_hash)
+                        
+                        # Process MDM configurations
+                        if 'mdmConfigurations' in module_data and module_data['mdmConfigurations']:
+                            for config in module_data['mdmConfigurations']:
+                                normalized = {k: v for k, v in config.items() 
+                                            if k not in ['lastUpdated']}
+                                policy_json = json.dumps(normalized, sort_keys=True)
+                                policy_hash = hashlib.md5(policy_json.encode()).hexdigest()
+                                
+                                cursor.execute("""
+                                    INSERT INTO policy_catalog (policy_hash, policy_type, policy_name, policy_data, last_seen, device_count)
+                                    VALUES (%s, 'mdm', %s, %s::jsonb, %s, 1)
+                                    ON CONFLICT (policy_hash) DO UPDATE 
+                                    SET last_seen = %s,
+                                        device_count = policy_catalog.device_count + 1
+                                """, (policy_hash, config.get('cspName'), policy_json, collected_at, collected_at))
+                                
+                                policy_hashes['mdm'].append(policy_hash)
+                        
+                        # Store device profile as lightweight reference to policies
+                        cursor.execute("""
+                            INSERT INTO profiles (device_id, intune_policy_hashes, security_policy_hashes, 
+                                                mdm_policy_hashes, metadata, updated_at)
+                            VALUES (%s, %s, %s, %s, %s::jsonb, %s)
+                            ON CONFLICT (device_id) DO UPDATE 
+                            SET intune_policy_hashes = %s,
+                                security_policy_hashes = %s,
+                                mdm_policy_hashes = %s,
+                                metadata = %s::jsonb,
+                                updated_at = %s
+                        """, (
+                            serial_number,
+                            policy_hashes['intune'], policy_hashes['security'], policy_hashes['mdm'],
+                            json.dumps(metadata), collected_at,
+                            policy_hashes['intune'], policy_hashes['security'], policy_hashes['mdm'],
+                            json.dumps(metadata), collected_at
+                        ))
+                        
+                        conn.commit()
+                        modules_processed.append(module_name)
+                        total_policies = len(policy_hashes['intune']) + len(policy_hashes['security']) + len(policy_hashes['mdm'])
+                        logger.info(f"Stored {total_policies} policy references for device {serial_number}")
+                        continue
+                    
+                    # STANDARD HANDLING: All other modules store normally
                     # Check if module record exists (device_id in module tables = serial_number per schema)
                     cursor.execute(
                         f"SELECT id FROM {table_name} WHERE device_id = %s",
@@ -4016,9 +4111,13 @@ async def delete_device(serial_number: str, confirm: bool = Query(False)):
 @app.get("/api/debug/database")
 async def debug_database():
     """
-    Database diagnostic endpoint.
+    Database diagnostic endpoint - analyze storage usage and data cleanup opportunities.
     
-    Shows device identification standard
+    This endpoint helps identify:
+    1. Duplicate records per device that should only have 1 row per module
+    2. Orphaned records for devices that no longer exist
+    3. Historical data retention issues
+    4. Table bloat from dead tuples
     """
     try:
         conn = get_db_connection()
@@ -4026,21 +4125,113 @@ async def debug_database():
         
         diagnostics = {}
         
-        # Check tables and record counts
-        tables = ["devices", "events", "system", "applications", "hardware", "installs", "network"]
-        for table in tables:
+        # 1. Check for duplicate records in module tables (MAJOR ISSUE)
+        module_tables = ['inventory', 'system', 'hardware', 'applications', 'network', 
+                        'security', 'profiles', 'installs', 'management', 'displays', 'printers']
+        duplicates = {}
+        total_duplicate_rows = 0
+        
+        for table in module_tables:
             try:
-                cursor.execute(f"SELECT COUNT(*) FROM {table}")
-                count = cursor.fetchone()[0]
-                diagnostics[table] = {"records": count, "status": "ok"}
+                # Each device should have ONLY ONE record per module table
+                cursor.execute(f"""
+                    SELECT device_id, COUNT(*) as cnt 
+                    FROM {table} 
+                    GROUP BY device_id 
+                    HAVING COUNT(*) > 1
+                """)
+                dups = cursor.fetchall()
+                if dups:
+                    device_count = len(dups)
+                    total_rows = sum(d[1] for d in dups)
+                    excess_rows = total_rows - device_count  # Should only be 1 per device
+                    duplicates[table] = {
+                        "devicesWithDuplicates": device_count,
+                        "totalRows": total_rows,
+                        "excessRows": excess_rows,
+                        "topOffenders": [{"deviceId": d[0], "count": d[1]} for d in dups[:5]]
+                    }
+                    total_duplicate_rows += excess_rows
+                else:
+                    cursor.execute(f"SELECT COUNT(*) FROM {table}")
+                    total = cursor.fetchone()[0]
+                    duplicates[table] = {
+                        "devicesWithDuplicates": 0,
+                        "totalRows": total,
+                        "excessRows": 0
+                    }
             except Exception as e:
-                diagnostics[table] = {"records": 0, "status": f"error: {str(e)}"}
+                duplicates[table] = {"error": str(e)}
+        
+        diagnostics["duplicates"] = duplicates
+        diagnostics["totalExcessRows"] = total_duplicate_rows
+        
+        # 2. Check for orphaned module records (device doesn't exist)
+        orphaned = {}
+        total_orphaned = 0
+        for table in module_tables:
+            try:
+                cursor.execute(f"""
+                    SELECT COUNT(*) 
+                    FROM {table} m
+                    LEFT JOIN devices d ON m.device_id = d.serial_number
+                    WHERE d.serial_number IS NULL
+                """)
+                orphan_count = cursor.fetchone()[0]
+                if orphan_count > 0:
+                    orphaned[table] = orphan_count
+                    total_orphaned += orphan_count
+            except Exception:
+                pass
+        
+        diagnostics["orphanedRecords"] = orphaned
+        diagnostics["totalOrphanedRecords"] = total_orphaned
+        
+        # 3. Check events table - should we have retention policy?
+        cursor.execute("SELECT COUNT(*), MIN(timestamp), MAX(timestamp) FROM events")
+        event_row = cursor.fetchone()
+        diagnostics["events"] = {
+            "totalEvents": event_row[0],
+            "oldestEvent": event_row[1].isoformat() if event_row[1] else None,
+            "newestEvent": event_row[2].isoformat() if event_row[2] else None
+        }
+        
+        # 4. Table sizes
+        cursor.execute("""
+            SELECT 
+                relname,
+                n_live_tup,
+                n_dead_tup,
+                pg_size_pretty(pg_total_relation_size(relid)) as total_size
+            FROM pg_stat_user_tables 
+            WHERE relname IN ('devices', 'events', 'inventory', 'system', 'hardware', 
+                             'applications', 'profiles', 'network', 'security')
+            ORDER BY pg_total_relation_size(relid) DESC
+        """)
+        table_sizes = []
+        for row in cursor.fetchall():
+            table_sizes.append({
+                "table": row[0],
+                "liveRows": row[1],
+                "deadRows": row[2],
+                "totalSize": row[3]
+            })
+        diagnostics["tableSizes"] = table_sizes
+        
+        # 5. Cleanup recommendations
+        recommendations = []
+        if total_duplicate_rows > 0:
+            recommendations.append(f"DELETE {total_duplicate_rows} duplicate rows from module tables (each device should have 1 record per module)")
+        if total_orphaned > 0:
+            recommendations.append(f"DELETE {total_orphaned} orphaned records (devices no longer exist)")
+        
+        diagnostics["recommendations"] = recommendations
+        diagnostics["potentialStorageSavings"] = f"~{total_duplicate_rows + total_orphaned} records can be safely removed"
         
         conn.close()
         
         return {
             "database": "connected",
-            "deviceIdStandard": "serialNumber",
             "diagnostics": diagnostics,
             "timestamp": datetime.now(timezone.utc).isoformat()
         }
@@ -4050,6 +4241,75 @@ async def debug_database():
         raise HTTPException(status_code=500, detail=f"Database diagnostic failed: {str(e)}")
 
 # Error handlers
+class SQLExecuteRequest(BaseModel):
+    sql: str
+    db_host: str = Field(default="reportmate-database.postgres.database.azure.com")
+    db_name: str = Field(default="reportmate")
+    db_user: str = Field(default="reportmate")
+    db_pass: str
+
+@app.post("/api/admin/execute-sql")
+async def execute_sql(request: SQLExecuteRequest, auth: dict = Depends(verify_authentication)):
+    """
+    ADMIN-ONLY: Execute arbitrary SQL on the database.
+    USE WITH EXTREME CAUTION.
+    """
+    try:
+        # Check if this requires autocommit (CONCURRENTLY, VACUUM, etc.)
+        sql_upper = request.sql.strip().upper()
+        requires_autocommit = ('CONCURRENTLY' in sql_upper or 
+                              sql_upper.startswith('VACUUM') or
+                              sql_upper.startswith('REINDEX'))
+        
+        # Connect directly with provided credentials
+        conn = pg8000.connect(
+            host=request.db_host,
+            port=5432,
+            database=request.db_name,
+            user=request.db_user,
+            password=request.db_pass,
+            ssl_context=True
+        )
+        
+        # Set autocommit for commands that can't run in transaction blocks
+        if requires_autocommit:
+            conn.autocommit = True
+        
+        cursor = conn.cursor()
+        
+        # Execute SQL
+        cursor.execute(request.sql)
+        
+        # Check if this is a SELECT query
+        if sql_upper.startswith('SELECT'):
+            results = cursor.fetchall()
+            columns = [desc[0] for desc in cursor.description] if cursor.description else []
+            if not requires_autocommit:
+                conn.commit()
+            cursor.close()
+            conn.close()
+            return {
+                "success": True,
+                "rows": results,
+                "columns": columns,
+                "rowCount": len(results)
+            }
+        else:
+            # For INSERT/UPDATE/DELETE/CREATE/etc
+            rows_affected = cursor.rowcount
+            if not requires_autocommit:
+                conn.commit()
+            cursor.close()
+            conn.close()
+            return {
+                "success": True,
+                "rowsAffected": rows_affected,
+                "message": f"SQL executed successfully. Rows affected: {rows_affected}"
+            }
+    except Exception as e:
+        logger.error(f"SQL execution error: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"SQL execution failed: {str(e)}")
+
 @app.exception_handler(404)
 async def not_found_handler(request: Request, exc: HTTPException):
     return JSONResponse(
