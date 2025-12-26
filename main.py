@@ -44,6 +44,7 @@ DATABASE_URL = os.getenv('DATABASE_URL', 'postgresql://reportmate:password@local
 
 # Security: Authentication configuration
 REPORTMATE_PASSPHRASE = os.getenv('REPORTMATE_PASSPHRASE')  # For Windows/Mac clients
+API_INTERNAL_SECRET = os.getenv('API_INTERNAL_SECRET')  # For internal container-to-container auth (frontend to API)
 AZURE_MANAGED_IDENTITY_HEADER = "X-MS-CLIENT-PRINCIPAL-ID"  # Azure Container Apps managed identity
 DISABLE_AUTH = os.getenv('DISABLE_AUTH', 'false').lower() in ('true', '1', 'yes')
 
@@ -51,6 +52,7 @@ async def verify_authentication(
     request: Request,
     x_api_passphrase: str = Header(None, alias="X-API-PASSPHRASE"),
     x_client_passphrase: str = Header(None, alias="X-Client-Passphrase"),
+    x_internal_secret: str = Header(None, alias="X-Internal-Secret"),
     x_ms_client_principal_id: str = Header(None, alias="X-MS-CLIENT-PRINCIPAL-ID"),
     x_forwarded_for: str = Header(None, alias="X-Forwarded-For"),
     user_agent: str = Header(None, alias="User-Agent")
@@ -60,16 +62,19 @@ async def verify_authentication(
     
     Authentication can be disabled via DISABLE_AUTH=true environment variable.
     
-    Four authentication methods supported (checked in order):
-    0. Disabled: If DISABLE_AUTH=true, all requests are allowed
-    1. Internal Network: Requests from Container App internal network (100.x.x.x or 10.x.x.x IPs)
+    Authentication methods supported (checked in order):
+    0. Disabled: If DISABLE_AUTH=true, all requests are allowed (development only!)
+    1. Internal Secret: X-Internal-Secret header (for container-to-container auth from frontend)
     2. Azure Managed Identity: X-MS-CLIENT-PRINCIPAL-ID header (when Easy Auth is properly configured)
     3. Passphrase: X-API-PASSPHRASE or X-Client-Passphrase header (for external Windows/macOS clients)
     
+    NOTE: IP-based "internal network" detection (100.x.x.x) was REMOVED because it's insecure
+    in Azure Container Apps - all traffic (internal AND external) routes through these IPs.
+    
     This ensures:
-    - Frontend (internal network) can access without passphrase
-    - Windows/macOS clients authenticate with passphrase (either header format)
-    - Random internet users get rejected (unless auth disabled)
+    - Frontend container authenticates with shared internal secret (X-Internal-Secret)
+    - Windows/macOS clients authenticate with passphrase (X-Client-Passphrase)
+    - Random internet users get rejected (401 Unauthorized)
     """
     
     # Method 0: Authentication disabled via environment variable
@@ -77,29 +82,35 @@ async def verify_authentication(
         logger.debug(f"[OK] Authentication disabled via DISABLE_AUTH env var (User-Agent: {user_agent})")
         return {"method": "auth_disabled", "user_agent": user_agent}
     
-    # Method 1: Internal Container App Network (highest priority)
-    # Container Apps internal network uses private IPs (100.x.x.x range or 10.x.x.x range)
     client_host = request.client.host if request.client else None
     
-    if client_host:
-        if client_host.startswith('100.') or client_host.startswith('10.'):
-            logger.info(f"[OK] Authenticated via internal network: {client_host} (User-Agent: {user_agent})")
-            return {"method": "internal_network", "client_ip": client_host, "user_agent": user_agent}
+    # Method 1: Internal Secret authentication (for container-to-container, frontend→API)
+    # This is the ONLY method for internal container communication - IP checks are NOT secure
+    # in Azure Container Apps because ALL traffic (internal and external) goes through 100.x.x.x IPs
+    if x_internal_secret:
+        if not API_INTERNAL_SECRET:
+            logger.error("[ERR] API_INTERNAL_SECRET not configured but client attempted internal secret auth")
+            raise HTTPException(status_code=500, detail="Server internal authentication not configured")
+        
+        if x_internal_secret != API_INTERNAL_SECRET:
+            logger.warning(f"[ERR] Invalid internal secret attempt from {user_agent} (IP: {client_host})")
+            raise HTTPException(status_code=401, detail="Invalid internal authentication credentials")
+        
+        logger.info(f"[OK] Authenticated via internal secret from {user_agent} (IP: {client_host})")
+        return {"method": "internal_secret", "user_agent": user_agent, "client_ip": client_host}
     
-    # Also check X-Forwarded-For for proxied requests
-    if x_forwarded_for:
-        forwarded_ip = x_forwarded_for.split(',')[0].strip()
-        if forwarded_ip.startswith('100.') or forwarded_ip.startswith('10.'):
-            logger.info(f"[OK] Authenticated via internal network (forwarded): {forwarded_ip} (User-Agent: {user_agent})")
-            return {"method": "internal_network_forwarded", "client_ip": forwarded_ip, "user_agent": user_agent}
+    # REMOVED: Internal network IP check (100.x.x.x, 10.x.x.x)
+    # This was INSECURE because Azure Container Apps routes ALL traffic (including external)
+    # through internal 100.x.x.x IPs. The X-Internal-Secret header is the only secure way
+    # to verify internal container-to-container traffic.
     
-    # Method 2: Azure Managed Identity (for when Easy Auth is properly configured)
+    # Method 3: Azure Managed Identity (for when Easy Auth is properly configured)
     if x_ms_client_principal_id:
         logger.info(f"[OK] Authenticated via Azure Managed Identity: {x_ms_client_principal_id}")
         return {"method": "managed_identity", "principal_id": x_ms_client_principal_id}
     
-    # Method 3: Passphrase authentication (for external Windows/macOS clients)
-    # Accept both X-API-PASSPHRASE (frontend/testing) and X-Client-Passphrase (Windows/Mac clients)
+    # Method 4: Passphrase authentication (for external Windows/macOS clients)
+    # Accept both X-API-PASSPHRASE (testing) and X-Client-Passphrase (Windows/Mac clients)
     passphrase_header = x_api_passphrase or x_client_passphrase
     if passphrase_header:
         if not REPORTMATE_PASSPHRASE:
@@ -118,7 +129,7 @@ async def verify_authentication(
     logger.warning(f"[ERR] Unauthenticated access attempt from {user_agent} (IP: {client_host}, X-Forwarded-For: {x_forwarded_for})")
     raise HTTPException(
         status_code=401,
-        detail="Authentication required. Internal network, X-MS-CLIENT-PRINCIPAL-ID (Managed Identity), or X-API-PASSPHRASE/X-Client-Passphrase required."
+        detail="Authentication required. X-Internal-Secret (internal), X-Client-Passphrase (clients), or internal network access required."
     )
 
 
@@ -1877,6 +1888,10 @@ async def get_bulk_profiles(
     Returns devices with MDM profiles and configuration policies.
     Used by /devices/profiles page for fleet-wide profile visibility.
     By default, archived devices are excluded. Use includeArchived=true to include them.
+    
+    Note: The profiles table uses a normalized schema with policy hash references:
+    - intune_policy_hashes, security_policy_hashes, mdm_policy_hashes reference policy_catalog
+    - metadata contains profile metadata as JSONB
     """
     try:
         logger.info("Fetching bulk profiles data")
@@ -1884,13 +1899,18 @@ async def get_bulk_profiles(
         conn = get_db_connection()
         cursor = conn.cursor()
         
+        # The profiles table uses normalized schema with metadata instead of data column
+        # Note: profiles table uses device serial_number in device_id column (not primary key)
         query = """
         SELECT DISTINCT ON (d.serial_number)
             d.serial_number,
             d.device_id,
             d.last_seen,
-            p.data as profiles_data,
-            p.collected_at,
+            p.metadata as profiles_metadata,
+            p.intune_policy_hashes,
+            p.security_policy_hashes,
+            p.mdm_policy_hashes,
+            p.updated_at as profiles_updated_at,
             inv.data->>'deviceName' as device_name,
             inv.data->>'computerName' as computer_name,
             inv.data->>'usage' as usage,
@@ -1898,12 +1918,12 @@ async def get_bulk_profiles(
             inv.data->>'location' as location,
             inv.data->>'assetTag' as asset_tag
         FROM devices d
-        LEFT JOIN profiles p ON d.id = p.device_id
-        LEFT JOIN inventory inv ON d.id = inv.device_id
+        LEFT JOIN profiles p ON d.serial_number = p.device_id
+        LEFT JOIN inventory inv ON d.serial_number = inv.device_id
         WHERE d.serial_number IS NOT NULL
             AND d.serial_number NOT LIKE 'TEST-%'
             AND d.serial_number != 'localhost'
-            AND p.data IS NOT NULL
+            AND p.device_id IS NOT NULL
         """
         
         # Add archive filter
@@ -1914,14 +1934,22 @@ async def get_bulk_profiles(
         
         cursor.execute(query)
         rows = cursor.fetchall()
-        conn.close()
         
         logger.info(f"Retrieved {len(rows)} devices with profiles data")
         
         devices = []
         for row in rows:
             try:
-                serial_number, device_uuid, last_seen, profiles_data, collected_at, device_name, computer_name, usage, catalog, location, asset_tag = row
+                serial_number, device_uuid, last_seen, metadata, intune_hashes, security_hashes, mdm_hashes, profiles_updated_at, device_name, computer_name, usage, catalog, location, asset_tag = row
+                
+                # Parse metadata JSONB
+                profile_data = json.loads(metadata) if isinstance(metadata, str) else metadata or {}
+                
+                # Count policies for summary
+                intune_count = len(intune_hashes) if intune_hashes else 0
+                security_count = len(security_hashes) if security_hashes else 0
+                mdm_count = len(mdm_hashes) if mdm_hashes else 0
+                total_policies = intune_count + security_count + mdm_count
                 
                 devices.append({
                     'id': serial_number,
@@ -1930,16 +1958,21 @@ async def get_bulk_profiles(
                     'serialNumber': serial_number,
                     'assetTag': asset_tag,
                     'lastSeen': last_seen.isoformat() if last_seen else None,
-                    'collectedAt': collected_at.isoformat() if collected_at else None,
+                    'collectedAt': profiles_updated_at.isoformat() if profiles_updated_at else None,
                     'usage': usage,
                     'catalog': catalog,
                     'location': location,
-                    'raw': profiles_data
+                    'totalPolicies': total_policies,
+                    'intunePolicyCount': intune_count,
+                    'securityPolicyCount': security_count,
+                    'mdmConfigCount': mdm_count,
+                    'raw': profile_data
                 })
             except Exception as e:
                 logger.warning(f"Error processing profiles for device {row[0]}: {e}")
                 continue
         
+        conn.close()
         logger.info(f"Processed {len(devices)} devices with profiles data")
         return devices
         
