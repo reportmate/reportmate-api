@@ -51,15 +51,35 @@ def load_sql(name: str) -> str:
     
     Raises:
         FileNotFoundError: If SQL file doesn't exist
+        ValueError: If name contains path traversal attempts
+        OSError: If file cannot be read
     """
     if name in SQL_QUERIES:
         return SQL_QUERIES[name]
     
+    # Security: Prevent path traversal attacks
+    if ".." in name or name.startswith("/") or name.startswith("\\"):
+        raise ValueError(f"Invalid SQL query name (path traversal detected): {name}")
+    
     sql_path = SQL_DIR / f"{name}.sql"
+    
+    # Additional safety: ensure resolved path is within SQL_DIR
+    try:
+        resolved = sql_path.resolve()
+        if not str(resolved).startswith(str(SQL_DIR.resolve())):
+            raise ValueError(f"Invalid SQL query path: {name}")
+    except OSError as e:
+        raise ValueError(f"Cannot resolve SQL path: {name}") from e
+    
     if not sql_path.exists():
         raise FileNotFoundError(f"SQL file not found: {sql_path}")
     
-    query = sql_path.read_text(encoding="utf-8")
+    try:
+        query = sql_path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError) as e:
+        logger.error(f"Failed to read SQL file {name}: {e}")
+        raise OSError(f"Cannot read SQL file: {sql_path}") from e
+    
     SQL_QUERIES[name] = query
     logger.info(f"Loaded SQL query: {name}")
     return query
@@ -110,13 +130,17 @@ def preload_sql_queries():
     ]
     
     loaded = 0
+    failed = []
     for name in sql_files:
         try:
             load_sql(name)
             loaded += 1
-        except FileNotFoundError as e:
-            logger.warning(f"SQL file not found during preload: {e}")
+        except (FileNotFoundError, ValueError, OSError) as e:
+            logger.error(f"Failed to preload SQL query '{name}': {e}")
+            failed.append(name)
     
+    if failed:
+        logger.error(f"SQL preload incomplete: {len(failed)} queries failed to load: {failed}")
     logger.info(f"Preloaded {loaded}/{len(sql_files)} SQL queries")
 
 # Preload SQL queries at module import time
