@@ -70,6 +70,7 @@ def preload_sql_queries():
     Called during application initialization.
     """
     sql_files = [
+        # Bulk fleet endpoints
         "devices/bulk_hardware",
         "devices/bulk_installs",
         "devices/bulk_network",
@@ -79,6 +80,33 @@ def preload_sql_queries():
         "devices/bulk_inventory",
         "devices/bulk_system",
         "devices/bulk_peripherals",
+        # Dashboard endpoints
+        "devices/dashboard_devices",
+        "devices/dashboard_events",
+        # Device list and count
+        "devices/list_devices",
+        "devices/count_devices",
+        # Single device operations
+        "devices/get_device",
+        "devices/get_device_module",
+        "devices/get_device_profiles",
+        "devices/get_policies_by_hash",
+        "devices/get_installs_log",
+        "devices/get_device_id",
+        "devices/get_serial_number",
+        # Events
+        "events/list_events",
+        "events/get_device_events",
+        "events/get_event_payload",
+        # Admin operations
+        "admin/archive_device",
+        "admin/unarchive_device",
+        "admin/get_device_for_delete",
+        "admin/check_device_archived",
+        "admin/check_duplicates",
+        "admin/check_orphaned",
+        "admin/events_stats",
+        "admin/table_sizes",
     ]
     
     loaded = 0
@@ -2302,23 +2330,8 @@ async def get_events(limit: int = Query(default=100, ge=1, le=1000, description=
         cursor = conn.cursor()
         
         # JOIN with inventory to get device names and assetTag in single query
-        # Return only essential fields needed for events list
-        # Note: device_id in both tables IS the serial number
-        # deviceName and assetTag are stored in inventory.data JSONB column
-        cursor.execute("""
-            SELECT 
-                e.id,
-                e.device_id,
-                i.data->>'deviceName' as device_name,
-                i.data->>'assetTag' as asset_tag,
-                e.event_type,
-                e.message,
-                e.timestamp
-            FROM events e
-            LEFT JOIN inventory i ON e.device_id = i.device_id
-            ORDER BY e.timestamp DESC 
-            LIMIT %s
-        """, (limit,))
+        query = load_sql("events/list_events")
+        cursor.execute(query, {"limit": limit})
         
         rows = cursor.fetchall()
         conn.close()
@@ -3858,10 +3871,8 @@ async def archive_device(serial_number: str):
         cursor = conn.cursor()
         
         # Check if device exists
-        cursor.execute("""
-            SELECT id, archived FROM devices 
-            WHERE serial_number = %s OR id = %s
-        """, (serial_number, serial_number))
+        check_query = load_sql("admin/check_device_archived")
+        cursor.execute(check_query, {"serial_number": serial_number})
         
         device_row = cursor.fetchone()
         if not device_row:
@@ -3882,14 +3893,13 @@ async def archive_device(serial_number: str):
             }
         
         # Archive the device
-        cursor.execute("""
-            UPDATE devices 
-            SET archived = TRUE, 
-                archived_at = %s,
-                status = 'archived',
-                updated_at = %s
-            WHERE serial_number = %s OR id = %s
-        """, (datetime.now(timezone.utc), datetime.now(timezone.utc), serial_number, serial_number))
+        archive_query = load_sql("admin/archive_device")
+        now = datetime.now(timezone.utc)
+        cursor.execute(archive_query, {
+            "serial_number": serial_number,
+            "archived_at": now,
+            "updated_at": now
+        })
         
         conn.commit()
         conn.close()
@@ -3901,8 +3911,8 @@ async def archive_device(serial_number: str):
             "message": f"Device {serial_number} has been archived",
             "serialNumber": serial_number,
             "archived": True,
-            "archivedAt": datetime.now(timezone.utc).isoformat(),
-            "timestamp": datetime.now(timezone.utc).isoformat()
+            "archivedAt": now.isoformat(),
+            "timestamp": now.isoformat()
         }
         
     except HTTPException:
@@ -3932,10 +3942,8 @@ async def unarchive_device(serial_number: str):
         cursor = conn.cursor()
         
         # Check if device exists
-        cursor.execute("""
-            SELECT id, archived FROM devices 
-            WHERE serial_number = %s OR id = %s
-        """, (serial_number, serial_number))
+        check_query = load_sql("admin/check_device_archived")
+        cursor.execute(check_query, {"serial_number": serial_number})
         
         device_row = cursor.fetchone()
         if not device_row:
@@ -3956,14 +3964,12 @@ async def unarchive_device(serial_number: str):
             }
         
         # Unarchive the device
-        cursor.execute("""
-            UPDATE devices 
-            SET archived = FALSE, 
-                archived_at = NULL,
-                status = 'active',
-                updated_at = %s
-            WHERE serial_number = %s OR id = %s
-        """, (datetime.now(timezone.utc), serial_number, serial_number))
+        unarchive_query = load_sql("admin/unarchive_device")
+        now = datetime.now(timezone.utc)
+        cursor.execute(unarchive_query, {
+            "serial_number": serial_number,
+            "updated_at": now
+        })
         
         conn.commit()
         conn.close()
@@ -4024,10 +4030,8 @@ async def delete_device(serial_number: str, confirm: bool = Query(False)):
         cursor = conn.cursor()
         
         # Check if device exists and get details for logging
-        cursor.execute("""
-            SELECT id, device_id, name, archived FROM devices 
-            WHERE serial_number = %s OR id = %s
-        """, (serial_number, serial_number))
+        check_query = load_sql("admin/get_device_for_delete")
+        cursor.execute(check_query, {"serial_number": serial_number})
         
         device_row = cursor.fetchone()
         if not device_row:
