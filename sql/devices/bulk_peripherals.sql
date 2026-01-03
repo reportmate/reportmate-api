@@ -9,7 +9,11 @@ SELECT DISTINCT ON (d.serial_number)
     d.last_seen,
     disp.data as displays_data,
     print.data as printers_data,
-    GREATEST(disp.collected_at, print.collected_at) as collected_at,
+    -- Use COALESCE to handle NULL values from LEFT JOINs
+    GREATEST(
+        COALESCE(disp.collected_at, '1970-01-01'::timestamp),
+        COALESCE(print.collected_at, '1970-01-01'::timestamp)
+    ) as collected_at,
     inv.data->>'deviceName' as device_name,
     inv.data->>'computerName' as computer_name,
     inv.data->>'usage' as usage,
@@ -25,4 +29,8 @@ WHERE d.serial_number IS NOT NULL
     AND d.serial_number != 'localhost'
     AND (disp.data IS NOT NULL OR print.data IS NOT NULL)
     AND (%(include_archived)s = TRUE OR d.archived = FALSE)
-ORDER BY d.serial_number, GREATEST(disp.updated_at, print.updated_at) DESC;
+-- Use COALESCE to handle NULL values in ORDER BY
+ORDER BY d.serial_number, GREATEST(
+    COALESCE(disp.updated_at, '1970-01-01'::timestamp),
+    COALESCE(print.updated_at, '1970-01-01'::timestamp)
+) DESC;
