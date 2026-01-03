@@ -13,6 +13,7 @@ import json
 import logging
 import os
 from datetime import datetime, timezone, timedelta
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
 
 import pg8000
@@ -32,11 +33,126 @@ except ImportError:
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# FastAPI app initialization
+# -----------------------------------------------------------------------------
+# SQL Query Loader - Load queries from external .sql files at startup
+# -----------------------------------------------------------------------------
+SQL_DIR = Path(__file__).parent / "sql"
+SQL_QUERIES: Dict[str, str] = {}
+
+def load_sql(name: str) -> str:
+    """
+    Load a SQL query from an external .sql file.
+    
+    Args:
+        name: Path relative to sql/ directory (e.g., 'devices/bulk_hardware')
+    
+    Returns:
+        SQL query string with %(name)s style parameter placeholders
+    
+    Raises:
+        FileNotFoundError: If SQL file doesn't exist
+    """
+    if name in SQL_QUERIES:
+        return SQL_QUERIES[name]
+    
+    sql_path = SQL_DIR / f"{name}.sql"
+    if not sql_path.exists():
+        raise FileNotFoundError(f"SQL file not found: {sql_path}")
+    
+    query = sql_path.read_text(encoding="utf-8")
+    SQL_QUERIES[name] = query
+    logger.info(f"Loaded SQL query: {name}")
+    return query
+
+def preload_sql_queries():
+    """
+    Preload all SQL queries at startup for faster execution.
+    Called during application initialization.
+    """
+    sql_files = [
+        "devices/bulk_hardware",
+        "devices/bulk_installs",
+        "devices/bulk_network",
+        "devices/bulk_security",
+        "devices/bulk_profiles",
+        "devices/bulk_management",
+        "devices/bulk_inventory",
+        "devices/bulk_system",
+        "devices/bulk_peripherals",
+    ]
+    
+    loaded = 0
+    for name in sql_files:
+        try:
+            load_sql(name)
+            loaded += 1
+        except FileNotFoundError as e:
+            logger.warning(f"SQL file not found during preload: {e}")
+    
+    logger.info(f"Preloaded {loaded}/{len(sql_files)} SQL queries")
+
+# Preload SQL queries at module import time
+preload_sql_queries()
+
+# FastAPI app initialization with OpenAPI documentation
 app = FastAPI(
     title="ReportMate API",
     version="1.0.0",
-    description="Device management and telemetry API"
+    description="""
+## ReportMate Device Management and Telemetry API
+
+ReportMate provides a comprehensive REST API for managing device fleets and collecting telemetry data.
+
+### Features
+- **Device Management**: Query, archive, and delete devices
+- **Fleet Analytics**: Bulk endpoints for hardware, software, network, and security data
+- **Event Logging**: Real-time event ingestion and retrieval
+- **Module Data**: Access individual module data (system, hardware, network, etc.)
+
+### Authentication
+All endpoints require authentication via one of:
+- `X-Client-Passphrase` header (Windows/macOS clients)
+- `X-Internal-Secret` header (container-to-container)
+- Azure Managed Identity (when Easy Auth is configured)
+
+### Rate Limiting
+API requests are subject to rate limiting. Contact support for increased limits.
+    """,
+    contact={
+        "name": "ReportMate Support",
+        "url": "https://reportmate.ecuad.ca",
+        "email": "support@ecuad.ca"
+    },
+    license_info={
+        "name": "Apache 2.0",
+        "url": "https://www.apache.org/licenses/LICENSE-2.0.html"
+    },
+    openapi_tags=[
+        {
+            "name": "devices",
+            "description": "Device management operations - list, get, archive, delete devices"
+        },
+        {
+            "name": "fleet",
+            "description": "Fleet-wide bulk data endpoints for analytics dashboards"
+        },
+        {
+            "name": "events",
+            "description": "Event logging, retrieval, and real-time notifications"
+        },
+        {
+            "name": "statistics",
+            "description": "Fleet analytics, usage statistics, and reporting"
+        },
+        {
+            "name": "admin",
+            "description": "Administrative operations and diagnostics"
+        },
+        {
+            "name": "health",
+            "description": "Health checks and status endpoints"
+        }
+    ]
 )
 
 # Database connection configuration
@@ -79,7 +195,7 @@ async def verify_authentication(
     
     # Method 0: Authentication disabled via environment variable
     if DISABLE_AUTH:
-        logger.debug(f"[OK] Authentication disabled via DISABLE_AUTH env var (User-Agent: {user_agent})")
+        logger.debug(f"[SUCCESS] Authentication disabled via DISABLE_AUTH env var (User-Agent: {user_agent})")
         return {"method": "auth_disabled", "user_agent": user_agent}
     
     client_host = request.client.host if request.client else None
@@ -96,7 +212,7 @@ async def verify_authentication(
             logger.warning(f"[ERR] Invalid internal secret attempt from {user_agent} (IP: {client_host})")
             raise HTTPException(status_code=401, detail="Invalid internal authentication credentials")
         
-        logger.info(f"[OK] Authenticated via internal secret from {user_agent} (IP: {client_host})")
+        logger.info(f"[SUCCESS] Authenticated via internal secret from {user_agent} (IP: {client_host})")
         return {"method": "internal_secret", "user_agent": user_agent, "client_ip": client_host}
     
     # REMOVED: Internal network IP check (100.x.x.x, 10.x.x.x)
@@ -106,7 +222,7 @@ async def verify_authentication(
     
     # Method 3: Azure Managed Identity (for when Easy Auth is properly configured)
     if x_ms_client_principal_id:
-        logger.info(f"[OK] Authenticated via Azure Managed Identity: {x_ms_client_principal_id}")
+        logger.info(f"[SUCCESS] Authenticated via Azure Managed Identity: {x_ms_client_principal_id}")
         return {"method": "managed_identity", "principal_id": x_ms_client_principal_id}
     
     # Method 4: Passphrase authentication (for external Windows/macOS clients)
@@ -122,7 +238,7 @@ async def verify_authentication(
             raise HTTPException(status_code=401, detail="Invalid authentication credentials")
         
         header_type = "X-API-PASSPHRASE" if x_api_passphrase else "X-Client-Passphrase"
-        logger.info(f"[OK] Authenticated via passphrase ({header_type}) from {user_agent} (IP: {client_host})")
+        logger.info(f"[SUCCESS] Authenticated via passphrase ({header_type}) from {user_agent} (IP: {client_host})")
         return {"method": "passphrase", "user_agent": user_agent, "client_ip": client_host}
     
     # No valid authentication method provided
@@ -407,9 +523,18 @@ async def root():
         }
     }
 
-@app.get("/api/health")
+@app.get("/api/health", tags=["health"])
 async def health_check():
-    """Health check endpoint."""
+    """
+    Health check endpoint for monitoring and load balancers.
+    
+    **No authentication required.**
+    
+    **Response:**
+    - status: "healthy" or "unhealthy"
+    - database: Connection status
+    - version: API version
+    """
     try:
         conn = get_db_connection()
         cursor = conn.cursor()
@@ -632,21 +757,27 @@ async def get_dashboard_data(
             conn.close()
         raise HTTPException(status_code=500, detail=f"Failed to retrieve dashboard data: {str(e)}")
 
-@app.get("/api/devices", response_model=DevicesResponse, dependencies=[Depends(verify_authentication)])
+@app.get("/api/devices", response_model=DevicesResponse, dependencies=[Depends(verify_authentication)], tags=["devices"])
 async def get_all_devices(
-    limit: Optional[int] = Query(default=None, ge=1, le=1000),
-    offset: int = Query(default=0, ge=0),
-    include_archived: bool = Query(default=False, alias="includeArchived")
+    limit: Optional[int] = Query(default=None, ge=1, le=1000, description="Maximum devices to return"),
+    offset: int = Query(default=0, ge=0, description="Number of devices to skip for pagination"),
+    include_archived: bool = Query(default=False, alias="includeArchived", description="Include archived devices")
 ):
     """
-    Bulk devices endpoint with standardized device identification and lightweight module payloads.
+    List all devices with standardized identification and lightweight module payloads.
     
     By default, archived devices are excluded from results.
     Use includeArchived=true to show archived devices.
     
-    **Authentication Required:**
-    - Windows clients: X-API-PASSPHRASE header
-    - Azure resources: X-MS-CLIENT-PRINCIPAL-ID header (Managed Identity)
+    **Query Parameters:**
+    - limit: Maximum devices to return (1-1000, default all)
+    - offset: Pagination offset
+    - includeArchived: Include archived devices (default false)
+    
+    **Response:**
+    - devices: Array of device objects
+    - total: Total device count
+    - offset: Current pagination offset
     """
     conn = None
     try:
@@ -826,16 +957,21 @@ async def get_all_devices(
         if conn:
             conn.close()
 
-@app.get("/api/device/{serial_number}", dependencies=[Depends(verify_authentication)])
+@app.get("/api/device/{serial_number}", dependencies=[Depends(verify_authentication)], tags=["devices"])
 async def get_device_by_serial(serial_number: str):
     """
     Get individual device details with all modules.
     
     Uses serialNumber consistently as primary identifier.
+    Returns complete device data including all collected module data.
     
-    **Authentication Required:**
-    - Windows clients: X-API-PASSPHRASE header
-    - Azure resources: X-MS-CLIENT-PRINCIPAL-ID header (Managed Identity)
+    **Path Parameters:**
+    - serial_number: Device serial number (e.g., "ABC123XYZ")
+    
+    **Response includes:**
+    - Device metadata (serial, UUID, last seen, client version)
+    - All module data (inventory, hardware, network, security, etc.)
+    - Archive status
     """
     try:
         conn = get_db_connection()
@@ -1399,15 +1535,20 @@ async def get_bulk_applications(
         logger.error(f"Failed to get bulk applications: {e}")
         raise HTTPException(status_code=500, detail=f"Failed to retrieve bulk applications: {str(e)}")
 
-@app.get("/api/devices/hardware", dependencies=[Depends(verify_authentication)])
+@app.get("/api/devices/hardware", dependencies=[Depends(verify_authentication)], tags=["fleet"])
 async def get_bulk_hardware(
-    include_archived: bool = Query(default=False, alias="includeArchived")
+    include_archived: bool = Query(default=False, alias="includeArchived", description="Include archived devices in results")
 ):
     """
     Bulk hardware endpoint.
     
     Returns flattened list of hardware details across all devices.
     By default, archived devices are excluded. Use includeArchived=true to include them.
+    
+    **Response includes:**
+    - Device identifiers (serial number, device ID, name)
+    - Hardware specs (manufacturer, model, CPU, memory, storage, GPU)
+    - OS information (name, version, architecture)
     """
     try:
         logger.info("Fetching bulk hardware data")
@@ -1415,32 +1556,10 @@ async def get_bulk_hardware(
         conn = get_db_connection()
         cursor = conn.cursor()
         
-        query = """
-        SELECT DISTINCT ON (d.serial_number)
-            d.serial_number,
-            d.device_id,
-            d.last_seen,
-            h.data as hardware_data,
-            h.collected_at,
-            s.data as system_data,
-            inv.data->>'deviceName' as device_name,
-            inv.data->>'computerName' as computer_name
-        FROM devices d
-        LEFT JOIN hardware h ON d.id = h.device_id
-        LEFT JOIN system s ON d.id = s.device_id
-        LEFT JOIN inventory inv ON d.id = inv.device_id
-        WHERE d.serial_number IS NOT NULL
-            AND d.serial_number NOT LIKE 'TEST-%'
-            AND h.data IS NOT NULL
-        """
+        # Load SQL from external file - uses parameterized archive filter
+        query = load_sql("devices/bulk_hardware")
         
-        # Add archive filter
-        if not include_archived:
-            query += " AND d.archived = FALSE"
-        
-        query += " ORDER BY d.serial_number, h.updated_at DESC"
-        
-        cursor.execute(query)
+        cursor.execute(query, {"include_archived": include_archived})
         rows = cursor.fetchall()
         conn.close()
         
@@ -1496,15 +1615,20 @@ async def get_bulk_hardware(
         logger.error(f"Failed to get bulk hardware: {e}")
         raise HTTPException(status_code=500, detail=f"Failed to retrieve bulk hardware: {str(e)}")
 
-@app.get("/api/devices/installs", dependencies=[Depends(verify_authentication)])
+@app.get("/api/devices/installs", dependencies=[Depends(verify_authentication)], tags=["fleet"])
 async def get_bulk_installs(
-    include_archived: bool = Query(default=False, alias="includeArchived")
+    include_archived: bool = Query(default=False, alias="includeArchived", description="Include archived devices in results")
 ):
     """
     Bulk installs endpoint for Cimian managed packages.
     
     Returns flattened list of managed installs across all devices.
     By default, archived devices are excluded. Use includeArchived=true to include them.
+    
+    **Response includes:**
+    - Device identifiers and inventory data
+    - Cimian package status (item name, version, update status)
+    - Install dates and last check timestamps
     """
     try:
         logger.info("Fetching bulk installs data")
@@ -1512,36 +1636,10 @@ async def get_bulk_installs(
         conn = get_db_connection()
         cursor = conn.cursor()
         
-        query = """
-        SELECT DISTINCT ON (d.serial_number)
-            d.serial_number,
-            d.device_id,
-            d.last_seen,
-            i.data as installs_data,
-            i.collected_at,
-            inv.data->>'deviceName' as device_name,
-            inv.data->>'computerName' as computer_name,
-            inv.data->>'usage' as usage,
-            inv.data->>'catalog' as catalog,
-            inv.data->>'location' as location,
-            inv.data->>'assetTag' as asset_tag,
-            inv.data->>'fleet' as fleet,
-            inv.data->>'platform' as platform
-        FROM devices d
-        LEFT JOIN installs i ON d.id = i.device_id
-        LEFT JOIN inventory inv ON d.id = inv.device_id
-        WHERE d.serial_number IS NOT NULL
-            AND d.serial_number NOT LIKE 'TEST-%'
-            AND i.data IS NOT NULL
-        """
+        # Load SQL from external file - uses parameterized archive filter
+        query = load_sql("devices/bulk_installs")
         
-        # Add archive filter
-        if not include_archived:
-            query += " AND d.archived = FALSE"
-        
-        query += " ORDER BY d.serial_number, i.updated_at DESC"
-        
-        cursor.execute(query)
+        cursor.execute(query, {"include_archived": include_archived})
         rows = cursor.fetchall()
         conn.close()
         
@@ -1704,9 +1802,9 @@ async def get_bulk_installs_full(
         raise HTTPException(status_code=500, detail=f"Failed to retrieve bulk installs: {str(e)}")
 
 
-@app.get("/api/devices/network", dependencies=[Depends(verify_authentication)])
+@app.get("/api/devices/network", dependencies=[Depends(verify_authentication)], tags=["fleet"])
 async def get_bulk_network(
-    include_archived: bool = Query(default=False, alias="includeArchived")
+    include_archived: bool = Query(default=False, alias="includeArchived", description="Include archived devices in results")
 ):
     """
     Bulk network endpoint for fleet-wide network overview.
@@ -1714,6 +1812,11 @@ async def get_bulk_network(
     Returns devices with network configuration data (interfaces, IPs, MACs, DNS, etc.).
     Used by /devices/network page for fleet-wide network visibility.
     By default, archived devices are excluded. Use includeArchived=true to include them.
+    
+    **Response includes:**
+    - Device identifiers and inventory
+    - Network interfaces, IP addresses, MAC addresses
+    - DNS configuration, gateways, and network type
     """
     try:
         logger.info("Fetching bulk network data")
@@ -1721,41 +1824,10 @@ async def get_bulk_network(
         conn = get_db_connection()
         cursor = conn.cursor()
         
-        query = """
-        SELECT DISTINCT ON (d.serial_number)
-            d.serial_number,
-            d.device_id,
-            d.last_seen,
-            n.data as network_data,
-            n.collected_at,
-            inv.data->>'deviceName' as device_name,
-            inv.data->>'computerName' as computer_name,
-            inv.data->>'usage' as usage,
-            inv.data->>'catalog' as catalog,
-            inv.data->>'location' as location,
-            inv.data->>'assetTag' as asset_tag,
-            sys.data->'operatingSystem'->>'name' as os_name,
-            sys.data->'operatingSystem'->>'version' as os_version,
-            sys.data->'operatingSystem'->>'buildNumber' as build_number,
-            sys.data->>'uptime' as uptime,
-            sys.data->>'bootTime' as boot_time
-        FROM devices d
-        LEFT JOIN network n ON d.id = n.device_id
-        LEFT JOIN inventory inv ON d.id = inv.device_id
-        LEFT JOIN system sys ON d.id = sys.device_id
-        WHERE d.serial_number IS NOT NULL
-            AND d.serial_number NOT LIKE 'TEST-%'
-            AND d.serial_number != 'localhost'
-            AND n.data IS NOT NULL
-        """
+        # Load SQL from external file - uses parameterized archive filter
+        query = load_sql("devices/bulk_network")
         
-        # Add archive filter
-        if not include_archived:
-            query += " AND d.archived = FALSE"
-        
-        query += " ORDER BY d.serial_number, n.updated_at DESC"
-        
-        cursor.execute(query)
+        cursor.execute(query, {"include_archived": include_archived})
         rows = cursor.fetchall()
         conn.close()
         
@@ -1798,9 +1870,9 @@ async def get_bulk_network(
         logger.error(f"Failed to get bulk network: {e}")
         raise HTTPException(status_code=500, detail=f"Failed to retrieve bulk network: {str(e)}")
 
-@app.get("/api/devices/security", dependencies=[Depends(verify_authentication)])
+@app.get("/api/devices/security", dependencies=[Depends(verify_authentication)], tags=["fleet"])
 async def get_bulk_security(
-    include_archived: bool = Query(default=False, alias="includeArchived")
+    include_archived: bool = Query(default=False, alias="includeArchived", description="Include archived devices in results")
 ):
     """
     Bulk security endpoint for fleet-wide security overview.
@@ -1808,6 +1880,12 @@ async def get_bulk_security(
     Returns devices with security configuration (TPM, BitLocker, EDR, AV, etc.).
     Used by /devices/security page for fleet-wide security visibility.
     By default, archived devices are excluded. Use includeArchived=true to include them.
+    
+    **Response includes:**
+    - Device identifiers and inventory
+    - TPM status, BitLocker encryption state
+    - EDR/AV status and configuration
+    - Firewall and security baseline compliance
     """
     try:
         logger.info("Fetching bulk security data")
@@ -1815,35 +1893,10 @@ async def get_bulk_security(
         conn = get_db_connection()
         cursor = conn.cursor()
         
-        query = """
-        SELECT DISTINCT ON (d.serial_number)
-            d.serial_number,
-            d.device_id,
-            d.last_seen,
-            sec.data as security_data,
-            sec.collected_at,
-            inv.data->>'deviceName' as device_name,
-            inv.data->>'computerName' as computer_name,
-            inv.data->>'usage' as usage,
-            inv.data->>'catalog' as catalog,
-            inv.data->>'location' as location,
-            inv.data->>'assetTag' as asset_tag
-        FROM devices d
-        LEFT JOIN security sec ON d.id = sec.device_id
-        LEFT JOIN inventory inv ON d.id = inv.device_id
-        WHERE d.serial_number IS NOT NULL
-            AND d.serial_number NOT LIKE 'TEST-%'
-            AND d.serial_number != 'localhost'
-            AND sec.data IS NOT NULL
-        """
+        # Load SQL from external file - uses parameterized archive filter
+        query = load_sql("devices/bulk_security")
         
-        # Add archive filter
-        if not include_archived:
-            query += " AND d.archived = FALSE"
-        
-        query += " ORDER BY d.serial_number, sec.updated_at DESC"
-        
-        cursor.execute(query)
+        cursor.execute(query, {"include_archived": include_archived})
         rows = cursor.fetchall()
         conn.close()
         
@@ -1878,9 +1931,9 @@ async def get_bulk_security(
         logger.error(f"Failed to get bulk security: {e}")
         raise HTTPException(status_code=500, detail=f"Failed to retrieve bulk security: {str(e)}")
 
-@app.get("/api/devices/profiles", dependencies=[Depends(verify_authentication)])
+@app.get("/api/devices/profiles", dependencies=[Depends(verify_authentication)], tags=["fleet"])
 async def get_bulk_profiles(
-    include_archived: bool = Query(default=False, alias="includeArchived")
+    include_archived: bool = Query(default=False, alias="includeArchived", description="Include archived devices in results")
 ):
     """
     Bulk profiles endpoint for fleet-wide configuration profiles.
@@ -1889,9 +1942,14 @@ async def get_bulk_profiles(
     Used by /devices/profiles page for fleet-wide profile visibility.
     By default, archived devices are excluded. Use includeArchived=true to include them.
     
-    Note: The profiles table uses a normalized schema with policy hash references:
+    **Note:** The profiles table uses a normalized schema with policy hash references:
     - intune_policy_hashes, security_policy_hashes, mdm_policy_hashes reference policy_catalog
     - metadata contains profile metadata as JSONB
+    
+    **Response includes:**
+    - Device identifiers and inventory
+    - Policy counts by type (Intune, security, MDM)
+    - Profile metadata and configuration details
     """
     try:
         logger.info("Fetching bulk profiles data")
@@ -1899,40 +1957,12 @@ async def get_bulk_profiles(
         conn = get_db_connection()
         cursor = conn.cursor()
         
+        # Load SQL from external file - uses parameterized archive filter
         # The profiles table uses normalized schema with metadata instead of data column
         # Note: profiles table uses device serial_number in device_id column (not primary key)
-        query = """
-        SELECT DISTINCT ON (d.serial_number)
-            d.serial_number,
-            d.device_id,
-            d.last_seen,
-            p.metadata as profiles_metadata,
-            p.intune_policy_hashes,
-            p.security_policy_hashes,
-            p.mdm_policy_hashes,
-            p.updated_at as profiles_updated_at,
-            inv.data->>'deviceName' as device_name,
-            inv.data->>'computerName' as computer_name,
-            inv.data->>'usage' as usage,
-            inv.data->>'catalog' as catalog,
-            inv.data->>'location' as location,
-            inv.data->>'assetTag' as asset_tag
-        FROM devices d
-        LEFT JOIN profiles p ON d.serial_number = p.device_id
-        LEFT JOIN inventory inv ON d.serial_number = inv.device_id
-        WHERE d.serial_number IS NOT NULL
-            AND d.serial_number NOT LIKE 'TEST-%'
-            AND d.serial_number != 'localhost'
-            AND p.device_id IS NOT NULL
-        """
+        query = load_sql("devices/bulk_profiles")
         
-        # Add archive filter
-        if not include_archived:
-            query += " AND d.archived = FALSE"
-        
-        query += " ORDER BY d.serial_number, p.updated_at DESC"
-        
-        cursor.execute(query)
+        cursor.execute(query, {"include_archived": include_archived})
         rows = cursor.fetchall()
         
         logger.info(f"Retrieved {len(rows)} devices with profiles data")
@@ -1980,9 +2010,9 @@ async def get_bulk_profiles(
         logger.error(f"Failed to get bulk profiles: {e}")
         raise HTTPException(status_code=500, detail=f"Failed to retrieve bulk profiles: {str(e)}")
 
-@app.get("/api/devices/management", dependencies=[Depends(verify_authentication)])
+@app.get("/api/devices/management", dependencies=[Depends(verify_authentication)], tags=["fleet"])
 async def get_bulk_management(
-    include_archived: bool = Query(default=False, alias="includeArchived")
+    include_archived: bool = Query(default=False, alias="includeArchived", description="Include archived devices in results")
 ):
     """
     Bulk management endpoint for fleet-wide MDM status.
@@ -1990,6 +2020,12 @@ async def get_bulk_management(
     Returns devices with MDM enrollment status and management configuration.
     Used by /devices/management page for fleet-wide MDM visibility.
     By default, archived devices are excluded. Use includeArchived=true to include them.
+    
+    **Response includes:**
+    - Device identifiers and inventory
+    - MDM enrollment status (Enrolled/Not Enrolled)
+    - Provider, enrollment type, Intune ID
+    - Tenant information
     """
     try:
         logger.info("Fetching bulk management data")
@@ -1997,36 +2033,10 @@ async def get_bulk_management(
         conn = get_db_connection()
         cursor = conn.cursor()
         
-        query = """
-        SELECT DISTINCT ON (d.serial_number)
-            d.serial_number,
-            d.device_id,
-            d.last_seen,
-            m.data as management_data,
-            m.collected_at,
-            inv.data->>'deviceName' as device_name,
-            inv.data->>'computerName' as computer_name,
-            inv.data->>'usage' as usage,
-            inv.data->>'catalog' as catalog,
-            inv.data->>'location' as location,
-            inv.data->>'assetTag' as asset_tag,
-            inv.data->>'department' as department
-        FROM devices d
-        LEFT JOIN management m ON d.id = m.device_id
-        LEFT JOIN inventory inv ON d.id = inv.device_id
-        WHERE d.serial_number IS NOT NULL
-            AND d.serial_number NOT LIKE 'TEST-%'
-            AND d.serial_number != 'localhost'
-            AND m.data IS NOT NULL
-        """
+        # Load SQL from external file - uses parameterized archive filter
+        query = load_sql("devices/bulk_management")
         
-        # Add archive filter
-        if not include_archived:
-            query += " AND d.archived = FALSE"
-        
-        query += " ORDER BY d.serial_number, m.updated_at DESC"
-        
-        cursor.execute(query)
+        cursor.execute(query, {"include_archived": include_archived})
         rows = cursor.fetchall()
         conn.close()
         
@@ -2078,9 +2088,9 @@ async def get_bulk_management(
         logger.error(f"Failed to get bulk management: {e}")
         raise HTTPException(status_code=500, detail=f"Failed to retrieve bulk management: {str(e)}")
 
-@app.get("/api/devices/inventory", dependencies=[Depends(verify_authentication)])
+@app.get("/api/devices/inventory", dependencies=[Depends(verify_authentication)], tags=["fleet"])
 async def get_bulk_inventory(
-    include_archived: bool = Query(default=False, alias="includeArchived")
+    include_archived: bool = Query(default=False, alias="includeArchived", description="Include archived devices in results")
 ):
     """
     Bulk inventory endpoint for fleet-wide device inventory.
@@ -2088,6 +2098,11 @@ async def get_bulk_inventory(
     Returns devices with inventory metadata (names, asset tags, locations, usage, etc.).
     Used by /devices/inventory page for fleet-wide inventory management.
     By default, archived devices are excluded. Use includeArchived=true to include them.
+    
+    **Response includes:**
+    - Device identifiers (serial number, device ID)
+    - Asset information (name, tag, location, department)
+    - Usage classification and catalog assignment
     """
     try:
         logger.info("Fetching bulk inventory data")
@@ -2095,35 +2110,10 @@ async def get_bulk_inventory(
         conn = get_db_connection()
         cursor = conn.cursor()
         
-        query = """
-        SELECT DISTINCT ON (d.serial_number)
-            d.serial_number,
-            d.device_id,
-            d.last_seen,
-            inv.data as inventory_data,
-            inv.collected_at,
-            inv.data->>'deviceName' as device_name,
-            inv.data->>'computerName' as computer_name,
-            inv.data->>'usage' as usage,
-            inv.data->>'catalog' as catalog,
-            inv.data->>'location' as location,
-            inv.data->>'assetTag' as asset_tag,
-            inv.data->>'department' as department
-        FROM devices d
-        LEFT JOIN inventory inv ON d.id = inv.device_id
-        WHERE d.serial_number IS NOT NULL
-            AND d.serial_number NOT LIKE 'TEST-%'
-            AND d.serial_number != 'localhost'
-            AND inv.data IS NOT NULL
-        """
+        # Load SQL from external file - uses parameterized archive filter
+        query = load_sql("devices/bulk_inventory")
         
-        # Add archive filter
-        if not include_archived:
-            query += " AND d.archived = FALSE"
-        
-        query += " ORDER BY d.serial_number, inv.updated_at DESC"
-        
-        cursor.execute(query)
+        cursor.execute(query, {"include_archived": include_archived})
         rows = cursor.fetchall()
         conn.close()
         
@@ -2159,9 +2149,9 @@ async def get_bulk_inventory(
         logger.error(f"Failed to get bulk inventory: {e}")
         raise HTTPException(status_code=500, detail=f"Failed to retrieve bulk inventory: {str(e)}")
 
-@app.get("/api/devices/system", dependencies=[Depends(verify_authentication)])
+@app.get("/api/devices/system", dependencies=[Depends(verify_authentication)], tags=["fleet"])
 async def get_bulk_system(
-    include_archived: bool = Query(default=False, alias="includeArchived")
+    include_archived: bool = Query(default=False, alias="includeArchived", description="Include archived devices in results")
 ):
     """
     Bulk system endpoint for fleet-wide OS and system information.
@@ -2169,6 +2159,12 @@ async def get_bulk_system(
     Returns devices with OS details, uptime, updates, services, etc.
     Used by /devices/system page for fleet-wide system visibility.
     By default, archived devices are excluded. Use includeArchived=true to include them.
+    
+    **Response includes:**
+    - Device identifiers and inventory
+    - Operating system name, version, build number
+    - System uptime, boot time
+    - Pending updates and service status
     """
     try:
         logger.info("Fetching bulk system data")
@@ -2176,35 +2172,10 @@ async def get_bulk_system(
         conn = get_db_connection()
         cursor = conn.cursor()
         
-        query = """
-        SELECT DISTINCT ON (d.serial_number)
-            d.serial_number,
-            d.device_id,
-            d.last_seen,
-            s.data as system_data,
-            s.collected_at,
-            inv.data->>'deviceName' as device_name,
-            inv.data->>'computerName' as computer_name,
-            inv.data->>'usage' as usage,
-            inv.data->>'catalog' as catalog,
-            inv.data->>'location' as location,
-            inv.data->>'assetTag' as asset_tag
-        FROM devices d
-        LEFT JOIN system s ON d.id = s.device_id
-        LEFT JOIN inventory inv ON d.id = inv.device_id
-        WHERE d.serial_number IS NOT NULL
-            AND d.serial_number NOT LIKE 'TEST-%'
-            AND d.serial_number != 'localhost'
-            AND s.data IS NOT NULL
-        """
+        # Load SQL from external file - uses parameterized archive filter
+        query = load_sql("devices/bulk_system")
         
-        # Add archive filter
-        if not include_archived:
-            query += " AND d.archived = FALSE"
-        
-        query += " ORDER BY d.serial_number, s.updated_at DESC"
-        
-        cursor.execute(query)
+        cursor.execute(query, {"include_archived": include_archived})
         rows = cursor.fetchall()
         conn.close()
         
@@ -2243,9 +2214,9 @@ async def get_bulk_system(
         logger.error(f"Failed to get bulk system: {e}")
         raise HTTPException(status_code=500, detail=f"Failed to retrieve bulk system: {str(e)}")
 
-@app.get("/api/devices/peripherals", dependencies=[Depends(verify_authentication)])
+@app.get("/api/devices/peripherals", dependencies=[Depends(verify_authentication)], tags=["fleet"])
 async def get_bulk_peripherals(
-    include_archived: bool = Query(default=False, alias="includeArchived")
+    include_archived: bool = Query(default=False, alias="includeArchived", description="Include archived devices in results")
 ):
     """
     Bulk peripherals endpoint for fleet-wide peripheral devices.
@@ -2254,7 +2225,12 @@ async def get_bulk_peripherals(
     Used by /devices/peripherals page for fleet-wide peripheral visibility.
     By default, archived devices are excluded. Use includeArchived=true to include them.
     
-    NOTE: This combines displays and printers data into a unified peripherals view.
+    **Note:** This combines displays and printers data into a unified peripherals view.
+    
+    **Response includes:**
+    - Device identifiers and inventory
+    - Connected displays (resolution, type, manufacturer)
+    - Connected printers (name, driver, status)
     """
     try:
         logger.info("Fetching bulk peripherals data")
@@ -2262,37 +2238,10 @@ async def get_bulk_peripherals(
         conn = get_db_connection()
         cursor = conn.cursor()
         
-        query = """
-        SELECT DISTINCT ON (d.serial_number)
-            d.serial_number,
-            d.device_id,
-            d.last_seen,
-            disp.data as displays_data,
-            print.data as printers_data,
-            GREATEST(disp.collected_at, print.collected_at) as collected_at,
-            inv.data->>'deviceName' as device_name,
-            inv.data->>'computerName' as computer_name,
-            inv.data->>'usage' as usage,
-            inv.data->>'catalog' as catalog,
-            inv.data->>'location' as location,
-            inv.data->>'assetTag' as asset_tag
-        FROM devices d
-        LEFT JOIN displays disp ON d.id = disp.device_id
-        LEFT JOIN printers print ON d.id = print.device_id
-        LEFT JOIN inventory inv ON d.id = inv.device_id
-        WHERE d.serial_number IS NOT NULL
-            AND d.serial_number NOT LIKE 'TEST-%'
-            AND d.serial_number != 'localhost'
-            AND (disp.data IS NOT NULL OR print.data IS NOT NULL)
-        """
+        # Load SQL from external file - uses parameterized archive filter
+        query = load_sql("devices/bulk_peripherals")
         
-        # Add archive filter
-        if not include_archived:
-            query += " AND d.archived = FALSE"
-        
-        query += " ORDER BY d.serial_number, GREATEST(disp.updated_at, print.updated_at) DESC"
-        
-        cursor.execute(query)
+        cursor.execute(query, {"include_archived": include_archived})
         rows = cursor.fetchall()
         conn.close()
         
@@ -2333,14 +2282,20 @@ async def get_bulk_peripherals(
         logger.error(f"Failed to get bulk peripherals: {e}")
         raise HTTPException(status_code=500, detail=f"Failed to retrieve bulk peripherals: {str(e)}")
 
-@app.get("/api/events", dependencies=[Depends(verify_authentication)])
-async def get_events(limit: int = 100):
+@app.get("/api/events", dependencies=[Depends(verify_authentication)], tags=["events"])
+async def get_events(limit: int = Query(default=100, ge=1, le=1000, description="Maximum number of events to return")):
     """
     Get recent events with device names (optimized for dashboard).
     
-    Returns only 4 essential fields per event: type, device, message, time
-    Uses JOIN to get device names in single query for maximum performance.
-    NOTE: Details/payload is NOT included here - use /api/events/{id}/payload to lazy-load.
+    Returns lightweight event list with device context for fast dashboard rendering.
+    **Note:** Full event payload is NOT included - use `/api/events/{id}/payload` for details.
+    
+    **Query Parameters:**
+    - limit: Maximum events to return (1-1000, default 100)
+    
+    **Response includes:**
+    - Event ID, type, message, timestamp
+    - Device serial number and name
     """
     try:
         conn = get_db_connection()
@@ -3753,7 +3708,7 @@ async def submit_events(request: Request):
         conn.commit()
         conn.close()
         
-        logger.info(f"[OK] Successfully processed device {serial_number}: {len(modules_processed)} modules, {events_stored} events")
+        logger.info(f"[SUCCESS] Successfully processed device {serial_number}: {len(modules_processed)} modules, {events_stored} events")
         
         return {
             "success": True,
@@ -3939,7 +3894,7 @@ async def archive_device(serial_number: str):
         conn.commit()
         conn.close()
         
-        logger.info(f"[OK] Archived device: {serial_number}")
+        logger.info(f"[SUCCESS] Archived device: {serial_number}")
         
         return {
             "success": True,
@@ -4013,7 +3968,7 @@ async def unarchive_device(serial_number: str):
         conn.commit()
         conn.close()
         
-        logger.info(f"[OK] Unarchived device: {serial_number}")
+        logger.info(f"[SUCCESS] Unarchived device: {serial_number}")
         
         return {
             "success": True,
