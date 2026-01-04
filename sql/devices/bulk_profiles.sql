@@ -12,12 +12,12 @@ SELECT DISTINCT ON (d.serial_number)
     p.security_policy_hashes,
     p.mdm_policy_hashes,
     p.updated_at as profiles_updated_at,
-    inv.data->>'deviceName' as device_name,
-    inv.data->>'computerName' as computer_name,
+    COALESCE(inv.data->>'device_name', inv.data->>'deviceName') as device_name,
+    COALESCE(inv.data->>'computer_name', inv.data->>'computerName') as computer_name,
     inv.data->>'usage' as usage,
     inv.data->>'catalog' as catalog,
     inv.data->>'location' as location,
-    inv.data->>'assetTag' as asset_tag
+    COALESCE(inv.data->>'asset_tag', inv.data->>'assetTag') as asset_tag
 FROM devices d
 LEFT JOIN profiles p ON d.serial_number = p.device_id
 LEFT JOIN inventory inv ON d.serial_number = inv.device_id
