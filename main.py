@@ -764,7 +764,7 @@ async def get_dashboard_data(
                 SELECT 
                     e.id,
                     e.device_id,
-                    i.data->>'deviceName' as device_name,
+                    COALESCE(i.data->>'device_name', i.data->>'deviceName') as device_name,
                     e.event_type,
                     e.message,
                     e.timestamp
@@ -1472,7 +1472,7 @@ async def get_bulk_applications(
         
         if device_name_list:
             placeholders = ', '.join([f'${i}' for i in range(param_index, param_index + len(device_name_list) * 3)])
-            where_conditions.append(f"(inv.data->>'deviceName' IN ({placeholders}) OR inv.data->>'computerName' IN ({placeholders}) OR d.serial_number IN ({placeholders}))")
+            where_conditions.append(f"(COALESCE(inv.data->>'device_name', inv.data->>'deviceName') IN ({placeholders}) OR COALESCE(inv.data->>'computer_name', inv.data->>'computerName') IN ({placeholders}) OR d.serial_number IN ({placeholders}))")
             query_params.extend(device_name_list * 3)
             param_index += len(device_name_list) * 3
         
@@ -1486,12 +1486,12 @@ async def get_bulk_applications(
             d.last_seen,
             a.data as applications_data,
             a.collected_at,
-            inv.data->>'deviceName' as device_name,
-            inv.data->>'computerName' as computer_name,
+            COALESCE(inv.data->>'device_name', inv.data->>'deviceName') as device_name,
+            COALESCE(inv.data->>'computer_name', inv.data->>'computerName') as computer_name,
             inv.data->>'usage' as usage,
             inv.data->>'catalog' as catalog,
             inv.data->>'location' as location,
-            inv.data->>'assetTag' as asset_tag
+            COALESCE(inv.data->>'asset_tag', inv.data->>'assetTag') as asset_tag
         FROM devices d
         LEFT JOIN applications a ON d.id = a.device_id
         LEFT JOIN inventory inv ON d.id = inv.device_id
@@ -1776,11 +1776,11 @@ async def get_bulk_installs_full(
             d.device_id,
             d.last_seen,
             i.data as installs_data,
-            inv.data->>'deviceName' as device_name,
+            COALESCE(inv.data->>'device_name', inv.data->>'deviceName') as device_name,
             inv.data->>'usage' as usage,
             inv.data->>'catalog' as catalog,
             inv.data->>'location' as location,
-            inv.data->>'assetTag' as asset_tag
+            COALESCE(inv.data->>'asset_tag', inv.data->>'assetTag') as asset_tag
         FROM devices d
         LEFT JOIN installs i ON d.id = i.device_id
         LEFT JOIN inventory inv ON d.id = inv.device_id
@@ -3335,15 +3335,15 @@ async def submit_events(request: Request):
     try:
         payload = await request.json()
         
-        # Extract metadata
+        # Extract metadata - support both snake_case and camelCase for Windows client compatibility
         metadata = payload.get('metadata', {})
-        device_uuid = metadata.get('deviceId', 'unknown-device')
-        serial_number = metadata.get('serialNumber', 'unknown-serial')
-        collected_at = metadata.get('collectedAt', datetime.now(timezone.utc).isoformat())
-        client_version = metadata.get('clientVersion', 'unknown')
+        device_uuid = metadata.get('device_id') or metadata.get('deviceId', 'unknown-device')
+        serial_number = metadata.get('serial_number') or metadata.get('serialNumber', 'unknown-serial')
+        collected_at = metadata.get('collected_at') or metadata.get('collectedAt', datetime.now(timezone.utc).isoformat())
+        client_version = metadata.get('client_version') or metadata.get('clientVersion', 'unknown')
         platform = metadata.get('platform', 'Unknown')
-        collection_type = metadata.get('collectionType', 'Full')
-        enabled_modules = metadata.get('enabledModules', [])
+        collection_type = metadata.get('collection_type') or metadata.get('collectionType', 'Full')
+        enabled_modules = metadata.get('enabled_modules') or metadata.get('enabledModules', [])
         
         # Validate required fields
         if device_uuid == 'unknown-device' or serial_number == 'unknown-serial':

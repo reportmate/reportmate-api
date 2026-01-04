@@ -14,12 +14,12 @@ SELECT DISTINCT ON (d.serial_number)
         COALESCE(disp.collected_at, '1970-01-01'::timestamp),
         COALESCE(print.collected_at, '1970-01-01'::timestamp)
     ) as collected_at,
-    inv.data->>'deviceName' as device_name,
-    inv.data->>'computerName' as computer_name,
+    COALESCE(inv.data->>'device_name', inv.data->>'deviceName') as device_name,
+    COALESCE(inv.data->>'computer_name', inv.data->>'computerName') as computer_name,
     inv.data->>'usage' as usage,
     inv.data->>'catalog' as catalog,
     inv.data->>'location' as location,
-    inv.data->>'assetTag' as asset_tag
+    COALESCE(inv.data->>'asset_tag', inv.data->>'assetTag') as asset_tag
 FROM devices d
 LEFT JOIN displays disp ON d.id = disp.device_id
 LEFT JOIN printers print ON d.id = print.device_id
