@@ -8,12 +8,12 @@ SELECT DISTINCT ON (d.serial_number)
     d.last_seen,
     m.data as management_data,
     m.collected_at,
-    inv.data->>'deviceName' as device_name,
-    inv.data->>'computerName' as computer_name,
+    COALESCE(inv.data->>'device_name', inv.data->>'deviceName') as device_name,
+    COALESCE(inv.data->>'computer_name', inv.data->>'computerName') as computer_name,
     inv.data->>'usage' as usage,
     inv.data->>'catalog' as catalog,
     inv.data->>'location' as location,
-    inv.data->>'assetTag' as asset_tag,
+    COALESCE(inv.data->>'asset_tag', inv.data->>'assetTag') as asset_tag,
     inv.data->>'department' as department
 FROM devices d
 LEFT JOIN management m ON d.id = m.device_id
