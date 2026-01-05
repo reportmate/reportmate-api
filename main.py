@@ -17,6 +17,8 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
 
 import pg8000
+# Use pyformat paramstyle for named parameters like %(name)s
+pg8000.paramstyle = 'pyformat'
 from fastapi import FastAPI, HTTPException, Query, Request, Header, Depends
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
@@ -1059,7 +1061,7 @@ async def get_device_by_serial(serial_number: str):
                 modules["system"] = system_data
         
         # CRITICAL FIX: Use serial number for module queries (module tables use serial as device_id)
-        module_tables = ["applications", "hardware", "installs", "network", "security", "inventory", "management"]
+        module_tables = ["applications", "hardware", "installs", "network", "security", "inventory", "management", "profiles"]
         for table in module_tables:
             try:
                 # Use serial_number as device_id since module tables store serial numbers
@@ -1076,61 +1078,6 @@ async def get_device_by_serial(serial_number: str):
                     modules[table] = module_data
             except Exception as e:
                 logger.warning(f"Failed to get {table} data for {serial_num}: {e}")
-        
-        # SPECIAL HANDLING: Profiles module - reconstruct from policy references
-        try:
-            cursor.execute("""
-                SELECT intune_policy_hashes, security_policy_hashes, mdm_policy_hashes, metadata
-                FROM profiles
-                WHERE device_id = %s
-            """, (serial_num,))
-            
-            profile_row = cursor.fetchone()
-            if profile_row:
-                intune_hashes, security_hashes, mdm_hashes, metadata = profile_row
-                
-                # Reconstruct profile by fetching policies from catalog
-                profile_data = json.loads(metadata) if isinstance(metadata, str) else metadata or {}
-                
-                # Fetch Intune policies
-                if intune_hashes:
-                    cursor.execute("""
-                        SELECT policy_data FROM policy_catalog 
-                        WHERE policy_hash = ANY(%s)
-                        ORDER BY policy_name
-                    """, (intune_hashes,))
-                    profile_data['intunePolicies'] = [
-                        json.loads(row[0]) if isinstance(row[0], str) else row[0]
-                        for row in cursor.fetchall()
-                    ]
-                
-                # Fetch security policies
-                if security_hashes:
-                    cursor.execute("""
-                        SELECT policy_data FROM policy_catalog 
-                        WHERE policy_hash = ANY(%s)
-                        ORDER BY policy_name
-                    """, (security_hashes,))
-                    profile_data['securityPolicies'] = [
-                        json.loads(row[0]) if isinstance(row[0], str) else row[0]
-                        for row in cursor.fetchall()
-                    ]
-                
-                # Fetch MDM configurations
-                if mdm_hashes:
-                    cursor.execute("""
-                        SELECT policy_data FROM policy_catalog 
-                        WHERE policy_hash = ANY(%s)
-                        ORDER BY policy_name
-                    """, (mdm_hashes,))
-                    profile_data['mdmConfigurations'] = [
-                        json.loads(row[0]) if isinstance(row[0], str) else row[0]
-                        for row in cursor.fetchall()
-                    ]
-                
-                modules["profiles"] = profile_data
-        except Exception as e:
-            logger.warning(f"Failed to get profiles data for {serial_num}: {e}")
         
         conn.close()
         
@@ -1994,13 +1941,9 @@ async def get_bulk_profiles(
     Used by /devices/profiles page for fleet-wide profile visibility.
     By default, archived devices are excluded. Use includeArchived=true to include them.
     
-    **Note:** The profiles table uses a normalized schema with policy hash references:
-    - intune_policy_hashes, security_policy_hashes, mdm_policy_hashes reference policy_catalog
-    - metadata contains profile metadata as JSONB
-    
     **Response includes:**
     - Device identifiers and inventory
-    - Policy counts by type (Intune, security, MDM)
+    - Profile data (MDM, Intune, security configurations)
     - Profile metadata and configuration details
     """
     try:
@@ -2010,8 +1953,6 @@ async def get_bulk_profiles(
         cursor = conn.cursor()
         
         # Load SQL from external file - uses parameterized archive filter
-        # The profiles table uses normalized schema with metadata instead of data column
-        # Note: profiles table uses device serial_number in device_id column (not primary key)
         query = load_sql("devices/bulk_profiles")
         
         cursor.execute(query, {"include_archived": include_archived})
@@ -2022,15 +1963,15 @@ async def get_bulk_profiles(
         devices = []
         for row in rows:
             try:
-                serial_number, device_uuid, last_seen, metadata, intune_hashes, security_hashes, mdm_hashes, profiles_updated_at, device_name, computer_name, usage, catalog, location, asset_tag = row
+                serial_number, device_uuid, last_seen, profiles_data, profiles_collected_at, profiles_updated_at, device_name, computer_name, usage, catalog, location, asset_tag = row
                 
-                # Parse metadata JSONB
-                profile_data = json.loads(metadata) if isinstance(metadata, str) else metadata or {}
+                # Parse profiles_data JSONB
+                profile_data = json.loads(profiles_data) if isinstance(profiles_data, str) else profiles_data or {}
                 
-                # Count policies for summary
-                intune_count = len(intune_hashes) if intune_hashes else 0
-                security_count = len(security_hashes) if security_hashes else 0
-                mdm_count = len(mdm_hashes) if mdm_hashes else 0
+                # Count policies from profiles data if available
+                intune_count = len(profile_data.get('intune_policies', profile_data.get('intunePolicies', [])))
+                security_count = len(profile_data.get('security_policies', profile_data.get('securityPolicies', [])))
+                mdm_count = len(profile_data.get('mdm_configurations', profile_data.get('mdmConfigurations', [])))
                 total_policies = intune_count + security_count + mdm_count
                 
                 devices.append({
@@ -2242,6 +2183,33 @@ async def get_bulk_system(
                 if isinstance(system_data, list) and len(system_data) > 0:
                     system_data = system_data[0]
                 
+                # Extract operating system info from raw data
+                os_info = system_data.get('operatingSystem', {}) if system_data else {}
+                uptime_str = system_data.get('uptime') if system_data else None
+                
+                # Parse uptime string (format: "d.hh:mm:ss") to seconds
+                uptime_seconds = None
+                if uptime_str:
+                    try:
+                        parts = uptime_str.replace('.', ':').split(':')
+                        if len(parts) >= 4:
+                            days, hours, minutes, seconds = int(parts[0]), int(parts[1]), int(parts[2]), int(parts[3])
+                            uptime_seconds = days * 86400 + hours * 3600 + minutes * 60 + seconds
+                    except (ValueError, IndexError):
+                        uptime_seconds = None
+                
+                # Build OS name string from components
+                os_name = os_info.get('name', '')
+                os_edition = os_info.get('edition', '')
+                os_display_version = os_info.get('displayVersion', '')
+                
+                # Format: "Windows 11 Enterprise 24H2" or just the name if no edition
+                operating_system = os_name
+                if os_edition and os_edition not in os_name:
+                    operating_system = f"{os_name} {os_edition}"
+                if os_display_version:
+                    operating_system = f"{operating_system} {os_display_version}"
+                
                 devices.append({
                     'id': serial_number,
                     'deviceId': serial_number,
@@ -2253,6 +2221,11 @@ async def get_bulk_system(
                     'usage': usage,
                     'catalog': catalog,
                     'location': location,
+                    'operatingSystem': operating_system.strip() or None,
+                    'osVersion': os_info.get('version'),
+                    'buildNumber': os_info.get('build'),
+                    'uptime': uptime_seconds,
+                    'bootTime': system_data.get('bootTime') if system_data else None,
                     'raw': system_data
                 })
             except Exception as e:
@@ -3446,109 +3419,7 @@ async def submit_events(request: Request):
                 try:
                     module_data = modules_data[module_name]
                     
-                    # SPECIAL HANDLING: Policy-level deduplication to reduce 6.7 GB → ~500 MB
-                    # Same policy NAME = same policy CONTENT (deduplicate at policy level, not profile level)
-                    if module_name == 'profiles':
-                        import hashlib
-                        
-                        # Extract metadata (non-policy fields)
-                        metadata = {
-                            'deviceId': module_data.get('deviceId'),
-                            'collectedAt': module_data.get('collectedAt'),
-                            'lastPolicyUpdate': module_data.get('lastPolicyUpdate'),
-                            'version': module_data.get('version'),
-                            'moduleId': module_data.get('moduleId'),
-                            'totalPoliciesApplied': module_data.get('totalPoliciesApplied')
-                        }
-                        
-                        policy_hashes = {
-                            'intune': [],
-                            'security': [],
-                            'mdm': []
-                        }
-                        
-                        # Process Intune policies
-                        if 'intunePolicies' in module_data and module_data['intunePolicies']:
-                            for policy in module_data['intunePolicies']:
-                                # Remove timestamps, hash normalized content
-                                normalized = {k: v for k, v in policy.items() 
-                                            if k not in ['lastSync', 'assignedDate']}
-                                policy_json = json.dumps(normalized, sort_keys=True)
-                                policy_hash = hashlib.md5(policy_json.encode()).hexdigest()
-                                
-                                # Store unique policy in catalog
-                                cursor.execute("""
-                                    INSERT INTO policy_catalog (policy_hash, policy_type, policy_name, policy_data, last_seen, device_count)
-                                    VALUES (%s, 'intune', %s, %s::jsonb, %s, 1)
-                                    ON CONFLICT (policy_hash) DO UPDATE 
-                                    SET last_seen = %s,
-                                        device_count = policy_catalog.device_count + 1
-                                """, (policy_hash, policy.get('policyName'), policy_json, collected_at, collected_at))
-                                
-                                policy_hashes['intune'].append(policy_hash)
-                        
-                        # Process security policies
-                        if 'securityPolicies' in module_data and module_data['securityPolicies']:
-                            for policy in module_data['securityPolicies']:
-                                normalized = {k: v for k, v in policy.items() 
-                                            if k not in ['lastApplied']}
-                                policy_json = json.dumps(normalized, sort_keys=True)
-                                policy_hash = hashlib.md5(policy_json.encode()).hexdigest()
-                                
-                                cursor.execute("""
-                                    INSERT INTO policy_catalog (policy_hash, policy_type, policy_name, policy_data, last_seen, device_count)
-                                    VALUES (%s, 'security', %s, %s::jsonb, %s, 1)
-                                    ON CONFLICT (policy_hash) DO UPDATE 
-                                    SET last_seen = %s,
-                                        device_count = policy_catalog.device_count + 1
-                                """, (policy_hash, policy.get('policyName'), policy_json, collected_at, collected_at))
-                                
-                                policy_hashes['security'].append(policy_hash)
-                        
-                        # Process MDM configurations
-                        if 'mdmConfigurations' in module_data and module_data['mdmConfigurations']:
-                            for config in module_data['mdmConfigurations']:
-                                normalized = {k: v for k, v in config.items() 
-                                            if k not in ['lastUpdated']}
-                                policy_json = json.dumps(normalized, sort_keys=True)
-                                policy_hash = hashlib.md5(policy_json.encode()).hexdigest()
-                                
-                                cursor.execute("""
-                                    INSERT INTO policy_catalog (policy_hash, policy_type, policy_name, policy_data, last_seen, device_count)
-                                    VALUES (%s, 'mdm', %s, %s::jsonb, %s, 1)
-                                    ON CONFLICT (policy_hash) DO UPDATE 
-                                    SET last_seen = %s,
-                                        device_count = policy_catalog.device_count + 1
-                                """, (policy_hash, config.get('cspName'), policy_json, collected_at, collected_at))
-                                
-                                policy_hashes['mdm'].append(policy_hash)
-                        
-                        # Store device profile as lightweight reference to policies
-                        cursor.execute("""
-                            INSERT INTO profiles (device_id, intune_policy_hashes, security_policy_hashes, 
-                                                mdm_policy_hashes, metadata, updated_at)
-                            VALUES (%s, %s, %s, %s, %s::jsonb, %s)
-                            ON CONFLICT (device_id) DO UPDATE 
-                            SET intune_policy_hashes = %s,
-                                security_policy_hashes = %s,
-                                mdm_policy_hashes = %s,
-                                metadata = %s::jsonb,
-                                updated_at = %s
-                        """, (
-                            serial_number,
-                            policy_hashes['intune'], policy_hashes['security'], policy_hashes['mdm'],
-                            json.dumps(metadata), collected_at,
-                            policy_hashes['intune'], policy_hashes['security'], policy_hashes['mdm'],
-                            json.dumps(metadata), collected_at
-                        ))
-                        
-                        conn.commit()
-                        modules_processed.append(module_name)
-                        total_policies = len(policy_hashes['intune']) + len(policy_hashes['security']) + len(policy_hashes['mdm'])
-                        logger.info(f"Stored {total_policies} policy references for device {serial_number}")
-                        continue
-                    
-                    # STANDARD HANDLING: All other modules store normally
+                    # STANDARD HANDLING: All modules store in their table with data JSONB
                     # Check if module record exists (device_id in module tables = serial_number per schema)
                     cursor.execute(
                         f"SELECT id FROM {table_name} WHERE device_id = %s",
