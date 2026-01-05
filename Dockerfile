@@ -16,8 +16,9 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir --upgrade pip && \
     pip install --no-cache-dir -r requirements.txt
 
-# Copy application code
+# Copy application code and SQL queries
 COPY main.py .
+COPY sql/ ./sql/
 
 # Create non-root user for security
 RUN useradd -m -u 1000 apiuser && chown -R apiuser:apiuser /app
