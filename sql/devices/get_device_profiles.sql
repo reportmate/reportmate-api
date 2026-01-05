@@ -1,8 +1,8 @@
--- Get device profiles with policy references
--- Returns normalized policy hashes for deduplication
+-- Get device profiles data
+-- Returns profiles JSON data for a device
 -- Parameters:
 --   %(device_id)s: string - device serial number
 
-SELECT intune_policy_hashes, security_policy_hashes, mdm_policy_hashes, metadata
+SELECT data, collected_at, updated_at
 FROM profiles
 WHERE device_id = %(device_id)s
