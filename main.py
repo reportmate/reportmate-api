@@ -2783,7 +2783,7 @@ async def get_fleet_application_usage(
         # ACTUAL data structure from Windows client:
         # applications.data.usage.activeSessions[] - array of session records
         # Each session: {name, path, user, durationSeconds, startTime, isActive, ...}
-        # NOTE: Only include usage data for apps that exist in the device's installed applications
+        # OPTIMIZED: Pre-extract installed apps to avoid nested EXISTS with jsonb_array_elements
         cursor.execute(f"""
             WITH device_usage AS (
                 SELECT 
@@ -2798,7 +2798,21 @@ async def get_fleet_application_usage(
                     {archive_filter}
                     {inventory_filter}
             ),
-            sessions_extracted AS (
+            installed_app_names AS (
+                SELECT DISTINCT
+                    du.serial_number,
+                    app->>'name' as app_name
+                FROM device_usage du,
+                LATERAL jsonb_array_elements(
+                    CASE 
+                        WHEN du.installed_apps IS NOT NULL AND jsonb_typeof(du.installed_apps) = 'array'
+                        THEN du.installed_apps
+                        ELSE '[]'::jsonb
+                    END
+                ) as app
+                WHERE app->>'name' IS NOT NULL AND app->>'name' != ''
+            ),
+            all_sessions AS (
                 SELECT 
                     du.serial_number,
                     session->>'name' as app_name,
@@ -2818,11 +2832,20 @@ async def get_fleet_application_usage(
                 WHERE du.usage_data IS NOT NULL 
                   AND du.usage_data != 'null'::jsonb
                   AND (du.usage_data->>'isCaptureEnabled')::boolean = true
-                  -- Only include sessions that match an installed application
-                  AND EXISTS (
-                      SELECT 1 FROM jsonb_array_elements(du.installed_apps) ia
-                      WHERE ia->>'name' = session->>'name'
-                  )
+                  AND session->>'name' IS NOT NULL AND session->>'name' != ''
+            ),
+            sessions_extracted AS (
+                SELECT 
+                    s.serial_number,
+                    s.app_name,
+                    s.app_path,
+                    s.username,
+                    s.duration_seconds,
+                    s.start_time
+                FROM all_sessions s
+                INNER JOIN installed_app_names ian ON 
+                    ian.serial_number = s.serial_number AND 
+                    ian.app_name = s.app_name
             ),
             app_summary AS (
                 SELECT 
@@ -2928,8 +2951,9 @@ async def get_fleet_application_usage(
                         END
                     ) as app_item
                     WHERE a.collected_at >= %s
+                      AND app_item->>'name' IS NOT NULL AND app_item->>'name' != ''
                 ),
-                device_sessions AS (
+                all_sessions AS (
                     SELECT 
                         d.serial_number,
                         session->>'user' as username,
@@ -2948,14 +2972,20 @@ async def get_fleet_application_usage(
                     ) as session
                     WHERE a.collected_at >= %s
                         AND (a.data->'usage'->>'isCaptureEnabled')::boolean = true
-                        -- Only include sessions for apps that exist in installed applications
-                        AND EXISTS (
-                            SELECT 1 FROM installed_apps_for_users ia 
-                            WHERE ia.serial_number = d.serial_number 
-                            AND ia.app_name = session->>'name'
-                        )
+                        AND session->>'name' IS NOT NULL AND session->>'name' != ''
                         {archive_filter}
                         {inventory_filter}
+                ),
+                device_sessions AS (
+                    SELECT 
+                        s.serial_number,
+                        s.username,
+                        s.duration_seconds,
+                        s.app_name
+                    FROM all_sessions s
+                    INNER JOIN installed_apps_for_users ia ON 
+                        ia.serial_number = s.serial_number AND 
+                        ia.app_name = s.app_name
                 ),
                 user_stats AS (
                     SELECT 
@@ -3030,15 +3060,20 @@ async def get_fleet_application_usage(
                 cursor.execute(f"""
                     WITH installed_apps AS (
                         SELECT DISTINCT 
-                            COALESCE(
-                                jsonb_array_elements(a.data->'installedApplications')->>'name',
-                                jsonb_array_elements(a.data->'InstalledApplications')->>'name',
-                                jsonb_array_elements(a.data->'installed_applications')->>'name'
-                            ) as app_name,
+                            app_item->>'name' as app_name,
                             d.serial_number
                         FROM applications a
-                        INNER JOIN devices d ON a.device_id = d.serial_number
+                        INNER JOIN devices d ON a.device_id = d.serial_number,
+                        LATERAL jsonb_array_elements(
+                            CASE 
+                                WHEN a.data->'installedApplications' IS NOT NULL 
+                                     AND jsonb_typeof(a.data->'installedApplications') = 'array'
+                                THEN a.data->'installedApplications'
+                                ELSE '[]'::jsonb
+                            END
+                        ) as app_item
                         WHERE d.archived = FALSE
+                          AND app_item->>'name' IS NOT NULL AND app_item->>'name' != ''
                     ),
                     used_apps AS (
                         SELECT DISTINCT session->>'name' as app_name
@@ -3079,6 +3114,70 @@ async def get_fleet_application_usage(
                     })
             except Exception as e:
                 logger.warning(f"Failed to get unused apps: {e}")
+                # Rollback to recover from error state
+                conn.rollback()
+        
+        # Get version distribution for each app from installedApplications
+        # This provides device-level version breakdown for the Version Distribution widget
+        version_distribution = {}
+        try:
+            cursor.execute(f"""
+                WITH app_versions AS (
+                    SELECT 
+                        app_item->>'name' as app_name,
+                        COALESCE(app_item->>'version', 'Unknown') as version,
+                        d.serial_number,
+                        COALESCE(inv.data->>'device_name', inv.data->>'deviceName', inv.data->>'computer_name', inv.data->>'computerName', d.serial_number) as device_name,
+                        inv.data->>'location' as location,
+                        inv.data->>'catalog' as catalog,
+                        d.last_seen
+                    FROM applications a
+                    INNER JOIN devices d ON a.device_id = d.serial_number
+                    LEFT JOIN inventory inv ON inv.device_id = d.serial_number,
+                    LATERAL jsonb_array_elements(
+                        CASE 
+                            WHEN a.data->'installedApplications' IS NOT NULL 
+                                 AND jsonb_typeof(a.data->'installedApplications') = 'array'
+                            THEN a.data->'installedApplications'
+                            ELSE '[]'::jsonb
+                        END
+                    ) as app_item
+                    WHERE a.collected_at >= %s
+                      AND app_item->>'name' IS NOT NULL AND app_item->>'name' != ''
+                        {archive_filter}
+                        {inventory_filter}
+                )
+                SELECT 
+                    app_name,
+                    version,
+                    COUNT(*) as device_count,
+                    json_agg(json_build_object(
+                        'serialNumber', serial_number,
+                        'deviceName', device_name,
+                        'location', location,
+                        'catalog', catalog,
+                        'lastSeen', last_seen
+                    )) as devices
+                FROM app_versions
+                GROUP BY app_name, version
+                ORDER BY app_name, COUNT(*) DESC
+            """, (cutoff_date,))
+            
+            for row in cursor.fetchall():
+                app_name, version, device_count, devices_json = row
+                if app_name not in version_distribution:
+                    version_distribution[app_name] = {
+                        "versions": {},
+                        "totalDevices": 0
+                    }
+                version_distribution[app_name]["versions"][version] = {
+                    "count": device_count,
+                    "devices": devices_json[:50] if devices_json else []  # Limit to 50 devices per version
+                }
+                version_distribution[app_name]["totalDevices"] += device_count
+                
+        except Exception as e:
+            logger.warning(f"Failed to get version distribution: {e}")
         
         conn.close()
         
@@ -3089,6 +3188,7 @@ async def get_fleet_application_usage(
             "topUsers": top_users,
             "singleUserApps": single_user_apps,
             "unusedApps": unused_apps,
+            "versionDistribution": version_distribution,
             "summary": {
                 "totalAppsTracked": len(applications),
                 "totalUsageHours": round(total_usage_seconds / 3600, 1),
