@@ -658,7 +658,8 @@ async def get_dashboard_data(
         except Exception as count_error:
             logger.warning(f"Failed to get total device count: {count_error}")
 
-        # Fetch all devices with inventory AND system data for full OS version details
+        # Fetch all devices with inventory and system data (NO installs - too large)
+        # Install stats are calculated via optimized SQL queries below
         device_query = f"""
         SELECT 
             d.id,
@@ -744,6 +745,10 @@ async def get_dashboard_data(
                 except Exception as inv_error:
                     logger.warning(f"Failed to parse inventory for {serial_number}: {inv_error}")
             
+            # NOTE: We no longer include full installs data in dashboard response
+            # Install error/warning counts are calculated via optimized SQL queries below
+            # This reduces response size from ~26MB to ~1MB
+            
             # Build complete OS info object with all version details
             os_info = {
                 "name": final_os_name,
@@ -754,6 +759,22 @@ async def get_dashboard_data(
                 "edition": os_edition,
                 "architecture": os_architecture
             }
+            
+            # Build modules object (NO installs - counts come from installStats)
+            modules_obj = {
+                "system": {
+                    "operatingSystem": os_info
+                }
+            }
+            
+            # Add inventory if present
+            if any([inv_catalog, inv_usage, inv_department, inv_location]):
+                modules_obj["inventory"] = {
+                    "catalog": inv_catalog,
+                    "usage": inv_usage,
+                    "department": inv_department,
+                    "location": inv_location
+                }
             
             device = {
                 "id": db_id,
@@ -767,63 +788,102 @@ async def get_dashboard_data(
                 "archived": archived or False,
                 "lastSeen": last_seen.isoformat() if last_seen else None,
                 "createdAt": created_at.isoformat() if created_at else None,
-                "modules": {
-                    "system": {
-                        "operatingSystem": os_info
-                    },
-                    "inventory": {
-                        "catalog": inv_catalog,
-                        "usage": inv_usage,
-                        "department": inv_department,
-                        "location": inv_location
-                    } if any([inv_catalog, inv_usage, inv_department, inv_location]) else None
-                }
+                "modules": modules_obj
             }
             devices.append(device)
         
-        # === INSTALL STATS QUERY (from cimian->items->currentStatus) ===
-        # Efficient query to count devices with errors and warnings
+        # === INSTALL STATS QUERY - OPTIMIZED FOR DASHBOARD ===
+        # Count ITEMS (not devices) with errors and warnings
+        # Includes both Cimian (Windows) and Munki (macOS) items
         install_stats = {
             "devicesWithErrors": 0,
             "devicesWithWarnings": 0,
-            "totalFailedInstalls": 0,
-            "totalWarnings": 0
+            "totalErrorItems": 0,      # Total error items across all devices
+            "totalWarningItems": 0,    # Total warning items across all devices
+            "hasInstallData": False    # Whether any install data exists
         }
         
         try:
-            # Count devices with errors (error, failed status)
+            # Count total ERROR ITEMS from Cimian (Windows)
             cursor.execute("""
-                SELECT COUNT(DISTINCT d.id)
+                SELECT COUNT(*)
                 FROM devices d
-                INNER JOIN installs i ON d.id = i.device_id
+                INNER JOIN installs i ON d.serial_number = i.device_id
                 CROSS JOIN LATERAL jsonb_array_elements(i.data->'cimian'->'items') AS item
                 WHERE d.archived = FALSE
                     AND (
                         LOWER(item->>'currentStatus') LIKE '%error%'
                         OR LOWER(item->>'currentStatus') LIKE '%failed%'
+                        OR LOWER(item->>'currentStatus') = 'problem'
+                        OR LOWER(item->>'currentStatus') = 'install-error'
                     )
             """)
-            errors_count = cursor.fetchone()
-            if errors_count:
-                install_stats["devicesWithErrors"] = errors_count[0]
+            cimian_errors = cursor.fetchone()
+            if cimian_errors and cimian_errors[0]:
+                install_stats["totalErrorItems"] += cimian_errors[0]
             
-            # Count devices with warnings (warning, pending status)
+            # Count total ERROR ITEMS from Munki (macOS)
             cursor.execute("""
-                SELECT COUNT(DISTINCT d.id)
+                SELECT COUNT(*)
                 FROM devices d
-                INNER JOIN installs i ON d.id = i.device_id
+                INNER JOIN installs i ON d.serial_number = i.device_id
+                CROSS JOIN LATERAL jsonb_array_elements(i.data->'munki'->'items') AS item
+                WHERE d.archived = FALSE
+                    AND (
+                        LOWER(item->>'status') LIKE '%error%'
+                        OR LOWER(item->>'status') LIKE '%failed%'
+                    )
+            """)
+            munki_errors = cursor.fetchone()
+            if munki_errors and munki_errors[0]:
+                install_stats["totalErrorItems"] += munki_errors[0]
+            
+            # Count total WARNING ITEMS from Cimian (Windows)
+            # Note: 'pending' is NOT a warning - it's in the pending category
+            cursor.execute("""
+                SELECT COUNT(*)
+                FROM devices d
+                INNER JOIN installs i ON d.serial_number = i.device_id
                 CROSS JOIN LATERAL jsonb_array_elements(i.data->'cimian'->'items') AS item
                 WHERE d.archived = FALSE
                     AND (
                         LOWER(item->>'currentStatus') LIKE '%warning%'
-                        OR LOWER(item->>'currentStatus') LIKE '%pending%'
+                        OR LOWER(item->>'currentStatus') = 'needs-attention'
                     )
             """)
-            warnings_count = cursor.fetchone()
-            if warnings_count:
-                install_stats["devicesWithWarnings"] = warnings_count[0]
+            cimian_warnings = cursor.fetchone()
+            if cimian_warnings and cimian_warnings[0]:
+                install_stats["totalWarningItems"] += cimian_warnings[0]
             
-            logger.info(f"Install stats calculated: {install_stats['devicesWithErrors']} errors, {install_stats['devicesWithWarnings']} warnings")
+            # Count total WARNING ITEMS from Munki (macOS)
+            cursor.execute("""
+                SELECT COUNT(*)
+                FROM devices d
+                INNER JOIN installs i ON d.serial_number = i.device_id
+                CROSS JOIN LATERAL jsonb_array_elements(i.data->'munki'->'items') AS item
+                WHERE d.archived = FALSE
+                    AND LOWER(item->>'status') LIKE '%warning%'
+            """)
+            munki_warnings = cursor.fetchone()
+            if munki_warnings and munki_warnings[0]:
+                install_stats["totalWarningItems"] += munki_warnings[0]
+            
+            # Check if any install data exists (for hasInstallData flag)
+            cursor.execute("""
+                SELECT EXISTS(
+                    SELECT 1 FROM installs i
+                    INNER JOIN devices d ON d.serial_number = i.device_id
+                    WHERE d.archived = FALSE
+                    AND (
+                        jsonb_array_length(COALESCE(i.data->'cimian'->'items', '[]'::jsonb)) > 0
+                        OR jsonb_array_length(COALESCE(i.data->'munki'->'items', '[]'::jsonb)) > 0
+                    )
+                )
+            """)
+            has_data = cursor.fetchone()
+            install_stats["hasInstallData"] = has_data[0] if has_data else False
+            
+            logger.info(f"Install stats: {install_stats['totalErrorItems']} error items, {install_stats['totalWarningItems']} warning items, hasData={install_stats['hasInstallData']}")
         except Exception as stats_error:
             logger.warning(f"Failed to calculate install stats: {stats_error}")
             # Keep zeros if query fails
@@ -938,6 +998,7 @@ async def get_all_devices(
             d.os_version,
             d.archived,
             d.archived_at,
+            d.platform,
             i.data as inventory_data
         FROM devices d
         LEFT JOIN inventory i ON i.device_id = COALESCE(d.serial_number, d.device_id)
@@ -978,13 +1039,15 @@ async def get_all_devices(
                 os_version,
                 archived,
                 archived_at,
+                platform,
                 inventory_data_raw,
             ) = row
 
             serial = serial_number or str(device_id)
 
             os_summary = build_os_summary(os_name or os, os_version)
-            platform = infer_platform(os_name or os)
+            # Use stored platform from database, fall back to inference if not set
+            device_platform = platform or infer_platform(os_name or os)
 
             inventory_summary: Optional[Dict[str, Any]] = None
             device_display_name = device_name
@@ -1033,7 +1096,7 @@ async def get_all_devices(
                 "status": status,
                 "archived": archived,
                 "archivedAt": archived_at.isoformat() if archived_at else None,
-                "platform": platform,
+                "platform": device_platform,
                 "osName": os_name or os,
                 "osVersion": os_version,
                 "lastEventTime": last_seen.isoformat() if last_seen else None,
@@ -1100,10 +1163,10 @@ async def get_device_by_serial(serial_number: str):
         conn = get_db_connection()
         cursor = conn.cursor()
         
-        # Query uses correct schema columns - include archived status and client_version
+        # Query uses correct schema columns - include archived status, client_version, and platform
         cursor.execute("""
             SELECT id, device_id, name, serial_number, last_seen, status, 
-                   model, manufacturer, os, os_name, os_version, created_at,
+                   model, manufacturer, os, os_name, os_version, platform, created_at,
                    archived, archived_at, client_version
             FROM devices 
             WHERE serial_number = %s OR id = %s
@@ -1114,7 +1177,7 @@ async def get_device_by_serial(serial_number: str):
             conn.close()
             raise HTTPException(status_code=404, detail="Device not found")
         
-        device_id, device_uuid, device_name, serial_num, last_seen, status, model, manufacturer, os, os_name, os_version, created_at, archived, archived_at, client_version = device_row
+        device_id, device_uuid, device_name, serial_num, last_seen, status, model, manufacturer, os, os_name, os_version, platform, created_at, archived, archived_at, client_version = device_row
         
         # Get all module data for this device using device ID
         modules = {}
@@ -1156,6 +1219,7 @@ async def get_device_by_serial(serial_number: str):
             "device": {
                 "serialNumber": serial_num or device_id,
                 "deviceId": device_uuid or device_id,
+                "platform": platform,
                 "clientVersion": client_version,
                 "lastSeen": last_seen.isoformat() if last_seen else None,
                 "createdAt": created_at.isoformat() if created_at else None,
@@ -1722,14 +1786,18 @@ async def get_bulk_installs(
                 
                 device_display_name = device_name or computer_name or serial_number
                 
-                # Extract Cimian data
+                # Extract Cimian data (Windows)
                 cimian_data = installs_data.get('cimian', {}) if isinstance(installs_data, dict) else {}
-                managed_items = cimian_data.get('items', [])
+                cimian_items = cimian_data.get('items', [])
                 
-                # Flatten each managed install
-                for idx, item in enumerate(managed_items):
+                # Extract Munki data (macOS)
+                munki_data = installs_data.get('munki', {}) if isinstance(installs_data, dict) else {}
+                munki_items = munki_data.get('items', [])
+                
+                # Flatten Cimian installs
+                for idx, item in enumerate(cimian_items):
                     all_installs.append({
-                        'id': f"{device_uuid}_{idx}",
+                        'id': f"{device_uuid}_cimian_{idx}",
                         'deviceId': device_uuid,
                         'deviceName': device_display_name,
                         'serialNumber': serial_number,
@@ -1747,7 +1815,34 @@ async def get_bulk_installs(
                         'location': location,
                         'assetTag': asset_tag,
                         'fleet': fleet,
-                        'platform': platform,
+                        'platform': platform or 'Windows',
+                        'source': 'cimian',
+                        'raw': item
+                    })
+                
+                # Flatten Munki installs (macOS)
+                for idx, item in enumerate(munki_items):
+                    all_installs.append({
+                        'id': f"{device_uuid}_munki_{idx}",
+                        'deviceId': device_uuid,
+                        'deviceName': device_display_name,
+                        'serialNumber': serial_number,
+                        'lastSeen': last_seen.isoformat() if last_seen else None,
+                        'collectedAt': collected_at.isoformat() if collected_at else None,
+                        'itemName': item.get('name') or item.get('displayName'),
+                        'currentStatus': item.get('status'),
+                        'latestVersion': item.get('version'),
+                        'installedVersion': item.get('installedVersion'),
+                        'installDate': item.get('endTime'),
+                        'lastChecked': None,
+                        'updateAvailable': None,
+                        'usage': usage,
+                        'catalog': catalog,
+                        'location': location,
+                        'assetTag': asset_tag,
+                        'fleet': fleet,
+                        'platform': platform or 'macOS',
+                        'source': 'munki',
                         'raw': item
                     })
             
@@ -1827,17 +1922,34 @@ async def get_bulk_installs_full(
                 # Extract only what UI needs from installs_data
                 installs_obj = installs_data if isinstance(installs_data, dict) else {}
                 cimian_data = installs_obj.get('cimian', {})
+                munki_data = installs_obj.get('munki', {})
                 
                 # Build lightweight installs structure (exclude runLog which is huge)
-                lightweight_installs = {
-                    'cimian': {
+                lightweight_installs = {}
+                
+                # Include Cimian data if present (Windows)
+                if cimian_data:
+                    lightweight_installs['cimian'] = {
                         'items': cimian_data.get('items', []),
                         'config': cimian_data.get('config', {}),
                         'version': cimian_data.get('version'),
                         'status': cimian_data.get('status'),
                         'sessions': cimian_data.get('sessions', [])[:5],  # Only last 5 sessions
                     }
-                }
+                
+                # Include Munki data if present (macOS)
+                if munki_data:
+                    lightweight_installs['munki'] = {
+                        'items': munki_data.get('items', []),
+                        'version': munki_data.get('version'),
+                        'status': munki_data.get('status'),
+                        'manifestName': munki_data.get('manifestName'),
+                        'clientIdentifier': munki_data.get('clientIdentifier'),
+                        'softwareRepoURL': munki_data.get('softwareRepoURL'),
+                        'lastRunSuccess': munki_data.get('lastRunSuccess'),
+                        'startTime': munki_data.get('startTime'),
+                        'endTime': munki_data.get('endTime'),
+                    }
                 
                 devices.append({
                     'serialNumber': serial_number,
@@ -3541,22 +3653,22 @@ async def submit_events(request: Request):
             device_exists = cursor.fetchone()
             
             if device_exists:
-                # Update existing device - include client_version
+                # Update existing device - include client_version and platform
                 cursor.execute("""
                     UPDATE devices 
-                    SET device_id = %s, last_seen = %s, updated_at = %s, client_version = %s
+                    SET device_id = %s, last_seen = %s, updated_at = %s, client_version = %s, platform = %s
                     WHERE serial_number = %s
-                """, (device_uuid, collected_at, datetime.now(timezone.utc), client_version, serial_number))
-                logger.info(f"Updated existing device: {serial_number} (client v{client_version})")
+                """, (device_uuid, collected_at, datetime.now(timezone.utc), client_version, platform, serial_number))
+                logger.info(f"Updated existing device: {serial_number} (client v{client_version}, platform: {platform})")
             else:
                 # Insert new device
                 # NOTE: devices.id is VARCHAR and equals serial_number (per schema design)
                 # Set name to 'Unknown' as placeholder (will be populated from system module data)
                 cursor.execute("""
-                    INSERT INTO devices (id, device_id, serial_number, name, status, last_seen, created_at, updated_at, client_version)
-                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
-                """, (serial_number, device_uuid, serial_number, 'Unknown', 'online', collected_at, datetime.now(timezone.utc), datetime.now(timezone.utc), client_version))
-                logger.info(f"Created new device: {serial_number} (client v{client_version})")
+                    INSERT INTO devices (id, device_id, serial_number, name, status, last_seen, created_at, updated_at, client_version, platform)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                """, (serial_number, device_uuid, serial_number, 'Unknown', 'online', collected_at, datetime.now(timezone.utc), datetime.now(timezone.utc), client_version, platform))
+                logger.info(f"Created new device: {serial_number} (client v{client_version}, platform: {platform})")
             
             conn.commit()
         except Exception as device_error:
@@ -4365,6 +4477,69 @@ async def execute_sql(request: SQLExecuteRequest, auth: dict = Depends(verify_au
     except Exception as e:
         logger.error(f"SQL execution error: {str(e)}")
         raise HTTPException(status_code=500, detail=f"SQL execution failed: {str(e)}")
+
+@app.post("/api/admin/migrate-platform-column")
+async def migrate_platform_column(auth: dict = Depends(verify_authentication)):
+    """
+    Add platform column to devices table.
+    This migration is idempotent and safe to run multiple times.
+    """
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        
+        migration_steps = []
+        
+        # Step 1: Add platform column
+        try:
+            cursor.execute("ALTER TABLE devices ADD COLUMN IF NOT EXISTS platform VARCHAR(50)")
+            migration_steps.append("✓ Added platform column")
+        except Exception as e:
+            migration_steps.append(f"Platform column: {str(e)}")
+        
+        # Step 2: Create index
+        try:
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_devices_platform ON devices(platform)")
+            migration_steps.append("✓ Created platform index")
+        except Exception as e:
+            migration_steps.append(f"Platform index: {str(e)}")
+        
+        # Step 3: Update existing devices with inferred platform
+        try:
+            cursor.execute("""
+                UPDATE devices 
+                SET platform = CASE
+                    WHEN LOWER(os_name) LIKE '%windows%' OR LOWER(os) LIKE '%windows%' THEN 'Windows'
+                    WHEN LOWER(os_name) LIKE '%mac%' OR LOWER(os) LIKE '%mac%' OR LOWER(os_name) LIKE '%darwin%' THEN 'macOS'
+                    ELSE 'Unknown'
+                END
+                WHERE platform IS NULL
+            """)
+            rows_updated = cursor.rowcount
+            migration_steps.append(f"✓ Updated {rows_updated} devices with inferred platform")
+        except Exception as e:
+            migration_steps.append(f"Update platforms: {str(e)}")
+        
+        conn.commit()
+        
+        # Step 4: Verify
+        cursor.execute("SELECT serial_number, platform, os_name FROM devices LIMIT 5")
+        sample_data = cursor.fetchall()
+        
+        cursor.close()
+        conn.close()
+        
+        return {
+            "success": True,
+            "steps": migration_steps,
+            "sample_data": [
+                {"serial": row[0], "platform": row[1], "os_name": row[2]}
+                for row in sample_data
+            ]
+        }
+    except Exception as e:
+        logger.error(f"Migration failed: {e}")
+        raise HTTPException(status_code=500, detail=f"Migration failed: {str(e)}")
 
 @app.exception_handler(404)
 async def not_found_handler(request: Request, exc: HTTPException):
