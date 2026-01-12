@@ -12,6 +12,7 @@ SELECT
     d.os,
     d.os_name,
     d.os_version,
+    d.platform,
     d.last_seen,
     d.archived,
     d.created_at,
