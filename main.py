@@ -2222,13 +2222,70 @@ async def get_bulk_management(
                 serial_number, device_uuid, last_seen, management_data, collected_at, device_name, computer_name, usage, catalog, location, asset_tag, department = row
                 
                 # Extract key management fields from the raw data for easy frontend access
-                mdm_enrollment = management_data.get('mdmEnrollment', {}) if management_data else {}
-                device_details = management_data.get('deviceDetails', {}) if management_data else {}
-                tenant_details = management_data.get('tenantDetails', {}) if management_data else {}
+                # Support both Windows (camelCase) and Mac (snake_case) field names
+                mdm_enrollment = management_data.get('mdmEnrollment', {}) or management_data.get('mdm_enrollment', {}) if management_data else {}
+                device_details = management_data.get('deviceDetails', {}) or management_data.get('device_details', {}) if management_data else {}
+                tenant_details = management_data.get('tenantDetails', {}) or management_data.get('tenant_details', {}) if management_data else {}
+                mdm_certificate_raw = management_data.get('mdmCertificate', {}) or management_data.get('mdm_certificate', {}) if management_data else {}
                 
-                # Determine enrollment status from isEnrolled boolean
-                is_enrolled = mdm_enrollment.get('isEnrolled', False)
+                # Parse MDM certificate - Mac osquery returns JSON in 'output' field
+                mdm_certificate = {}
+                if mdm_certificate_raw:
+                    if 'output' in mdm_certificate_raw and isinstance(mdm_certificate_raw['output'], str):
+                        try:
+                            import json
+                            # Clean up osquery's escaped JSON format
+                            clean_json = mdm_certificate_raw['output'].replace(';"', '"').strip()
+                            mdm_certificate = json.loads(clean_json)
+                        except:
+                            mdm_certificate = mdm_certificate_raw
+                    else:
+                        mdm_certificate = mdm_certificate_raw
+                
+                # Determine enrollment status - support both isEnrolled (Windows) and enrolled (Mac)
+                # Mac osquery returns string "true"/"false", Windows returns boolean
+                is_enrolled_raw = mdm_enrollment.get('isEnrolled') or mdm_enrollment.get('is_enrolled') or mdm_enrollment.get('enrolled')
+                is_enrolled = is_enrolled_raw in (True, 'true', '1', 'yes', 'True')
                 enrollment_status = 'Enrolled' if is_enrolled else 'Not Enrolled'
+                
+                # Provider detection - support multiple sources
+                # Priority: explicit provider field > certificate issuer > "Unknown"
+                provider = mdm_enrollment.get('provider')
+                if not provider:
+                    # Try to get from certificate data (Mac)
+                    cert_issuer = mdm_certificate.get('certificate_issuer') or mdm_certificate.get('certificateIssuer')
+                    cert_provider = mdm_certificate.get('mdm_provider') or mdm_certificate.get('mdmProvider')
+                    if cert_provider:
+                        provider = cert_provider
+                    elif cert_issuer:
+                        issuer_lower = cert_issuer.lower()
+                        if 'micromdm' in issuer_lower:
+                            provider = 'MicroMDM'
+                        elif 'nanomdm' in issuer_lower:
+                            provider = 'NanoMDM'
+                        elif 'jamf' in issuer_lower:
+                            provider = 'Jamf Pro'
+                        elif 'microsoft' in issuer_lower:
+                            provider = 'Microsoft Intune'
+                        else:
+                            provider = cert_issuer  # Use issuer as provider
+                if not provider:
+                    provider = 'Unknown'
+                
+                # Enrollment type - support Mac and Windows patterns
+                enrollment_type = mdm_enrollment.get('enrollmentType') or mdm_enrollment.get('enrollment_type')
+                if not enrollment_type and is_enrolled:
+                    # Mac-specific: Check for DEP/ADE enrollment
+                    installed_from_dep = mdm_enrollment.get('installed_from_dep') or mdm_enrollment.get('installedFromDep')
+                    user_approved = mdm_enrollment.get('user_approved') or mdm_enrollment.get('userApproved')
+                    if installed_from_dep in (True, 'true', '1', 'True'):
+                        enrollment_type = 'Automated Device Enrollment'
+                    elif user_approved in (True, 'true', '1', 'True'):
+                        enrollment_type = 'User Approved Enrollment'
+                    else:
+                        enrollment_type = 'MDM Enrolled'
+                if not enrollment_type:
+                    enrollment_type = 'N/A'
                 
                 devices.append({
                     'id': serial_number,
@@ -2243,11 +2300,11 @@ async def get_bulk_management(
                     'location': location,
                     'department': department,
                     # Extract flattened MDM fields for table display (using actual field names from data)
-                    'provider': mdm_enrollment.get('provider', 'Unknown'),
+                    'provider': provider,
                     'enrollmentStatus': enrollment_status,
-                    'enrollmentType': mdm_enrollment.get('enrollmentType', 'N/A'),
-                    'intuneId': device_details.get('intuneDeviceId', 'N/A'),
-                    'tenantName': tenant_details.get('tenantName', 'N/A'),
+                    'enrollmentType': enrollment_type,
+                    'intuneId': device_details.get('intuneDeviceId') or device_details.get('intune_device_id') or 'N/A',
+                    'tenantName': tenant_details.get('tenantName') or tenant_details.get('tenant_name') or tenant_details.get('organization') or 'N/A',
                     'isEnrolled': is_enrolled,
                     'raw': management_data
                 })
