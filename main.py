@@ -1193,7 +1193,7 @@ async def get_device_by_serial(serial_number: str):
                 modules["system"] = system_data
         
         # CRITICAL FIX: Use serial number for module queries (module tables use serial as device_id)
-        module_tables = ["applications", "hardware", "installs", "network", "security", "inventory", "management", "profiles"]
+        module_tables = ["applications", "hardware", "installs", "network", "security", "inventory", "management", "profiles", "peripherals"]
         for table in module_tables:
             try:
                 # Use serial_number as device_id since module tables store serial numbers
@@ -2484,16 +2484,21 @@ async def get_bulk_peripherals(
     """
     Bulk peripherals endpoint for fleet-wide peripheral devices.
     
-    Returns devices with connected peripherals (displays, printers, USB devices, etc.).
+    Returns devices with connected peripherals (USB, input devices, audio, Bluetooth, cameras, etc.).
     Used by /devices/peripherals page for fleet-wide peripheral visibility.
     By default, archived devices are excluded. Use includeArchived=true to include them.
     
-    **Note:** This combines displays and printers data into a unified peripherals view.
-    
     **Response includes:**
     - Device identifiers and inventory
-    - Connected displays (resolution, type, manufacturer)
-    - Connected printers (name, driver, status)
+    - USB devices (hubs, storage, peripherals)
+    - Input devices (keyboards, mice, trackpads, graphics tablets)
+    - Audio devices (speakers, microphones)
+    - Bluetooth devices (paired and connected)
+    - Cameras (built-in and external)
+    - Thunderbolt devices (docks, displays, storage)
+    - Printers (CUPS, network, direct-connect)
+    - Scanners
+    - External storage (USB drives, SD cards)
     """
     try:
         logger.info("Fetching bulk peripherals data")
@@ -2513,13 +2518,7 @@ async def get_bulk_peripherals(
         devices = []
         for row in rows:
             try:
-                serial_number, device_uuid, last_seen, displays_data, printers_data, collected_at, device_name, computer_name, usage, catalog, location, asset_tag = row
-                
-                # Combine displays and printers into unified peripherals structure
-                peripherals_data = {
-                    'displays': displays_data or [],
-                    'printers': printers_data or []
-                }
+                serial_number, device_uuid, last_seen, peripherals_data, collected_at, device_name, computer_name, usage, catalog, location, asset_tag = row
                 
                 devices.append({
                     'id': serial_number,
@@ -2532,7 +2531,7 @@ async def get_bulk_peripherals(
                     'usage': usage,
                     'catalog': catalog,
                     'location': location,
-                    'raw': peripherals_data
+                    'raw': peripherals_data or {}
                 })
             except Exception as e:
                 logger.warning(f"Error processing peripherals for device {row[0]}: {e}")
@@ -3746,11 +3745,16 @@ async def submit_events(request: Request):
             'management': 'management',
             'profiles': 'profiles',
             'displays': 'displays',
-            'printers': 'printers'
+            'printers': 'printers',
+            'peripherals': 'peripherals'
         }
         
         # Get modules from payload (could be at top level or nested under 'modules' key)
         modules_data = payload.get('modules', payload)
+        
+        # Debug: Log available modules in payload
+        available_modules = [k for k in modules_data.keys() if k in module_tables]
+        logger.info(f"Available modules in payload for {serial_number}: {available_modules}")
         
         for module_name, table_name in module_tables.items():
             if module_name in modules_data and modules_data[module_name]:
