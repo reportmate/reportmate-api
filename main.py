@@ -2545,7 +2545,12 @@ async def get_bulk_peripherals(
         raise HTTPException(status_code=500, detail=f"Failed to retrieve bulk peripherals: {str(e)}")
 
 @app.get("/api/events", dependencies=[Depends(verify_authentication)], tags=["events"])
-async def get_events(limit: int = Query(default=100, ge=1, le=1000, description="Maximum number of events to return")):
+async def get_events(
+    limit: int = Query(default=100, ge=1, le=1000, description="Maximum number of events to return"),
+    offset: int = Query(default=0, ge=0, description="Number of events to skip (for pagination)"),
+    startDate: str = Query(default=None, description="Filter events after this ISO8601 date"),
+    endDate: str = Query(default=None, description="Filter events before this ISO8601 date")
+):
     """
     Get recent events with device names (optimized for dashboard).
     
@@ -2554,18 +2559,46 @@ async def get_events(limit: int = Query(default=100, ge=1, le=1000, description=
     
     **Query Parameters:**
     - limit: Maximum events to return (1-1000, default 100)
+    - offset: Number of events to skip (for pagination, default 0)
+    - startDate: Filter events after this ISO8601 date (optional)
+    - endDate: Filter events before this ISO8601 date (optional)
     
     **Response includes:**
     - Event ID, type, message, timestamp
     - Device serial number and name
+    - Total count for pagination
     """
     try:
         conn = get_db_connection()
         cursor = conn.cursor()
         
+        # Parse date parameters
+        start_date = None
+        end_date = None
+        if startDate:
+            try:
+                start_date = datetime.fromisoformat(startDate.replace('Z', '+00:00'))
+            except ValueError as e:
+                logger.warning(f"Invalid startDate format: {startDate}, error: {e}")
+        if endDate:
+            try:
+                end_date = datetime.fromisoformat(endDate.replace('Z', '+00:00'))
+            except ValueError as e:
+                logger.warning(f"Invalid endDate format: {endDate}, error: {e}")
+        
+        # Get total count first for pagination info
+        count_query = load_sql("events/count_events")
+        cursor.execute(count_query, {"start_date": start_date, "end_date": end_date})
+        total_count = cursor.fetchone()[0]
+        
         # JOIN with inventory to get device names and assetTag in single query
         query = load_sql("events/list_events")
-        cursor.execute(query, {"limit": limit})
+        cursor.execute(query, {
+            "limit": limit, 
+            "offset": offset,
+            "start_date": start_date,
+            "end_date": end_date
+        })
         
         rows = cursor.fetchall()
         conn.close()
@@ -2588,7 +2621,15 @@ async def get_events(limit: int = Query(default=100, ge=1, le=1000, description=
                 "timestamp": timestamp.isoformat() if timestamp else None
             })
         
-        return {"events": events, "total": len(events)}
+        return {
+            "success": True,
+            "events": events, 
+            "total": total_count,
+            "totalEvents": total_count,  # Frontend expects this field
+            "count": len(events),
+            "limit": limit,
+            "offset": offset
+        }
         
     except Exception as e:
         logger.error(f"Failed to get events: {e}")
