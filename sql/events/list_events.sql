@@ -1,6 +1,9 @@
--- Get recent events with device names
+-- Get recent events with device names (with pagination and date filtering)
 -- Parameters:
 --   %(limit)s: integer - maximum events to return
+--   %(offset)s: integer - number of events to skip (for pagination)
+--   %(start_date)s: timestamp - filter events after this date (nullable)
+--   %(end_date)s: timestamp - filter events before this date (nullable)
 
 SELECT 
     e.id,
@@ -12,5 +15,8 @@ SELECT
     e.timestamp
 FROM events e
 LEFT JOIN inventory i ON e.device_id = i.device_id
+WHERE (%(start_date)s IS NULL OR e.timestamp >= %(start_date)s)
+  AND (%(end_date)s IS NULL OR e.timestamp <= %(end_date)s)
 ORDER BY e.timestamp DESC 
 LIMIT %(limit)s
+OFFSET %(offset)s
