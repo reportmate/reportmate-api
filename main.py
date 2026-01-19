@@ -498,6 +498,7 @@ class DeviceInfo(BaseModel):
     deviceId: str      # UUID from device_id column
     deviceName: Optional[str] = None
     name: Optional[str] = None
+    hostname: Optional[str] = None  # Network hostname for search
     lastSeen: Optional[str] = None
     createdAt: Optional[str] = None
     registrationDate: Optional[str] = None
