@@ -2116,6 +2116,12 @@ async def get_bulk_profiles(
     include_archived: bool = Query(default=False, alias="includeArchived", description="Include archived devices in results")
 ):
     """
+    **DEPRECATED:** This endpoint is deprecated. Profiles functionality has been integrated into Management module.
+    
+    **Use `/api/devices/management` instead** for profile data.
+    
+    This endpoint is maintained for backward compatibility but will be removed in a future version.
+    
     Bulk profiles endpoint for fleet-wide configuration profiles.
     
     Returns devices with MDM profiles and configuration policies.
@@ -2126,6 +2132,11 @@ async def get_bulk_profiles(
     - Device identifiers and inventory
     - Profile data (MDM, Intune, security configurations)
     - Profile metadata and configuration details
+    
+    **Migration Guide:**
+    - Replace `/api/devices/profiles` calls with `/api/devices/management`
+    - Profile data is available in the `management` module of device responses
+    - Use `/api/device/{serial}/modules/management` for individual device profiles
     """
     try:
         logger.info("Fetching bulk profiles data")
