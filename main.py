@@ -999,9 +999,11 @@ async def get_all_devices(
             d.archived,
             d.archived_at,
             d.platform,
-            i.data as inventory_data
+            i.data as inventory_data,
+            n.data as network_data
         FROM devices d
-        LEFT JOIN inventory i ON i.device_id = COALESCE(d.serial_number, d.device_id)
+        LEFT JOIN inventory i ON i.device_id = d.serial_number
+        LEFT JOIN network n ON n.device_id = d.serial_number
         {archive_filter_where}
         ORDER BY COALESCE(d.serial_number, d.device_id) ASC
         """
@@ -1041,6 +1043,7 @@ async def get_all_devices(
                 archived_at,
                 platform,
                 inventory_data_raw,
+                network_data_raw,
             ) = row
 
             serial = serial_number or str(device_id)
@@ -1082,6 +1085,29 @@ async def get_all_devices(
                 except Exception as inventory_error:
                     logger.warning(f"Failed to parse inventory data for {serial}: {inventory_error}")
 
+            # Process network data to extract hostname
+            hostname: Optional[str] = None
+            network_summary: Optional[Dict[str, Any]] = None
+            if network_data_raw:
+                logger.info(f"Found network data for device {serial}")
+                try:
+                    raw_network = network_data_raw
+                    if isinstance(raw_network, str):
+                        raw_network = json.loads(raw_network)
+                    if isinstance(raw_network, list) and raw_network:
+                        raw_network = raw_network[0]
+                    if isinstance(raw_network, dict):
+                        hostname = raw_network.get("hostname")
+                        logger.info(f"Extracted hostname for {serial}: {hostname}")
+                        # Build network summary with key fields
+                        network_summary = {
+                            "hostname": hostname,
+                        }
+                except Exception as network_error:
+                    logger.warning(f"Failed to parse network data for {serial}: {network_error}")
+            else:
+                logger.debug(f"No network data found for device {serial}")
+
             if not device_display_name:
                 device_display_name = serial
 
@@ -1090,6 +1116,7 @@ async def get_all_devices(
                 "deviceId": device_uuid or str(device_id),
                 "deviceName": device_display_name,
                 "name": device_display_name,
+                "hostname": hostname,  # Include hostname at top level for search
                 "lastSeen": last_seen.isoformat() if last_seen else None,
                 "createdAt": created_at.isoformat() if created_at else None,
                 "registrationDate": created_at.isoformat() if created_at else None,
@@ -1102,6 +1129,9 @@ async def get_all_devices(
                 "lastEventTime": last_seen.isoformat() if last_seen else None,
                 "totalEvents": 0,
             }
+            
+            # DEBUG: Log what we're actually adding to device_info
+            logger.info(f"🔍 [HOSTNAME_TEST_v2] Device {serial}: hostname_var={hostname}, network_summary_exists={bool(network_summary)}")
 
             if inventory_summary:
                 device_info["inventory"] = inventory_summary
@@ -1117,10 +1147,17 @@ async def get_all_devices(
                 modules_payload["inventory"] = inventory_summary
             if os_summary:
                 modules_payload["system"] = {"operatingSystem": os_summary}
+            if network_summary:
+                modules_payload["network"] = network_summary
             if modules_payload:
                 device_info["modules"] = modules_payload
 
             devices.append(device_info)
+
+        # DEBUG: Check first device in response
+        if devices:
+            first_dev = devices[0]
+            logger.info(f"🔍 [FINAL_RESPONSE_CHECK] First device: serial={first_dev.get('serialNumber')}, hostname={first_dev.get('hostname')}, has_modules_network={'network' in first_dev.get('modules', {})}")
 
         page_size = limit or len(devices) or total_devices or 1
         page = (offset // page_size) + 1 if page_size else 1
