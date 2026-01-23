@@ -5,5 +5,5 @@
 
 SELECT COUNT(*) as total
 FROM events e
-WHERE (%(start_date)s IS NULL OR e.timestamp >= %(start_date)s)
-  AND (%(end_date)s IS NULL OR e.timestamp <= %(end_date)s)
+WHERE (%(start_date)s::timestamptz IS NULL OR e.timestamp >= %(start_date)s::timestamptz)
+  AND (%(end_date)s::timestamptz IS NULL OR e.timestamp <= %(end_date)s::timestamptz)
