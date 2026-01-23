@@ -2574,7 +2574,7 @@ async def get_bulk_peripherals(
         devices = []
         for row in rows:
             try:
-                serial_number, device_uuid, last_seen, peripherals_data, collected_at, device_name, computer_name, usage, catalog, location, asset_tag = row
+                serial_number, device_uuid, last_seen, peripherals_data, collected_at, device_name, computer_name, usage, catalog, location, asset_tag, platform = row
                 
                 devices.append({
                     'id': serial_number,
@@ -2587,6 +2587,7 @@ async def get_bulk_peripherals(
                     'usage': usage,
                     'catalog': catalog,
                     'location': location,
+                    'platform': platform,
                     'raw': peripherals_data or {}
                 })
             except Exception as e:
@@ -2749,7 +2750,7 @@ async def get_events(
         
         events = []
         for row in rows:
-            event_id, device_id, device_name, asset_tag, event_type, message, timestamp = row
+            event_id, device_id, device_name, asset_tag, event_type, message, timestamp, platform = row
             events.append({
                 # Essential fields for events page
                 "id": event_id,
@@ -2759,6 +2760,7 @@ async def get_events(
                 "kind": event_type,  # Event type (success/warning/error/info)
                 "message": message,  # User-friendly message
                 "ts": timestamp.isoformat() if timestamp else None,  # Timestamp
+                "platform": platform,  # Platform from system.operatingSystem.name
                 # Legacy compatibility fields (minimal)
                 "serialNumber": device_id,
                 "eventType": event_type,
