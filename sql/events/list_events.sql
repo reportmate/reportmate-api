@@ -15,8 +15,8 @@ SELECT
     e.timestamp
 FROM events e
 LEFT JOIN inventory i ON e.device_id = i.device_id
-WHERE (%(start_date)s IS NULL OR e.timestamp >= %(start_date)s)
-  AND (%(end_date)s IS NULL OR e.timestamp <= %(end_date)s)
+WHERE (%(start_date)s::timestamptz IS NULL OR e.timestamp >= %(start_date)s::timestamptz)
+  AND (%(end_date)s::timestamptz IS NULL OR e.timestamp <= %(end_date)s::timestamptz)
 ORDER BY e.timestamp DESC 
 LIMIT %(limit)s
 OFFSET %(offset)s

@@ -102,6 +102,7 @@ def preload_sql_queries():
         "devices/bulk_inventory",
         "devices/bulk_system",
         "devices/bulk_peripherals",
+        "devices/bulk_identity",
         # Dashboard endpoints
         "devices/dashboard_devices",
         "devices/dashboard_events",
@@ -1001,10 +1002,12 @@ async def get_all_devices(
             d.archived_at,
             d.platform,
             i.data as inventory_data,
-            n.data as network_data
+            n.data as network_data,
+            s.data->'operatingSystem'->>'name' as system_os_name
         FROM devices d
         LEFT JOIN inventory i ON i.device_id = d.serial_number
         LEFT JOIN network n ON n.device_id = d.serial_number
+        LEFT JOIN system s ON s.device_id = d.serial_number
         {archive_filter_where}
         ORDER BY COALESCE(d.serial_number, d.device_id) ASC
         """
@@ -1045,13 +1048,14 @@ async def get_all_devices(
                 platform,
                 inventory_data_raw,
                 network_data_raw,
+                system_os_name,
             ) = row
 
             serial = serial_number or str(device_id)
 
             os_summary = build_os_summary(os_name or os, os_version)
-            # Use stored platform from database, fall back to inference if not set
-            device_platform = platform or infer_platform(os_name or os)
+            # Priority: system.operatingSystem.name (kernel) > stored platform > inferred
+            device_platform = system_os_name or platform or infer_platform(os_name or os)
 
             inventory_summary: Optional[Dict[str, Any]] = None
             device_display_name = device_name
@@ -1231,7 +1235,7 @@ async def get_device_by_serial(serial_number: str):
                 modules["system"] = system_data
         
         # CRITICAL FIX: Use serial number for module queries (module tables use serial as device_id)
-        module_tables = ["applications", "hardware", "installs", "network", "security", "inventory", "management", "profiles", "peripherals"]
+        module_tables = ["applications", "hardware", "installs", "network", "security", "inventory", "management", "profiles", "peripherals", "identity"]
         for table in module_tables:
             try:
                 # Use serial_number as device_id since module tables store serial numbers
@@ -1480,7 +1484,7 @@ async def get_device_module(device_id: str, module_name: str):
         valid_modules = [
             "applications", "hardware", "installs", "network", "security",
             "inventory", "management", "profiles", "system", "displays",
-            "printers", "peripherals"
+            "printers", "peripherals", "identity"
         ]
         
         if module_name not in valid_modules:
@@ -1609,10 +1613,12 @@ async def get_bulk_applications(
             inv.data->>'usage' as usage,
             inv.data->>'catalog' as catalog,
             inv.data->>'location' as location,
-            COALESCE(inv.data->>'asset_tag', inv.data->>'assetTag') as asset_tag
+            COALESCE(inv.data->>'asset_tag', inv.data->>'assetTag') as asset_tag,
+            COALESCE(sys.data->'operatingSystem'->>'name', d.platform) as platform
         FROM devices d
         LEFT JOIN applications a ON d.id = a.device_id
         LEFT JOIN inventory inv ON d.id = inv.device_id
+        LEFT JOIN system sys ON d.id = sys.device_id
         WHERE {where_clause}
             AND a.data IS NOT NULL
         ORDER BY d.serial_number, a.updated_at DESC
@@ -1629,7 +1635,7 @@ async def get_bulk_applications(
         
         for row in rows:
             try:
-                serial_number, device_uuid, last_seen, apps_data, collected_at, device_name, computer_name, usage, catalog, location, asset_tag = row
+                serial_number, device_uuid, last_seen, apps_data, collected_at, device_name, computer_name, usage, catalog, location, asset_tag, platform = row
                 
                 device_display_name = device_name or computer_name or serial_number
                 
@@ -1690,6 +1696,7 @@ async def get_bulk_applications(
                         'catalog': catalog,
                         'location': location,
                         'assetTag': asset_tag,
+                        'platform': platform,
                         'raw': app
                     })
             
@@ -2592,6 +2599,94 @@ async def get_bulk_peripherals(
     except Exception as e:
         logger.error(f"Failed to get bulk peripherals: {e}")
         raise HTTPException(status_code=500, detail=f"Failed to retrieve bulk peripherals: {str(e)}")
+
+@app.get("/api/devices/identity", dependencies=[Depends(verify_authentication)], tags=["fleet"])
+async def get_bulk_identity(
+    include_archived: bool = Query(default=False, alias="includeArchived", description="Include archived devices in results")
+):
+    """
+    Bulk identity endpoint for fleet-wide user account and identity data.
+    
+    Returns devices with user accounts, groups, sessions, BTMDB health, and directory services.
+    Used by /devices/identity page for fleet-wide identity visibility.
+    By default, archived devices are excluded. Use includeArchived=true to include them.
+    
+    **Response includes:**
+    - Device identifiers and inventory
+    - User accounts (local, domain, Apple ID linked)
+    - User groups and memberships
+    - Login sessions and history
+    - BTMDB health (macOS background task management database)
+    - Directory services (AD, Open Directory, LDAP)
+    - Secure Token users
+    - Platform SSO registration status
+    """
+    try:
+        logger.info("Fetching bulk identity data")
+        
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        
+        # Load SQL from external file - uses parameterized archive filter
+        query = load_sql("devices/bulk_identity")
+        
+        cursor.execute(query, {"include_archived": include_archived})
+        rows = cursor.fetchall()
+        conn.close()
+        
+        logger.info(f"Retrieved {len(rows)} devices with identity data")
+        
+        devices = []
+        for row in rows:
+            try:
+                serial_number, device_uuid, last_seen, platform, identity_data, collected_at, device_name, computer_name, usage, catalog, location, asset_tag, department = row
+                
+                # Extract summary counts from identity data for quick display
+                summary = {}
+                if identity_data and isinstance(identity_data, dict):
+                    users = identity_data.get('users') or identity_data.get('userAccounts') or []
+                    groups = identity_data.get('groups') or identity_data.get('userGroups') or []
+                    btmdb = identity_data.get('btmdbHealth') or identity_data.get('btmdb_health') or {}
+                    directory = identity_data.get('directoryServices') or identity_data.get('directory_services') or {}
+                    secure_token = identity_data.get('secureToken') or identity_data.get('secure_token') or {}
+                    platform_sso = identity_data.get('platformSSOUsers') or identity_data.get('platform_sso_users') or {}
+                    
+                    summary = {
+                        'userCount': len(users) if isinstance(users, list) else 0,
+                        'groupCount': len(groups) if isinstance(groups, list) else 0,
+                        'btmdbStatus': btmdb.get('status') or btmdb.get('health_status'),
+                        'btmdbSizeMB': btmdb.get('sizeMB') or btmdb.get('size_mb'),
+                        'directoryBound': bool(directory.get('isBound') or directory.get('is_bound')),
+                        'secureTokenEnabled': len(secure_token.get('users', [])) > 0 if isinstance(secure_token, dict) else False,
+                        'platformSSORegistered': platform_sso.get('deviceRegistered') or platform_sso.get('device_registered') or False
+                    }
+                
+                devices.append({
+                    'id': serial_number,
+                    'deviceId': serial_number,
+                    'deviceName': device_name or computer_name or serial_number,
+                    'serialNumber': serial_number,
+                    'assetTag': asset_tag,
+                    'platform': platform,
+                    'lastSeen': last_seen.isoformat() if last_seen else None,
+                    'collectedAt': collected_at.isoformat() if collected_at else None,
+                    'usage': usage,
+                    'catalog': catalog,
+                    'location': location,
+                    'department': department,
+                    'summary': summary,
+                    'raw': identity_data or {}
+                })
+            except Exception as e:
+                logger.warning(f"Error processing identity for device {row[0]}: {e}")
+                continue
+        
+        logger.info(f"Processed {len(devices)} devices with identity data")
+        return devices
+        
+    except Exception as e:
+        logger.error(f"Failed to get bulk identity: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to retrieve bulk identity: {str(e)}")
 
 @app.get("/api/events", dependencies=[Depends(verify_authentication)], tags=["events"])
 async def get_events(
@@ -3836,7 +3931,8 @@ async def submit_events(request: Request):
             'profiles': 'profiles',
             'displays': 'displays',
             'printers': 'printers',
-            'peripherals': 'peripherals'
+            'peripherals': 'peripherals',
+            'identity': 'identity'
         }
         
         # Get modules from payload (could be at top level or nested under 'modules' key)
@@ -4369,7 +4465,7 @@ async def delete_device(serial_number: str, confirm: bool = Query(False)):
         
         # Get module counts for logging
         module_tables = ["system", "hardware", "applications", "installs", "network", "security", 
-                        "inventory", "management", "profiles", "displays", "printers"]
+                        "inventory", "management", "profiles", "displays", "printers", "peripherals", "identity"]
         module_counts = {}
         
         for table in module_tables:
@@ -4446,7 +4542,7 @@ async def debug_database():
         
         # 1. Check for duplicate records in module tables (MAJOR ISSUE)
         module_tables = ['inventory', 'system', 'hardware', 'applications', 'network', 
-                        'security', 'profiles', 'installs', 'management', 'displays', 'printers']
+                        'security', 'profiles', 'installs', 'management', 'displays', 'printers', 'peripherals', 'identity']
         duplicates = {}
         total_duplicate_rows = 0
         
