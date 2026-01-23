@@ -14,10 +14,16 @@ SELECT DISTINCT ON (d.serial_number)
     inv.data->>'usage' as usage,
     inv.data->>'catalog' as catalog,
     inv.data->>'location' as location,
-    COALESCE(inv.data->>'asset_tag', inv.data->>'assetTag') as asset_tag
+    COALESCE(inv.data->>'asset_tag', inv.data->>'assetTag') as asset_tag,
+    COALESCE(
+        sys.data->'operating_system'->>'name',
+        sys.data->'operatingSystem'->>'name',
+        inv.data->>'platform'
+    ) as platform
 FROM devices d
 LEFT JOIN peripherals p ON d.id = p.device_id
 LEFT JOIN inventory inv ON d.id = inv.device_id
+LEFT JOIN system sys ON d.id = sys.device_id
 WHERE d.serial_number IS NOT NULL
     AND d.serial_number NOT LIKE 'TEST-%%'
     AND d.serial_number != 'localhost'
