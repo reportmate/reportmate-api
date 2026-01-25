@@ -1,6 +1,6 @@
 -- Bulk system endpoint: /api/devices/system
 -- Returns devices with OS details, uptime, updates, services, etc.
--- Parameters: include_archived (boolean), limit (integer)
+-- Parameters: include_archived (boolean)
 
 SELECT DISTINCT ON (d.serial_number)
     d.serial_number,
@@ -22,5 +22,4 @@ WHERE d.serial_number IS NOT NULL
     AND d.serial_number != 'localhost'
     AND s.data IS NOT NULL
     AND (%(include_archived)s = TRUE OR d.archived = FALSE)
-ORDER BY d.serial_number, s.updated_at DESC
-LIMIT %(limit)s;
+ORDER BY d.serial_number, s.updated_at DESC;
