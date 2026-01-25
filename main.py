@@ -2479,17 +2479,26 @@ async def get_bulk_system(
                 
                 # Extract operating system info from raw data
                 os_info = system_data.get('operatingSystem', {}) if system_data else {}
-                uptime_str = system_data.get('uptime') if system_data else None
+                uptime_raw = system_data.get('uptime') if system_data else None
                 
-                # Parse uptime string (format: "d.hh:mm:ss") to seconds
+                # Parse uptime - handle both integer (seconds) and string (format: "d.hh:mm:ss")
                 uptime_seconds = None
-                if uptime_str:
+                if uptime_raw:
                     try:
-                        parts = uptime_str.replace('.', ':').split(':')
-                        if len(parts) >= 4:
-                            days, hours, minutes, seconds = int(parts[0]), int(parts[1]), int(parts[2]), int(parts[3])
-                            uptime_seconds = days * 86400 + hours * 3600 + minutes * 60 + seconds
-                    except (ValueError, IndexError):
+                        # If it's already an integer, use it directly
+                        if isinstance(uptime_raw, (int, float)):
+                            uptime_seconds = int(uptime_raw)
+                        # If it's a string, parse it
+                        elif isinstance(uptime_raw, str):
+                            parts = uptime_raw.replace('.', ':').split(':')
+                            if len(parts) >= 4:
+                                days, hours, minutes, seconds = int(parts[0]), int(parts[1]), int(parts[2]), int(parts[3])
+                                uptime_seconds = days * 86400 + hours * 3600 + minutes * 60 + seconds
+                            elif len(parts) == 1:
+                                # Single number as string
+                                uptime_seconds = int(parts[0])
+                    except (ValueError, IndexError, AttributeError) as e:
+                        logger.debug(f"Could not parse uptime {uptime_raw} for device {serial_number}: {e}")
                         uptime_seconds = None
                 
                 # Build OS name string from components
