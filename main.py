@@ -2478,8 +2478,8 @@ async def get_bulk_system(
                 if isinstance(system_data, list) and len(system_data) > 0:
                     system_data = system_data[0]
                 
-                # Extract operating system info from raw data
-                os_info = system_data.get('operatingSystem', {}) if system_data else {}
+                # Extract operating system info from raw data (handle both snake_case and camelCase)
+                os_info = system_data.get('operating_system') or system_data.get('operatingSystem', {}) if system_data else {}
                 uptime_raw = system_data.get('uptime') if system_data else None
                 
                 # Parse uptime - handle both integer (seconds) and string (format: "d.hh:mm:ss")
