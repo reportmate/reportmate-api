@@ -2439,7 +2439,7 @@ async def get_bulk_inventory(
 @app.get("/api/devices/system", dependencies=[Depends(verify_authentication)], tags=["fleet"])
 async def get_bulk_system(
     include_archived: bool = Query(default=False, alias="includeArchived", description="Include archived devices in results"),
-    limit: Optional[int] = Query(default=1000, le=5000, description="Maximum number of devices to return (default 1000, max 5000, NULL for all)")
+    limit: int = Query(default=1000, le=5000, description="Maximum number of devices to return (default 1000, max 5000)")
 ):
     """
     Bulk system endpoint for fleet-wide OS and system information.
@@ -2448,7 +2448,7 @@ async def get_bulk_system(
     Used by /devices/system page for fleet-wide system visibility.
     By default, archived devices are excluded. Use includeArchived=true to include them.
     
-    Supports optional limit parameter for performance (defaults to 1000 devices).
+    Supports limit parameter for performance (defaults to 1000 devices, max 5000).
     
     **Response includes:**
     - Device identifiers and inventory
@@ -2457,12 +2457,12 @@ async def get_bulk_system(
     - Pending updates and service status (in raw field)
     """
     try:
-        logger.info(f"Fetching bulk system data (limit: {limit or 'all'})")
+        logger.info(f"Fetching bulk system data (limit: {limit})")
         
         conn = get_db_connection()
         cursor = conn.cursor()
         
-        # Load SQL from external file - uses parameterized archive filter and optional limit
+        # Load SQL from external file - uses parameterized archive filter and limit
         query = load_sql("devices/bulk_system")
         
         cursor.execute(query, {"include_archived": include_archived, "limit": limit})

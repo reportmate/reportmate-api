@@ -1,6 +1,7 @@
 -- Bulk system endpoint: /api/devices/system
 -- Returns devices with OS details, uptime, updates, services, etc.
--- Parameters: include_archived (boolean), limit (integer, optional - NULL = no limit)
+-- Parameters: include_archived (boolean), limit (integer, optional)
+-- Note: If limit is None/NULL, returns all devices (up to practical DB limits)
 
 SELECT DISTINCT ON (d.serial_number)
     d.serial_number,
@@ -23,4 +24,4 @@ WHERE d.serial_number IS NOT NULL
     AND s.data IS NOT NULL
     AND (%(include_archived)s = TRUE OR d.archived = FALSE)
 ORDER BY d.serial_number, s.updated_at DESC
-LIMIT COALESCE(%(limit)s, 5000);  -- Default to 5000 max if no limit specified
+LIMIT %(limit)s;
