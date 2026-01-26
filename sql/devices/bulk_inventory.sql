@@ -16,7 +16,7 @@ SELECT DISTINCT ON (d.serial_number)
     COALESCE(inv.data->>'asset_tag', inv.data->>'assetTag') as asset_tag,
     inv.data->>'department' as department
 FROM devices d
-LEFT JOIN inventory inv ON d.id = inv.device_id
+LEFT JOIN inventory inv ON d.serial_number = inv.device_id
 WHERE d.serial_number IS NOT NULL
     AND d.serial_number NOT LIKE 'TEST-%%'
     AND d.serial_number != 'localhost'
