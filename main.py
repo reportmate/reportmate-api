@@ -1069,21 +1069,19 @@ async def get_all_devices(
                     if isinstance(raw_inventory, list) and raw_inventory:
                         raw_inventory = raw_inventory[0]
                     if isinstance(raw_inventory, dict):
-                        allowed_keys = [
-                            "deviceName",
-                            "assetTag",
-                            "serialNumber",
-                            "location",
-                            "department",
-                            "usage",
-                            "catalog",
-                            "owner",
-                        ]
-                        summary = {
-                            key: raw_inventory.get(key)
-                            for key in allowed_keys
-                            if raw_inventory.get(key) not in (None, "")
+                        # Map snake_case to camelCase (Windows client uses snake_case)
+                        normalized = {
+                            "deviceName": raw_inventory.get("device_name") or raw_inventory.get("deviceName"),
+                            "assetTag": raw_inventory.get("asset_tag") or raw_inventory.get("assetTag"),
+                            "serialNumber": raw_inventory.get("serial_number") or raw_inventory.get("serialNumber"),
+                            "location": raw_inventory.get("location"),
+                            "department": raw_inventory.get("department"),
+                            "usage": raw_inventory.get("usage"),
+                            "catalog": raw_inventory.get("catalog"),
+                            "owner": raw_inventory.get("owner"),
                         }
+                        # Filter out None/"" values
+                        summary = {k: v for k, v in normalized.items() if v not in (None, "")}
                         if summary:
                             inventory_summary = summary
                             device_display_name = summary.get("deviceName", device_display_name)
@@ -2516,6 +2514,18 @@ async def get_bulk_system(
                 if os_display_version:
                     operating_system = f"{operating_system} {os_display_version}"
                 
+                # Get counts for services, updates, scheduled_tasks (NOT the full arrays)
+                services_count = 0
+                updates_count = 0
+                tasks_count = 0
+                if system_data:
+                    services = system_data.get('services', [])
+                    updates = system_data.get('updates', [])
+                    tasks = system_data.get('scheduled_tasks', [])
+                    services_count = len(services) if isinstance(services, list) else 0
+                    updates_count = len(updates) if isinstance(updates, list) else 0
+                    tasks_count = len(tasks) if isinstance(tasks, list) else 0
+                
                 devices.append({
                     'id': serial_number,
                     'deviceId': serial_number,
@@ -2531,8 +2541,10 @@ async def get_bulk_system(
                     'osVersion': os_info.get('version'),
                     'buildNumber': os_info.get('build'),
                     'uptime': uptime_seconds,
-                    'bootTime': system_data.get('bootTime') if system_data else None,
-                    'raw': system_data
+                    'bootTime': system_data.get('bootTime') or system_data.get('last_boot_time') if system_data else None,
+                    'servicesCount': services_count,
+                    'updatesCount': updates_count,
+                    'tasksCount': tasks_count
                 })
             except Exception as e:
                 logger.warning(f"Error processing system for device {row[0]}: {e}")
