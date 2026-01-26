@@ -1392,9 +1392,9 @@ async def get_device_info_fast(device_id: str):
         conn = get_db_connection()
         cursor = conn.cursor()
         
-        # Get device record
+        # Get device record (including platform for macOS/Windows-specific UI features)
         cursor.execute("""
-            SELECT id, device_id, serial_number, last_seen, created_at
+            SELECT id, device_id, serial_number, last_seen, created_at, platform
             FROM devices 
             WHERE serial_number = %s OR id = %s
         """, (device_id, device_id))
@@ -1404,7 +1404,7 @@ async def get_device_info_fast(device_id: str):
             conn.close()
             raise HTTPException(status_code=404, detail="Device not found")
         
-        _, device_uuid, serial_num, last_seen, created_at = device_row
+        _, device_uuid, serial_num, last_seen, created_at, platform = device_row
         
         # Get only the modules needed for InfoTab (6 widgets)
         info_modules = {}
@@ -1447,6 +1447,7 @@ async def get_device_info_fast(device_id: str):
             "device": {
                 "serialNumber": serial_num,
                 "deviceId": device_uuid,
+                "platform": platform,  # Required for macOS/Windows-specific UI (e.g., btmdbHealth)
                 "lastSeen": last_seen.isoformat() if last_seen else None,
                 "createdAt": created_at.isoformat() if created_at else None,
                 "registrationDate": created_at.isoformat() if created_at else None,
