@@ -6,6 +6,7 @@ SELECT DISTINCT ON (d.serial_number)
     d.serial_number,
     d.device_id,
     d.last_seen,
+    d.platform,
     sec.data as security_data,
     sec.collected_at,
     COALESCE(inv.data->>'device_name', inv.data->>'deviceName') as device_name,
