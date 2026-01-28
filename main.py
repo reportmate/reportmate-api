@@ -2129,7 +2129,7 @@ async def get_bulk_security(
         devices = []
         for row in rows:
             try:
-                serial_number, device_uuid, last_seen, security_data, collected_at, device_name, computer_name, usage, catalog, location, asset_tag = row
+                serial_number, device_uuid, last_seen, platform, security_data, collected_at, device_name, computer_name, usage, catalog, location, asset_tag = row
                 
                 devices.append({
                     'id': serial_number,
@@ -2142,6 +2142,7 @@ async def get_bulk_security(
                     'usage': usage,
                     'catalog': catalog,
                     'location': location,
+                    'platform': platform,
                     'raw': security_data
                 })
             except Exception as e:
