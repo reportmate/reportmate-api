@@ -2129,7 +2129,13 @@ async def get_bulk_security(
         devices = []
         for row in rows:
             try:
-                serial_number, device_uuid, last_seen, platform, security_data, collected_at, device_name, computer_name, usage, catalog, location, asset_tag = row
+                (serial_number, device_uuid, last_seen, platform, collected_at,
+                 device_name, computer_name, usage, catalog, location, asset_tag,
+                 firewall_enabled, filevault_enabled, edr_active, edr_status,
+                 cve_count, critical_cve_count, expired_cert_count, expiring_soon_cert_count,
+                 tpm_present, tpm_enabled, secure_boot_enabled, sip_enabled,
+                 ssh_status_display, ssh_is_configured, ssh_is_service_running,
+                 secure_boot_level, auto_login_user) = row
                 
                 devices.append({
                     'id': serial_number,
@@ -2143,7 +2149,25 @@ async def get_bulk_security(
                     'catalog': catalog,
                     'location': location,
                     'platform': platform,
-                    'raw': security_data
+                    'firewallEnabled': firewall_enabled or False,
+                    'fileVaultEnabled': filevault_enabled or False,
+                    'edrActive': edr_active or False,
+                    'edrStatus': edr_status,
+                    'cveCount': cve_count or 0,
+                    'criticalCveCount': critical_cve_count or 0,
+                    'expiredCertCount': expired_cert_count or 0,
+                    'expiringSoonCertCount': expiring_soon_cert_count or 0,
+                    'tpmPresent': tpm_present or False,
+                    'tpmEnabled': tpm_enabled or False,
+                    'secureBootEnabled': secure_boot_enabled or False,
+                    'sipEnabled': sip_enabled,
+                    'secureShell': {
+                        'statusDisplay': ssh_status_display,
+                        'isConfigured': ssh_is_configured or False,
+                        'isServiceRunning': ssh_is_service_running or False
+                    } if ssh_status_display is not None else None,
+                    'secureBootLevel': secure_boot_level,
+                    'autoLoginUser': auto_login_user
                 })
             except Exception as e:
                 logger.warning(f"Error processing security for device {row[0]}: {e}")
