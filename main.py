@@ -2671,6 +2671,7 @@ async def get_bulk_identity(
     - Directory services (AD, Open Directory, LDAP)
     - Secure Token users
     - Platform SSO registration status
+    - Enrollment type (Entra Joined, Domain Joined, Hybrid, Standalone)
     """
     try:
         logger.info("Fetching bulk identity data")
@@ -2694,6 +2695,12 @@ async def get_bulk_identity(
                 
                 # Extract summary counts from identity data for quick display
                 summary = {}
+                enrollment_type = 'Unknown'
+                entra_joined = False
+                domain_joined = False
+                tenant_id = None
+                tenant_name = None
+                
                 if identity_data and isinstance(identity_data, dict):
                     users = identity_data.get('users') or identity_data.get('userAccounts') or []
                     groups = identity_data.get('groups') or identity_data.get('userGroups') or []
@@ -2702,15 +2709,35 @@ async def get_bulk_identity(
                     secure_token = identity_data.get('secureToken') or identity_data.get('secure_token') or {}
                     platform_sso = identity_data.get('platformSSOUsers') or identity_data.get('platform_sso_users') or {}
                     
+                    # Extract enrollment info from identity module's directoryServices (authoritative)
+                    # Identity module runs dsregcmd directly - no cross-module fallback
+                    ad = directory.get('activeDirectory') or directory.get('active_directory') or {}
+                    entra = directory.get('azureAd') or directory.get('azure_ad') or directory.get('entraId') or directory.get('entra_id') or {}
+                    
+                    domain_joined = ad.get('bound') or ad.get('is_domain_joined') or ad.get('isDomainJoined') or False
+                    entra_joined = entra.get('joined') or entra.get('is_aad_joined') or entra.get('isAadJoined') or entra.get('is_entra_joined') or entra.get('isEntraJoined') or False
+                    tenant_id = entra.get('tenant_id') or entra.get('tenantId')
+                    tenant_name = entra.get('tenant_name') or entra.get('tenantName')
+                    
                     summary = {
                         'userCount': len(users) if isinstance(users, list) else 0,
                         'groupCount': len(groups) if isinstance(groups, list) else 0,
                         'btmdbStatus': btmdb.get('status') or btmdb.get('health_status'),
                         'btmdbSizeMB': btmdb.get('sizeMB') or btmdb.get('size_mb'),
-                        'directoryBound': bool(directory.get('isBound') or directory.get('is_bound')),
+                        'directoryBound': bool(directory.get('isBound') or directory.get('is_bound') or domain_joined or entra_joined),
                         'secureTokenEnabled': len(secure_token.get('users', [])) > 0 if isinstance(secure_token, dict) else False,
                         'platformSSORegistered': platform_sso.get('deviceRegistered') or platform_sso.get('device_registered') or False
                     }
+                
+                # Determine enrollment type from identity module's directoryServices data
+                if domain_joined and entra_joined:
+                    enrollment_type = 'Hybrid'
+                elif entra_joined:
+                    enrollment_type = 'Entra Joined'
+                elif domain_joined:
+                    enrollment_type = 'Domain Joined'
+                else:
+                    enrollment_type = 'Workgroup'
                 
                 devices.append({
                     'id': serial_number,
@@ -2725,6 +2752,11 @@ async def get_bulk_identity(
                     'catalog': catalog,
                     'location': location,
                     'department': department,
+                    'enrollmentType': enrollment_type,
+                    'entraJoined': entra_joined,
+                    'domainJoined': domain_joined,
+                    'tenantId': tenant_id,
+                    'tenantName': tenant_name,
                     'summary': summary,
                     'raw': identity_data or {}
                 })
