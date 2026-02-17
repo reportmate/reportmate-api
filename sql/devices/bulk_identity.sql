@@ -1,5 +1,6 @@
 -- Bulk identity endpoint: /api/devices/identity
 -- Returns devices with identity data (users, groups, sessions, BTMDB health, directory services)
+-- Identity module collects Entra/Domain join status directly via dsregcmd - no cross-module fallback
 -- Parameters: include_archived (boolean)
 
 SELECT DISTINCT ON (d.serial_number)
