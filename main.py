@@ -618,7 +618,7 @@ async def health_check():
 
 @app.get("/api/dashboard", dependencies=[Depends(verify_authentication)])
 async def get_dashboard_data(
-    events_limit: int = Query(default=50, ge=1, le=200, alias="eventsLimit"),
+    events_limit: int = Query(default=1000, ge=1, le=1000, alias="eventsLimit"),
     include_archived: bool = Query(default=False, alias="includeArchived")
 ):
     """
@@ -1310,7 +1310,7 @@ async def get_device_installs_log(serial_number: str):
         logger.error(f"Failed to get installs log for {serial_number}: {e}")
         raise HTTPException(status_code=500, detail=f"Failed to retrieve installs log: {str(e)}")
 @app.get("/api/device/{serial_number}/events", dependencies=[Depends(verify_authentication)])
-async def get_device_events(serial_number: str, limit: int = 100):
+async def get_device_events(serial_number: str, limit: int = 1000):
     """
     Get events for a specific device.
     
