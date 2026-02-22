@@ -528,18 +528,27 @@ class DevicesResponse(BaseModel):
     hasMore: Optional[bool] = None
 
 
-def infer_platform(os_name: Optional[str]) -> Optional[str]:
-    """Infer platform from OS name."""
-    if not os_name:
-        return None
+def infer_platform(os_name: Optional[str], hardware_data: Optional[Dict] = None) -> Optional[str]:
+    """Infer platform from OS name or hardware data."""
+    if os_name:
+        lower_name = os_name.lower()
+        if "windows" in lower_name:
+            return "Windows"
+        if "mac" in lower_name or "darwin" in lower_name:
+            return "macOS"
+        if "linux" in lower_name:
+            return "Linux"
 
-    lower_name = os_name.lower()
-    if "windows" in lower_name:
-        return "Windows"
-    if "mac" in lower_name or "darwin" in lower_name:
-        return "macOS"
-    if "linux" in lower_name:
-        return "Linux"
+    # Fallback: check hardware model_name and manufacturer for platform hints
+    if hardware_data and isinstance(hardware_data, dict):
+        hw_system = hardware_data.get("system") or {}
+        model_name = (hw_system.get("model_name") or hardware_data.get("model") or "").lower()
+        if "mac" in model_name or "imac" in model_name:
+            return "macOS"
+        vendor = (hw_system.get("hardware_vendor") or hardware_data.get("manufacturer") or "").lower()
+        if "apple" in vendor:
+            return "macOS"
+
     return None
 
 
@@ -675,10 +684,12 @@ async def get_dashboard_data(
             d.archived,
             d.created_at,
             i.data as inventory_data,
-            s.data as system_data
+            s.data as system_data,
+            h.data as hardware_data
         FROM devices d
         LEFT JOIN inventory i ON d.serial_number = i.device_id
         LEFT JOIN system s ON d.serial_number = s.device_id
+        LEFT JOIN hardware h ON d.serial_number = h.device_id
         {archive_filter_where}
         ORDER BY d.last_seen DESC NULLS LAST
         """
@@ -689,7 +700,7 @@ async def get_dashboard_data(
         devices = []
         for row in device_rows:
             (db_id, device_id, serial_number, device_name, os_val, os_name_db, os_version_db, 
-             last_seen, archived, created_at, inventory_data_raw, system_data_raw) = row
+             last_seen, archived, created_at, inventory_data_raw, system_data_raw, hardware_data_raw) = row
             
             # Extract full OS details from system module
             system_os = {}
@@ -717,8 +728,17 @@ async def get_dashboard_data(
             os_edition = system_os.get("edition") or ""
             os_architecture = system_os.get("architecture") or ""
             
-            # Determine platform from OS name
-            platform = "Windows" if "windows" in (final_os_name or "").lower() else "macOS" if "mac" in (final_os_name or "").lower() else "Unknown"
+            # Determine platform from OS name, with hardware fallback
+            parsed_hw = None
+            if hardware_data_raw:
+                try:
+                    parsed_hw = hardware_data_raw if isinstance(hardware_data_raw, dict) else json.loads(hardware_data_raw)
+                    if isinstance(parsed_hw, list) and parsed_hw:
+                        parsed_hw = parsed_hw[0]
+                except Exception:
+                    parsed_hw = None
+
+            platform = "Windows" if "windows" in (final_os_name or "").lower() else "macOS" if "mac" in (final_os_name or "").lower() else infer_platform(None, parsed_hw) or "Unknown"
             
             # Determine status based on last_seen
             status = "online"
@@ -747,6 +767,17 @@ async def get_dashboard_data(
                 except Exception as inv_error:
                     logger.warning(f"Failed to parse inventory for {serial_number}: {inv_error}")
             
+            # Fall back to hardware.system.computer_name for device name
+            # Treat "Unknown" as empty to allow hardware fallback
+            if not inv_device_name or inv_device_name == device_name or inv_device_name.lower() == "unknown":
+                if parsed_hw and isinstance(parsed_hw, dict):
+                    hw_sys = parsed_hw.get("system") or {}
+                    hw_name = hw_sys.get("computer_name") or hw_sys.get("hostname")
+                    if hw_name:
+                        inv_device_name = hw_name
+                    elif not inv_device_name or inv_device_name.lower() == "unknown":
+                        inv_device_name = device_name
+            
             # NOTE: We no longer include full installs data in dashboard response
             # Install error/warning counts are calculated via optimized SQL queries below
             # This reduces response size from ~26MB to ~1MB
@@ -769,14 +800,33 @@ async def get_dashboard_data(
                 }
             }
             
-            # Add inventory if present
-            if any([inv_catalog, inv_usage, inv_department, inv_location]):
-                modules_obj["inventory"] = {
-                    "catalog": inv_catalog,
-                    "usage": inv_usage,
-                    "department": inv_department,
-                    "location": inv_location
-                }
+            # Add inventory if present (always include deviceName for frontend widgets)
+            inv_fields = {}
+            if inv_device_name and inv_device_name != serial_number:
+                inv_fields["deviceName"] = inv_device_name
+            if inv_catalog:
+                inv_fields["catalog"] = inv_catalog
+            if inv_usage:
+                inv_fields["usage"] = inv_usage
+            if inv_department:
+                inv_fields["department"] = inv_department
+            if inv_location:
+                inv_fields["location"] = inv_location
+            if inv_fields:
+                modules_obj["inventory"] = inv_fields
+            
+            # Add hardware summary for frontend platform detection
+            if parsed_hw and isinstance(parsed_hw, dict):
+                hw_summary_dash: Dict[str, Any] = {}
+                hw_sys = parsed_hw.get("system")
+                if hw_sys:
+                    hw_summary_dash["system"] = hw_sys
+                if parsed_hw.get("model"):
+                    hw_summary_dash["model"] = parsed_hw["model"]
+                if parsed_hw.get("manufacturer"):
+                    hw_summary_dash["manufacturer"] = parsed_hw["manufacturer"]
+                if hw_summary_dash:
+                    modules_obj["hardware"] = hw_summary_dash
             
             device = {
                 "id": db_id,
@@ -1003,11 +1053,13 @@ async def get_all_devices(
             d.platform,
             i.data as inventory_data,
             n.data as network_data,
-            s.data->'operatingSystem'->>'name' as system_os_name
+            s.data->'operatingSystem'->>'name' as system_os_name,
+            h.data as hardware_data
         FROM devices d
         LEFT JOIN inventory i ON i.device_id = d.serial_number
         LEFT JOIN network n ON n.device_id = d.serial_number
         LEFT JOIN system s ON s.device_id = d.serial_number
+        LEFT JOIN hardware h ON h.device_id = d.serial_number
         {archive_filter_where}
         ORDER BY COALESCE(d.serial_number, d.device_id) ASC
         """
@@ -1049,13 +1101,24 @@ async def get_all_devices(
                 inventory_data_raw,
                 network_data_raw,
                 system_os_name,
+                hardware_data_raw,
             ) = row
 
             serial = serial_number or str(device_id)
 
             os_summary = build_os_summary(os_name or os, os_version)
-            # Priority: system.operatingSystem.name (kernel) > stored platform > inferred
-            device_platform = system_os_name or platform or infer_platform(os_name or os)
+            # Parse hardware data for platform inference and name fallback
+            parsed_hardware = None
+            if hardware_data_raw:
+                try:
+                    parsed_hardware = hardware_data_raw if isinstance(hardware_data_raw, dict) else json.loads(hardware_data_raw)
+                    if isinstance(parsed_hardware, list) and parsed_hardware:
+                        parsed_hardware = parsed_hardware[0]
+                except Exception:
+                    parsed_hardware = None
+
+            # Priority: system.operatingSystem.name (kernel) > stored platform > inferred (with hardware fallback)
+            device_platform = system_os_name or platform or infer_platform(os_name or os, parsed_hardware)
 
             inventory_summary: Optional[Dict[str, Any]] = None
             device_display_name = device_name
@@ -1112,7 +1175,12 @@ async def get_all_devices(
                 logger.debug(f"No network data found for device {serial}")
 
             if not device_display_name:
-                device_display_name = serial
+                # Fallback: try hardware.system.computer_name or hardware.system.hostname
+                if parsed_hardware and isinstance(parsed_hardware, dict):
+                    hw_sys = parsed_hardware.get("system") or {}
+                    device_display_name = hw_sys.get("computer_name") or hw_sys.get("hostname")
+                if not device_display_name:
+                    device_display_name = serial
 
             device_info: Dict[str, Any] = {
                 "serialNumber": serial,
@@ -1152,6 +1220,18 @@ async def get_all_devices(
                 modules_payload["system"] = {"operatingSystem": os_summary}
             if network_summary:
                 modules_payload["network"] = network_summary
+            # Include hardware module summary in bulk response for platform detection
+            if parsed_hardware and isinstance(parsed_hardware, dict):
+                hw_summary: Dict[str, Any] = {}
+                hw_system = parsed_hardware.get("system")
+                if hw_system:
+                    hw_summary["system"] = hw_system
+                if parsed_hardware.get("model"):
+                    hw_summary["model"] = parsed_hardware["model"]
+                if parsed_hardware.get("manufacturer"):
+                    hw_summary["manufacturer"] = parsed_hardware["manufacturer"]
+                if hw_summary:
+                    modules_payload["hardware"] = hw_summary
             if modules_payload:
                 device_info["modules"] = modules_payload
 
