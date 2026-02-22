@@ -675,7 +675,8 @@ async def get_dashboard_data(
             d.archived,
             d.created_at,
             i.data as inventory_data,
-            s.data as system_data
+            s.data as system_data,
+            d.platform as stored_platform
         FROM devices d
         LEFT JOIN inventory i ON d.serial_number = i.device_id
         LEFT JOIN system s ON d.serial_number = s.device_id
@@ -689,7 +690,7 @@ async def get_dashboard_data(
         devices = []
         for row in device_rows:
             (db_id, device_id, serial_number, device_name, os_val, os_name_db, os_version_db, 
-             last_seen, archived, created_at, inventory_data_raw, system_data_raw) = row
+             last_seen, archived, created_at, inventory_data_raw, system_data_raw, stored_platform) = row
             
             # Extract full OS details from system module
             system_os = {}
@@ -717,8 +718,8 @@ async def get_dashboard_data(
             os_edition = system_os.get("edition") or ""
             os_architecture = system_os.get("architecture") or ""
             
-            # Determine platform from OS name
-            platform = "Windows" if "windows" in (final_os_name or "").lower() else "macOS" if "mac" in (final_os_name or "").lower() else "Unknown"
+            # Determine platform from OS name, fall back to stored platform column
+            platform = "Windows" if "windows" in (final_os_name or "").lower() else "macOS" if "mac" in (final_os_name or "").lower() else (stored_platform or "Unknown")
             
             # Determine status based on last_seen
             status = "online"
