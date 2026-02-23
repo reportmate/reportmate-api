@@ -8,7 +8,13 @@
 SELECT 
     e.id,
     e.device_id,
-    COALESCE(i.data->>'device_name', i.data->>'deviceName') as device_name,
+    COALESCE(
+        NULLIF(NULLIF(i.data->>'deviceName', ''), 'Unknown'),
+        NULLIF(NULLIF(i.data->>'device_name', ''), 'Unknown'),
+        NULLIF(h.data->'system'->>'computer_name', ''),
+        NULLIF(h.data->'system'->>'hostname', ''),
+        NULLIF(n.data->>'hostname', '')
+    ) as device_name,
     COALESCE(i.data->>'asset_tag', i.data->>'assetTag') as asset_tag,
     e.event_type,
     e.message,
@@ -21,6 +27,8 @@ SELECT
 FROM events e
 LEFT JOIN inventory i ON e.device_id = i.device_id
 LEFT JOIN system s ON e.device_id = s.device_id
+LEFT JOIN hardware h ON e.device_id = h.device_id
+LEFT JOIN network n ON e.device_id = n.device_id
 WHERE (%(start_date)s::timestamptz IS NULL OR e.timestamp >= %(start_date)s::timestamptz)
   AND (%(end_date)s::timestamptz IS NULL OR e.timestamp <= %(end_date)s::timestamptz)
 ORDER BY e.timestamp DESC 
