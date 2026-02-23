@@ -676,10 +676,17 @@ async def get_dashboard_data(
             d.created_at,
             i.data as inventory_data,
             s.data as system_data,
-            d.platform as stored_platform
+            d.platform as stored_platform,
+            COALESCE(
+                NULLIF(h.data->'system'->>'computer_name', ''),
+                NULLIF(h.data->'system'->>'hostname', '')
+            ) as hw_device_name,
+            NULLIF(n.data->>'hostname', '') as net_device_name
         FROM devices d
         LEFT JOIN inventory i ON d.serial_number = i.device_id
         LEFT JOIN system s ON d.serial_number = s.device_id
+        LEFT JOIN hardware h ON d.serial_number = h.device_id
+        LEFT JOIN network n ON d.serial_number = n.device_id
         {archive_filter_where}
         ORDER BY d.last_seen DESC NULLS LAST
         """
@@ -690,7 +697,8 @@ async def get_dashboard_data(
         devices = []
         for row in device_rows:
             (db_id, device_id, serial_number, device_name, os_val, os_name_db, os_version_db, 
-             last_seen, archived, created_at, inventory_data_raw, system_data_raw, stored_platform) = row
+             last_seen, archived, created_at, inventory_data_raw, system_data_raw, stored_platform,
+             hw_device_name, net_device_name) = row
             
             # Extract full OS details from system module
             system_os = {}
@@ -731,7 +739,7 @@ async def get_dashboard_data(
                     status = "idle"
             
             # Extract inventory data (catalog, usage, department, location)
-            inv_device_name = device_name
+            inv_device_name = None
             inv_catalog = None
             inv_usage = None
             inv_department = None
@@ -740,14 +748,17 @@ async def get_dashboard_data(
             if inventory_data_raw:
                 try:
                     inventory = inventory_data_raw if isinstance(inventory_data_raw, dict) else json.loads(inventory_data_raw)
-                    inv_device_name = inventory.get("deviceName") or device_name
+                    inv_device_name = inventory.get("deviceName") or None
                     inv_catalog = inventory.get("catalog")
                     inv_usage = inventory.get("usage")
                     inv_department = inventory.get("department")
                     inv_location = inventory.get("location")
                 except Exception as inv_error:
                     logger.warning(f"Failed to parse inventory for {serial_number}: {inv_error}")
-            
+
+            # hw_device_name and net_device_name are already extracted by SQL JSONB expressions
+            # (no Python-level JSON parsing needed for these)
+
             # NOTE: We no longer include full installs data in dashboard response
             # Install error/warning counts are calculated via optimized SQL queries below
             # This reduces response size from ~26MB to ~1MB
@@ -770,9 +781,14 @@ async def get_dashboard_data(
                 }
             }
             
+            # Normalize device name - chain: inventory.deviceName → hardware.computer_name → hardware.hostname → network.hostname → d.name → serial
+            raw_name = inv_device_name or hw_device_name or net_device_name or device_name
+            final_device_name = raw_name if (raw_name and raw_name.lower() != "unknown") else serial_number
+
             # Add inventory if present
-            if any([inv_catalog, inv_usage, inv_department, inv_location]):
+            if any([inv_device_name, inv_catalog, inv_usage, inv_department, inv_location]):
                 modules_obj["inventory"] = {
+                    "deviceName": final_device_name if final_device_name != serial_number else None,
                     "catalog": inv_catalog,
                     "usage": inv_usage,
                     "department": inv_department,
@@ -783,7 +799,7 @@ async def get_dashboard_data(
                 "id": db_id,
                 "deviceId": device_id,
                 "serialNumber": serial_number,
-                "name": inv_device_name or serial_number,
+                "name": final_device_name,
                 "platform": platform,
                 "osName": final_os_name,
                 "osVersion": final_os_version,
@@ -892,21 +908,41 @@ async def get_dashboard_data(
             # Keep zeros if query fails
         
         # === EVENTS QUERY ===
+        # Fetch the last N events per event_type so the dashboard always has
+        # a pool of each type visible — prevents the widget appearing empty
+        # when recent activity is dominated by a single filtered type (e.g. info).
         events = []
+        per_type_limit = max(50, events_limit // 5)  # at least 50 per type
         try:
             cursor.execute("""
-                SELECT 
-                    e.id,
-                    e.device_id,
-                    COALESCE(i.data->>'device_name', i.data->>'deviceName') as device_name,
-                    e.event_type,
-                    e.message,
-                    e.timestamp
-                FROM events e
-                LEFT JOIN inventory i ON e.device_id = i.device_id
-                ORDER BY e.timestamp DESC 
-                LIMIT %s
-            """, (events_limit,))
+                WITH ranked AS (
+                    SELECT
+                        e.id,
+                        e.device_id,
+                        COALESCE(
+                            NULLIF(NULLIF(i.data->>'deviceName', ''), 'Unknown'),
+                            NULLIF(NULLIF(i.data->>'device_name', ''), 'Unknown'),
+                            NULLIF(h.data->'system'->>'computer_name', ''),
+                            NULLIF(h.data->'system'->>'hostname', ''),
+                            NULLIF(n.data->>'hostname', '')
+                        ) as device_name,
+                        e.event_type,
+                        e.message,
+                        e.timestamp,
+                        ROW_NUMBER() OVER (
+                            PARTITION BY e.event_type
+                            ORDER BY e.timestamp DESC
+                        ) AS rn
+                    FROM events e
+                    LEFT JOIN inventory i ON e.device_id = i.device_id
+                    LEFT JOIN hardware h ON e.device_id = h.device_id
+                    LEFT JOIN network n ON e.device_id = n.device_id
+                )
+                SELECT id, device_id, device_name, event_type, message, timestamp
+                FROM ranked
+                WHERE rn <= %s
+                ORDER BY timestamp DESC
+            """, (per_type_limit,))
             
             event_rows = cursor.fetchall()
             for row in event_rows:
@@ -2786,7 +2822,7 @@ async def get_events(
                 # Essential fields for events page
                 "id": event_id,
                 "device": device_id,  # Serial number (used for links)
-                "deviceName": device_name or device_id,  # Friendly name from inventory
+                "deviceName": device_name if (device_name and device_name.lower() != "unknown") else device_id,  # Friendly name from inventory
                 "assetTag": asset_tag,  # Asset tag for display
                 "kind": event_type,  # Event type (success/warning/error/info)
                 "message": message,  # User-friendly message
