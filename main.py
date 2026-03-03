@@ -2190,7 +2190,7 @@ async def get_bulk_security(
                  device_name, computer_name, usage, catalog, location, asset_tag,
                  firewall_enabled, encryption_enabled,
                  antivirus_name, antivirus_enabled, antivirus_up_to_date, antivirus_version, antivirus_last_scan,
-                 edr_active, edr_status,
+                 detection_count,
                  tpm_present, tpm_enabled, secure_boot_enabled, sip_enabled, gatekeeper_enabled,
                  memory_integrity_enabled, core_isolation_enabled, smart_app_control_state,
                  ssh_status_display, ssh_is_configured, ssh_is_service_running, rdp_enabled,
@@ -2220,9 +2220,8 @@ async def get_bulk_security(
                     'antivirusUpToDate': bool(antivirus_up_to_date),
                     'antivirusVersion': antivirus_version,
                     'antivirusLastScan': antivirus_last_scan,
-                    # Detection / EDR
-                    'edrActive': bool(edr_active),
-                    'edrStatus': edr_status,
+                    # Detection (threat alerts count - 0 = clean)
+                    'detectionCount': int(detection_count or 0),
                     # Tampering
                     'tpmPresent': bool(tpm_present),
                     'tpmEnabled': bool(tpm_enabled),
