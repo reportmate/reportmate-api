@@ -1347,12 +1347,20 @@ async def get_device_installs_log(serial_number: str):
         logger.error(f"Failed to get installs log for {serial_number}: {e}")
         raise HTTPException(status_code=500, detail=f"Failed to retrieve installs log: {str(e)}")
 @app.get("/api/device/{serial_number}/events", dependencies=[Depends(verify_authentication)])
-async def get_device_events(serial_number: str, limit: int = 100):
+async def get_device_events(
+    serial_number: str,
+    limit: int = 100,
+    type: str = Query(default=None, description="Filter by event type (success, warning, error, info, system)")
+):
     """
     Get events for a specific device.
     
     Returns event history for device activity logging and monitoring.
     Used by EventsTab for displaying device events.
+    
+    **Query Parameters:**
+    - limit: Maximum events to return (default 100)
+    - type: Filter by event type - success, warning, error, info, system (optional)
     """
     try:
         conn = get_db_connection()
@@ -1371,15 +1379,22 @@ async def get_device_events(serial_number: str, limit: int = 100):
         
         device_id = device_row[0]
         
+        # Validate event type filter
+        VALID_EVENT_TYPES = ['success', 'warning', 'error', 'info', 'system']
+        event_type = None
+        if type and type.lower() in VALID_EVENT_TYPES:
+            event_type = type.lower()
+        
         # Get events for this device
         # NOTE: events.device_id contains the serial_number (same as devices.id)
         cursor.execute("""
             SELECT id, event_type, message, details, timestamp, created_at
             FROM events
             WHERE device_id = %s
+              AND (%s IS NULL OR event_type = %s)
             ORDER BY timestamp DESC
             LIMIT %s
-        """, (device_id, limit))
+        """, (device_id, event_type, event_type, limit))
         
         events = []
         for row in cursor.fetchall():
@@ -2171,7 +2186,17 @@ async def get_bulk_security(
         devices = []
         for row in rows:
             try:
-                serial_number, device_uuid, last_seen, security_data, collected_at, device_name, computer_name, usage, catalog, location, asset_tag = row
+                (serial_number, device_uuid, last_seen, platform, collected_at,
+                 device_name, computer_name, usage, catalog, location, asset_tag,
+                 firewall_enabled, encryption_enabled,
+                 antivirus_name, antivirus_enabled, antivirus_up_to_date, antivirus_version, antivirus_last_scan,
+                 edr_active, edr_status,
+                 tpm_present, tpm_enabled, secure_boot_enabled, sip_enabled, gatekeeper_enabled,
+                 memory_integrity_enabled, core_isolation_enabled, smart_app_control_state,
+                 ssh_status_display, ssh_is_configured, ssh_is_service_running, rdp_enabled,
+                 certificate_count, expired_cert_count, expiring_soon_cert_count,
+                 cve_count, critical_cve_count,
+                 auto_login_user) = row
                 
                 devices.append({
                     'id': serial_number,
@@ -2181,10 +2206,49 @@ async def get_bulk_security(
                     'assetTag': asset_tag,
                     'lastSeen': last_seen.isoformat() if last_seen else None,
                     'collectedAt': collected_at.isoformat() if collected_at else None,
+                    'platform': platform,
                     'usage': usage,
                     'catalog': catalog,
                     'location': location,
-                    'raw': security_data
+                    # Firewall
+                    'firewallEnabled': bool(firewall_enabled),
+                    # Encryption
+                    'encryptionEnabled': bool(encryption_enabled),
+                    # Antivirus / Protection
+                    'antivirusName': antivirus_name or '',
+                    'antivirusEnabled': bool(antivirus_enabled),
+                    'antivirusUpToDate': bool(antivirus_up_to_date),
+                    'antivirusVersion': antivirus_version,
+                    'antivirusLastScan': antivirus_last_scan,
+                    # Detection / EDR
+                    'edrActive': bool(edr_active),
+                    'edrStatus': edr_status,
+                    # Tampering
+                    'tpmPresent': bool(tpm_present),
+                    'tpmEnabled': bool(tpm_enabled),
+                    'secureBootEnabled': bool(secure_boot_enabled),
+                    'sipEnabled': sip_enabled,
+                    'gatekeeperEnabled': bool(gatekeeper_enabled),
+                    # Protection (Windows)
+                    'memoryIntegrityEnabled': bool(memory_integrity_enabled),
+                    'coreIsolationEnabled': bool(core_isolation_enabled),
+                    'smartAppControlState': smart_app_control_state,
+                    # Remote Access
+                    'secureShell': {
+                        'statusDisplay': ssh_status_display,
+                        'isConfigured': bool(ssh_is_configured),
+                        'isServiceRunning': bool(ssh_is_service_running),
+                    },
+                    'rdpEnabled': bool(rdp_enabled),
+                    # Certificates
+                    'certificateCount': certificate_count or 0,
+                    'expiredCertCount': expired_cert_count or 0,
+                    'expiringSoonCertCount': expiring_soon_cert_count or 0,
+                    # Vulnerabilities
+                    'cveCount': cve_count or 0,
+                    'criticalCveCount': critical_cve_count or 0,
+                    # Misc
+                    'autoLoginUser': auto_login_user,
                 })
             except Exception as e:
                 logger.warning(f"Error processing security for device {row[0]}: {e}")
@@ -2196,6 +2260,80 @@ async def get_bulk_security(
     except Exception as e:
         logger.error(f"Failed to get bulk security: {e}")
         raise HTTPException(status_code=500, detail=f"Failed to retrieve bulk security: {str(e)}")
+
+@app.get("/api/devices/security/certificates", dependencies=[Depends(verify_authentication)], tags=["fleet"])
+async def search_fleet_certificates(
+    search: str = Query(default="", description="Search term to match against certificate commonName, issuer, subject, or serialNumber"),
+    status: str = Query(default="all", description="Filter by certificate status: all, valid, expired, expiring"),
+    include_archived: bool = Query(default=False, alias="includeArchived", description="Include archived devices in results")
+):
+    """
+    Fleet-wide certificate search endpoint.
+    
+    Searches across all device certificates for matching commonName, issuer, subject, or serialNumber.
+    Useful for verifying certificate deployment across the fleet or finding expired certificates.
+    
+    **Parameters:**
+    - search: Text to search for (case-insensitive, partial match)
+    - status: Filter by cert status (all, valid, expired, expiring)
+    - includeArchived: Include archived devices
+    """
+    try:
+        logger.info(f"Searching fleet certificates: search='{search}', status='{status}'")
+        
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        
+        query = load_sql("devices/security_certificates")
+        
+        cursor.execute(query, {
+            "search": search.strip(),
+            "status": status.strip().lower(),
+            "include_archived": include_archived
+        })
+        rows = cursor.fetchall()
+        conn.close()
+        
+        logger.info(f"Certificate search returned {len(rows)} results")
+        
+        results = []
+        for row in rows:
+            try:
+                (serial_number, platform, device_name,
+                 common_name, issuer, subject, cert_status,
+                 not_after, not_before, days_until_expiry,
+                 is_expired, is_expiring_soon,
+                 store_name, store_location, key_algorithm,
+                 cert_serial_number, is_self_signed) = row
+                
+                results.append({
+                    'serialNumber': serial_number,
+                    'platform': platform,
+                    'deviceName': device_name,
+                    'commonName': common_name,
+                    'issuer': issuer,
+                    'subject': subject,
+                    'status': cert_status,
+                    'notAfter': not_after,
+                    'notBefore': not_before,
+                    'daysUntilExpiry': days_until_expiry,
+                    'isExpired': bool(is_expired),
+                    'isExpiringSoon': bool(is_expiring_soon),
+                    'storeName': store_name,
+                    'storeLocation': store_location,
+                    'keyAlgorithm': key_algorithm,
+                    'certSerialNumber': cert_serial_number,
+                    'isSelfSigned': bool(is_self_signed),
+                })
+            except Exception as e:
+                logger.warning(f"Error processing certificate row: {e}")
+                continue
+        
+        return results
+        
+    except Exception as e:
+        logger.error(f"Failed to search fleet certificates: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to search certificates: {str(e)}")
 
 @app.get("/api/devices/profiles", dependencies=[Depends(verify_authentication)], tags=["fleet"])
 async def get_bulk_profiles(
@@ -2761,7 +2899,8 @@ async def get_events(
     limit: int = Query(default=100, ge=1, le=1000, description="Maximum number of events to return"),
     offset: int = Query(default=0, ge=0, description="Number of events to skip (for pagination)"),
     startDate: str = Query(default=None, description="Filter events after this ISO8601 date"),
-    endDate: str = Query(default=None, description="Filter events before this ISO8601 date")
+    endDate: str = Query(default=None, description="Filter events before this ISO8601 date"),
+    type: str = Query(default=None, description="Filter by event type (success, warning, error, info, system)")
 ):
     """
     Get recent events with device names (optimized for dashboard).
@@ -2774,6 +2913,7 @@ async def get_events(
     - offset: Number of events to skip (for pagination, default 0)
     - startDate: Filter events after this ISO8601 date (optional)
     - endDate: Filter events before this ISO8601 date (optional)
+    - type: Filter by event type - success, warning, error, info, system (optional)
     
     **Response includes:**
     - Event ID, type, message, timestamp
@@ -2798,9 +2938,17 @@ async def get_events(
             except ValueError as e:
                 logger.warning(f"Invalid endDate format: {endDate}, error: {e}")
         
+        # Validate event type filter
+        VALID_EVENT_TYPES = ['success', 'warning', 'error', 'info', 'system']
+        event_type = None
+        if type and type.lower() in VALID_EVENT_TYPES:
+            event_type = type.lower()
+        elif type:
+            logger.warning(f"Invalid event type filter: {type}")
+        
         # Get total count first for pagination info
         count_query = load_sql("events/count_events")
-        cursor.execute(count_query, {"start_date": start_date, "end_date": end_date})
+        cursor.execute(count_query, {"start_date": start_date, "end_date": end_date, "event_type": event_type})
         total_count = cursor.fetchone()[0]
         
         # JOIN with inventory to get device names and assetTag in single query
@@ -2809,7 +2957,8 @@ async def get_events(
             "limit": limit, 
             "offset": offset,
             "start_date": start_date,
-            "end_date": end_date
+            "end_date": end_date,
+            "event_type": event_type
         })
         
         rows = cursor.fetchall()
