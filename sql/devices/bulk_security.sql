@@ -38,9 +38,8 @@ SELECT DISTINCT ON (d.serial_number)
     sec.data->'antivirus'->>'version' as antivirus_version,
     sec.data->'antivirus'->>'lastScan' as antivirus_last_scan,
 
-    -- EDR / Detection
-    COALESCE((sec.data->>'edrActive')::boolean, false) as edr_active,
-    sec.data->>'edrStatus' as edr_status,
+    -- Detection (threat alerts from Defender/AV - empty = clean device)
+    COALESCE(jsonb_array_length(sec.data->'detections'), 0) as detection_count,
 
     -- Tampering: TPM (Windows)
     COALESCE((sec.data->'tpm'->>'isPresent')::boolean, false) as tpm_present,
