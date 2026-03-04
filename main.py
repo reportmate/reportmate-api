@@ -1366,18 +1366,16 @@ async def get_device_events(
         conn = get_db_connection()
         cursor = conn.cursor()
         
-        # Get device record to verify it exists
+        # Verify device exists
         cursor.execute("""
-            SELECT id FROM devices 
-            WHERE serial_number = %s OR id = %s
-        """, (serial_number, serial_number))
+            SELECT serial_number FROM devices 
+            WHERE serial_number = %s
+        """, (serial_number,))
         
         device_row = cursor.fetchone()
         if not device_row:
             conn.close()
             raise HTTPException(status_code=404, detail="Device not found")
-        
-        device_id = device_row[0]
         
         # Validate event type filter
         VALID_EVENT_TYPES = ['success', 'warning', 'error', 'info', 'system']
@@ -1386,15 +1384,23 @@ async def get_device_events(
             event_type = type.lower()
         
         # Get events for this device
-        # NOTE: events.device_id contains the serial_number (same as devices.id)
-        cursor.execute("""
-            SELECT id, event_type, message, details, timestamp, created_at
-            FROM events
-            WHERE device_id = %s
-              AND (%s IS NULL OR event_type = %s)
-            ORDER BY timestamp DESC
-            LIMIT %s
-        """, (device_id, event_type, event_type, limit))
+        # NOTE: events.device_id contains the serial_number string
+        if event_type:
+            cursor.execute("""
+                SELECT id, event_type, message, details, timestamp, created_at
+                FROM events
+                WHERE device_id = %s AND event_type = %s
+                ORDER BY timestamp DESC
+                LIMIT %s
+            """, (serial_number, event_type, limit))
+        else:
+            cursor.execute("""
+                SELECT id, event_type, message, details, timestamp, created_at
+                FROM events
+                WHERE device_id = %s
+                ORDER BY timestamp DESC
+                LIMIT %s
+            """, (serial_number, limit))
         
         events = []
         for row in cursor.fetchall():
@@ -2537,7 +2543,7 @@ async def get_bulk_management(
                     'provider': provider,
                     'enrollmentStatus': enrollment_status,
                     'enrollmentType': enrollment_type,
-                    'intuneId': device_details.get('intuneDeviceId') or device_details.get('intune_device_id') or 'N/A',
+                    'intuneId': device_details.get('intuneDeviceId') or device_details.get('intune_device_id') or (management_data.get('device_identifiers', {}) or {}).get('uuid') or device_uuid or 'N/A',
                     'tenantName': tenant_details.get('tenantName') or tenant_details.get('tenant_name') or tenant_details.get('organization') or 'N/A',
                     'isEnrolled': is_enrolled,
                     'raw': management_data
@@ -2846,25 +2852,58 @@ async def get_bulk_identity(
             try:
                 serial_number, device_uuid, last_seen, platform, identity_data, collected_at, device_name, computer_name, usage, catalog, location, asset_tag, department = row
                 
-                # Extract summary counts from identity data for quick display
+                # Extract only the summary fields needed by the fleet page
+                # Do NOT return the full raw identity blob (~50KB per device)
                 summary = {}
+                users_preview = []
+                logged_in_usernames = []
+                btmdb = {}
+                secure_token = {}
+                platform_sso = {}
+                directory_services = {}
+                domain_trust = {}
+                windows_hello = {}
+                
                 if identity_data and isinstance(identity_data, dict):
                     users = identity_data.get('users') or identity_data.get('userAccounts') or []
                     groups = identity_data.get('groups') or identity_data.get('userGroups') or []
+                    logged_in_users = identity_data.get('loggedInUsers') or []
                     btmdb = identity_data.get('btmdbHealth') or identity_data.get('btmdb_health') or {}
-                    directory = identity_data.get('directoryServices') or identity_data.get('directory_services') or {}
-                    secure_token = identity_data.get('secureToken') or identity_data.get('secure_token') or {}
+                    directory_services = identity_data.get('directoryServices') or identity_data.get('directory_services') or {}
+                    secure_token = identity_data.get('secureToken') or identity_data.get('secure_token') or identity_data.get('secureTokenUsers') or {}
                     platform_sso = identity_data.get('platformSSOUsers') or identity_data.get('platform_sso_users') or {}
+                    domain_trust = identity_data.get('domainTrust') or {}
+                    windows_hello = identity_data.get('windowsHello') or {}
+                    
+                    admin_count = sum(1 for u in users if isinstance(u, dict) and u.get('isAdmin')) if isinstance(users, list) else 0
+                    disabled_count = sum(1 for u in users if isinstance(u, dict) and u.get('disabled')) if isinstance(users, list) else 0
+                    
+                    unique_logged_in = list(dict.fromkeys(
+                        s.get('user') for s in logged_in_users 
+                        if isinstance(s, dict) and s.get('user')
+                    )) if isinstance(logged_in_users, list) else []
                     
                     summary = {
-                        'userCount': len(users) if isinstance(users, list) else 0,
+                        'totalUsers': len(users) if isinstance(users, list) else 0,
+                        'adminUsers': admin_count,
+                        'disabledUsers': disabled_count,
                         'groupCount': len(groups) if isinstance(groups, list) else 0,
-                        'btmdbStatus': btmdb.get('status') or btmdb.get('health_status'),
-                        'btmdbSizeMB': btmdb.get('sizeMB') or btmdb.get('size_mb'),
-                        'directoryBound': bool(directory.get('isBound') or directory.get('is_bound')),
-                        'secureTokenEnabled': len(secure_token.get('users', [])) > 0 if isinstance(secure_token, dict) else False,
-                        'platformSSORegistered': platform_sso.get('deviceRegistered') or platform_sso.get('device_registered') or False
+                        'currentlyLoggedIn': len(unique_logged_in),
                     }
+                    
+                    # Top 5 users for preview
+                    if isinstance(users, list):
+                        users_preview = [
+                            {
+                                'username': u.get('username'),
+                                'realName': u.get('realName'),
+                                'isAdmin': u.get('isAdmin', False),
+                                'lastLogon': u.get('lastLogon'),
+                            }
+                            for u in users[:5] if isinstance(u, dict)
+                        ]
+                    
+                    logged_in_usernames = unique_logged_in[:3]
                 
                 devices.append({
                     'id': serial_number,
@@ -2880,7 +2919,42 @@ async def get_bulk_identity(
                     'location': location,
                     'department': department,
                     'summary': summary,
-                    'raw': identity_data or {}
+                    'users': users_preview,
+                    'loggedInUsernames': logged_in_usernames,
+                    'btmdbHealth': {
+                        'status': btmdb.get('status') or btmdb.get('health_status'),
+                        'sizeMB': btmdb.get('sizeMB') or btmdb.get('size_mb'),
+                    } if btmdb else None,
+                    'secureTokenUsers': {
+                        'tokenGrantedCount': len(secure_token.get('users', [])) if isinstance(secure_token, dict) and secure_token.get('users') else 0,
+                        'tokenMissingCount': secure_token.get('tokenMissingCount', 0) if isinstance(secure_token, dict) else 0,
+                    } if secure_token else None,
+                    'platformSSOUsers': {
+                        'deviceRegistered': platform_sso.get('deviceRegistered') or platform_sso.get('device_registered') or False,
+                        'registeredUserCount': platform_sso.get('registeredUserCount', 0),
+                    } if platform_sso else None,
+                    'directoryServices': {
+                        'activeDirectory': {
+                            'bound': (directory_services.get('activeDirectory') or directory_services.get('active_directory') or {}).get('bound', False),
+                            'domain': (directory_services.get('activeDirectory') or directory_services.get('active_directory') or {}).get('domain'),
+                            'isDomainJoined': (directory_services.get('activeDirectory') or directory_services.get('active_directory') or {}).get('is_domain_joined') or (directory_services.get('activeDirectory') or directory_services.get('active_directory') or {}).get('isDomainJoined', False),
+                        },
+                        'azureAd': {
+                            'joined': (directory_services.get('azureAd') or directory_services.get('azure_ad') or directory_services.get('entraId') or directory_services.get('entra_id') or {}).get('joined') or (directory_services.get('azureAd') or directory_services.get('azure_ad') or directory_services.get('entraId') or directory_services.get('entra_id') or {}).get('is_aad_joined') or (directory_services.get('azureAd') or directory_services.get('azure_ad') or directory_services.get('entraId') or directory_services.get('entra_id') or {}).get('isAadJoined') or (directory_services.get('azureAd') or directory_services.get('azure_ad') or directory_services.get('entraId') or directory_services.get('entra_id') or {}).get('is_entra_joined') or (directory_services.get('azureAd') or directory_services.get('azure_ad') or directory_services.get('entraId') or directory_services.get('entra_id') or {}).get('isEntraJoined', False),
+                            'tenantId': (directory_services.get('azureAd') or directory_services.get('azure_ad') or directory_services.get('entraId') or directory_services.get('entra_id') or {}).get('tenant_id') or (directory_services.get('azureAd') or directory_services.get('azure_ad') or directory_services.get('entraId') or directory_services.get('entra_id') or {}).get('tenantId'),
+                            'tenantName': (directory_services.get('azureAd') or directory_services.get('azure_ad') or directory_services.get('entraId') or directory_services.get('entra_id') or {}).get('tenant_name') or (directory_services.get('azureAd') or directory_services.get('azure_ad') or directory_services.get('entraId') or directory_services.get('entra_id') or {}).get('tenantName'),
+                        },
+                        'ldap': {
+                            'bound': (directory_services.get('ldap') or {}).get('bound', False),
+                        },
+                        'workgroup': directory_services.get('workgroup'),
+                    } if directory_services else None,
+                    'domainTrust': {
+                        'trustStatus': domain_trust.get('trustStatus'),
+                    } if domain_trust else None,
+                    'windowsHello': {
+                        'statusDisplay': windows_hello.get('statusDisplay'),
+                    } if windows_hello else None,
                 })
             except Exception as e:
                 logger.warning(f"Error processing identity for device {row[0]}: {e}")
@@ -3163,7 +3237,7 @@ async def get_application_usage_stats(
                 MAX(e.end_time) as last_used
             FROM application_usage_events e
             {archive_join}
-            WHERE e.start_time >= $1
+            WHERE e.start_time >= %s
             {archive_where}
             GROUP BY e.application_name
             ORDER BY total_seconds DESC
@@ -3191,7 +3265,7 @@ async def get_application_usage_stats(
                 MAX(e.end_time) as last_used
             FROM application_usage_events e
             {archive_join}
-            WHERE e.start_time >= $1
+            WHERE e.start_time >= %s
             {archive_where}
             GROUP BY e.application_name
             ORDER BY launch_count DESC
@@ -3218,7 +3292,7 @@ async def get_application_usage_stats(
                 COUNT(DISTINCT e.application_name) as apps_used
             FROM application_usage_events e
             {archive_join}
-            WHERE e.start_time >= $1
+            WHERE e.start_time >= %s
                 AND e.username IS NOT NULL
                 AND e.username != ''
             {archive_where}
@@ -3240,14 +3314,14 @@ async def get_application_usage_stats(
         # Summary statistics
         cursor.execute(f"""
             SELECT 
-                COUNT(DISTINCT application_name) as total_apps,
-                COALESCE(SUM(duration_seconds), 0) as total_seconds,
+                COUNT(DISTINCT e.application_name) as total_apps,
+                COALESCE(SUM(e.duration_seconds), 0) as total_seconds,
                 COUNT(*) as total_launches,
-                COUNT(DISTINCT username) as unique_users,
-                COUNT(DISTINCT device_id) as devices
+                COUNT(DISTINCT e.username) as unique_users,
+                COUNT(DISTINCT e.device_id) as devices
             FROM application_usage_events e
-            {archive_join.replace('e.device_id', 'e.device_id') if archive_join else ''}
-            WHERE start_time >= $1
+            {archive_join}
+            WHERE e.start_time >= %s
             {archive_where}
         """, (cutoff_date,))
         
@@ -3260,7 +3334,7 @@ async def get_application_usage_stats(
             WITH recent_usage AS (
                 SELECT DISTINCT application_name 
                 FROM application_usage_events 
-                WHERE start_time >= $1
+                WHERE start_time >= %s
             )
             SELECT COUNT(DISTINCT a.data->>'name')
             FROM applications a
@@ -3833,8 +3907,8 @@ async def get_device_application_usage(
                 MIN(start_time) as first_seen,
                 AVG(duration_seconds) as avg_session
             FROM application_usage_events
-            WHERE device_id = $1
-                AND start_time >= $2
+            WHERE device_id = %s
+                AND start_time >= %s
             GROUP BY application_name
             ORDER BY total_seconds DESC
         """, (serial_number, cutoff_date))
@@ -3861,8 +3935,8 @@ async def get_device_application_usage(
                 COUNT(*) as launch_count,
                 COUNT(DISTINCT application_name) as apps_used
             FROM application_usage_events
-            WHERE device_id = $1
-                AND start_time >= $2
+            WHERE device_id = %s
+                AND start_time >= %s
                 AND username IS NOT NULL
                 AND username != ''
             GROUP BY username
@@ -3887,8 +3961,8 @@ async def get_device_application_usage(
                 COUNT(*) as total_launches,
                 COUNT(DISTINCT username) as unique_users
             FROM application_usage_events
-            WHERE device_id = $1
-                AND start_time >= $2
+            WHERE device_id = %s
+                AND start_time >= %s
         """, (serial_number, cutoff_date))
         
         summary_row = cursor.fetchone()
