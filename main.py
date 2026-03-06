@@ -1721,6 +1721,7 @@ async def get_bulk_applications(
     
     By default, archived devices are excluded. Use includeArchived=true to include them.
     """
+    conn = None
     try:
         logger.info(f"Fetching bulk applications (loadAll={loadAll}, includeArchived={include_archived}, filters={dict(request.query_params)})")
         
@@ -1783,10 +1784,12 @@ async def get_bulk_applications(
         cursor.execute(query, tuple(query_params))
         rows = cursor.fetchall()
         conn.close()
+        conn = None
         
         logger.info(f"Retrieved {len(rows)} devices with applications data")
         
-        # Process and flatten applications
+        # Process and flatten applications - process one device at a time
+        # to limit peak memory (each device's apps_data is released after processing)
         all_applications = []
         
         for row in rows:
@@ -1805,7 +1808,10 @@ async def get_bulk_applications(
                 elif isinstance(apps_data, list):
                     installed_apps = apps_data
                 
-                # Flatten each application
+                last_seen_iso = last_seen.isoformat() if last_seen else None
+                collected_at_iso = collected_at.isoformat() if collected_at else None
+                
+                # Flatten each application - only extract needed fields (no raw copy)
                 for idx, app in enumerate(installed_apps):
                     app_name = app.get('name') or app.get('displayName') or 'Unknown Application'
                     app_publisher = app.get('publisher') or app.get('signed_by') or app.get('vendor') or 'Unknown'
@@ -1814,8 +1820,7 @@ async def get_bulk_applications(
                     app_size = app.get('size') or app.get('estimatedSize')
                     app_install_date = app.get('installDate') or app.get('install_date') or app.get('last_modified')
                     
-                    # Apply application-level filters (if provided)
-                    # Note: Using substring matching to be more inclusive (shows "Bifrost" AND "Bifrost Extension" when "Bifrost" selected)
+                    # Apply application-level filters
                     if app_name_list and not any(name.lower() in app_name.lower() for name in app_name_list):
                         continue
                     if publisher_list and not any(pub.lower() in app_publisher.lower() for pub in publisher_list):
@@ -1836,8 +1841,8 @@ async def get_bulk_applications(
                         'deviceId': device_uuid,
                         'deviceName': device_display_name,
                         'serialNumber': serial_number,
-                        'lastSeen': last_seen.isoformat() if last_seen else None,
-                        'collectedAt': collected_at.isoformat() if collected_at else None,
+                        'lastSeen': last_seen_iso,
+                        'collectedAt': collected_at_iso,
                         'name': app_name,
                         'version': app_version,
                         'vendor': app_publisher,
@@ -1866,6 +1871,12 @@ async def get_bulk_applications(
     except Exception as e:
         logger.error(f"Failed to get bulk applications: {e}")
         raise HTTPException(status_code=500, detail=f"Failed to retrieve bulk applications: {str(e)}")
+    finally:
+        if conn:
+            try:
+                conn.close()
+            except Exception:
+                pass
 
 @app.get("/api/devices/hardware", dependencies=[Depends(verify_authentication)], tags=["fleet"])
 async def get_bulk_hardware(
@@ -3451,12 +3462,15 @@ async def get_event_payload(event_id: int):
         raise HTTPException(status_code=500, detail=f"Failed to retrieve event payload: {str(e)}")
 
 
-@app.get("/api/stats/applications/usage", dependencies=[Depends(verify_authentication)])
+@app.get("/api/stats/applications/usage", dependencies=[Depends(verify_authentication)], deprecated=True)
 async def get_application_usage_stats(
     days: int = Query(default=30, ge=1, le=365, description="Number of days to look back for usage data"),
     include_archived: bool = Query(default=False, alias="includeArchived")
 ):
     """
+    DEPRECATED: This endpoint queries the empty application_usage_events table.
+    Use GET /api/devices/applications/usage instead, which extracts usage from JSONB.
+    
     Get aggregated application usage statistics for fleet-wide analytics.
     
     Returns:
@@ -3719,7 +3733,7 @@ async def get_fleet_application_usage(
             WITH device_usage AS (
                 SELECT 
                     d.serial_number,
-                    a.data->'usage' as usage_data,
+                    COALESCE(a.data->'usage', a.data->'applicationUsage') as usage_data,
                     a.data->'installedApplications' as installed_apps,
                     a.collected_at
                 FROM applications a
@@ -3762,7 +3776,10 @@ async def get_fleet_application_usage(
                 ) as session
                 WHERE du.usage_data IS NOT NULL 
                   AND du.usage_data != 'null'::jsonb
-                  AND (du.usage_data->>'isCaptureEnabled')::boolean = true
+                  AND (
+                      (du.usage_data->>'isCaptureEnabled')::boolean = true
+                      OR du.usage_data->>'captureMethod' IS NOT NULL
+                  )
                   AND session->>'name' IS NOT NULL AND session->>'name' != ''
             ),
             sessions_extracted AS (
@@ -3895,14 +3912,17 @@ async def get_fleet_application_usage(
                     LEFT JOIN inventory inv ON inv.device_id = d.serial_number,
                     LATERAL jsonb_array_elements(
                         CASE 
-                            WHEN a.data->'usage'->'activeSessions' IS NOT NULL 
-                                 AND jsonb_typeof(a.data->'usage'->'activeSessions') = 'array'
-                            THEN a.data->'usage'->'activeSessions'
+                            WHEN COALESCE(a.data->'usage', a.data->'applicationUsage')->'activeSessions' IS NOT NULL 
+                                 AND jsonb_typeof(COALESCE(a.data->'usage', a.data->'applicationUsage')->'activeSessions') = 'array'
+                            THEN COALESCE(a.data->'usage', a.data->'applicationUsage')->'activeSessions'
                             ELSE '[]'::jsonb
                         END
                     ) as session
                     WHERE a.collected_at >= %s
-                        AND (a.data->'usage'->>'isCaptureEnabled')::boolean = true
+                        AND (
+                            (COALESCE(a.data->'usage', a.data->'applicationUsage')->>'isCaptureEnabled')::boolean = true
+                            OR COALESCE(a.data->'usage', a.data->'applicationUsage')->>'captureMethod' IS NOT NULL
+                        )
                         AND session->>'name' IS NOT NULL AND session->>'name' != ''
                         {archive_filter}
                         {inventory_filter}
@@ -4012,14 +4032,17 @@ async def get_fleet_application_usage(
                         INNER JOIN devices d ON a.device_id = d.serial_number,
                         LATERAL jsonb_array_elements(
                             CASE 
-                                WHEN a.data->'usage'->'activeSessions' IS NOT NULL 
-                                     AND jsonb_typeof(a.data->'usage'->'activeSessions') = 'array'
-                                THEN a.data->'usage'->'activeSessions'
+                                WHEN COALESCE(a.data->'usage', a.data->'applicationUsage')->'activeSessions' IS NOT NULL 
+                                     AND jsonb_typeof(COALESCE(a.data->'usage', a.data->'applicationUsage')->'activeSessions') = 'array'
+                                THEN COALESCE(a.data->'usage', a.data->'applicationUsage')->'activeSessions'
                                 ELSE '[]'::jsonb
                             END
                         ) as session
                         WHERE d.archived = FALSE
-                          AND (a.data->'usage'->>'isCaptureEnabled')::boolean = true
+                          AND (
+                              (COALESCE(a.data->'usage', a.data->'applicationUsage')->>'isCaptureEnabled')::boolean = true
+                              OR COALESCE(a.data->'usage', a.data->'applicationUsage')->>'captureMethod' IS NOT NULL
+                          )
                     )
                     SELECT 
                         ia.app_name,
@@ -4148,12 +4171,16 @@ async def get_fleet_application_usage(
         raise HTTPException(status_code=500, detail=f"Failed to retrieve fleet application usage: {str(e)}")
 
 
-@app.get("/api/device/{serial_number}/applications/usage", dependencies=[Depends(verify_authentication)])
+@app.get("/api/device/{serial_number}/applications/usage", dependencies=[Depends(verify_authentication)], deprecated=True)
 async def get_device_application_usage(
     serial_number: str,
     days: int = Query(default=30, ge=1, le=365, description="Number of days to look back for usage data")
 ):
     """
+    DEPRECATED: This endpoint queries the empty application_usage_events table.
+    Use GET /api/device/{serial_number} instead — the applications module JSONB
+    already contains usage data (activeSessions, captureMethod, etc.).
+    
     Get application usage statistics for a specific device.
     
     Returns usage data collected via kernel process telemetry for the specified device.
