@@ -1535,7 +1535,7 @@ async def get_device_module(device_id: str, module_name: str):
     
     Supports all module types:
     - applications, hardware, installs, network, security
-    - inventory, management, profiles, system
+    - inventory, management, system
     
     Used for:
     1. Background progressive loading (after fast info load)
@@ -1545,7 +1545,7 @@ async def get_device_module(device_id: str, module_name: str):
         # Validate module name
         valid_modules = [
             "applications", "hardware", "installs", "network", "security",
-            "inventory", "management", "profiles", "system", "displays",
+            "inventory", "management", "system", "displays",
             "printers", "peripherals", "identity"
         ]
         
@@ -1601,6 +1601,100 @@ async def get_device_module(device_id: str, module_name: str):
     except Exception as e:
         logger.error(f"Failed to get module {module_name} for {device_id}: {e}")
         raise HTTPException(status_code=500, detail=f"Failed to retrieve module: {str(e)}")
+
+
+@app.get("/api/devices/applications/filters", dependencies=[Depends(verify_authentication)], tags=["fleet"])
+async def get_applications_filters(
+    include_archived: bool = Query(default=False, alias="includeArchived")
+):
+    """
+    Lightweight endpoint for application filter options.
+    
+    Returns unique application names, publishers, categories, and inventory
+    filter values using SQL DISTINCT queries — without downloading all records.
+    Also returns a lightweight device list (serial, name, inventory fields)
+    for the "missing" report mode.
+    
+    This replaces the pattern of calling /api/devices/applications?loadAll=true
+    and processing 200K+ records client-side.
+    """
+    try:
+        logger.info(f"Fetching applications filter options (includeArchived={include_archived})")
+        
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        
+        # 1. Extract unique app names, publishers, categories via JSONB unnesting
+        options_query = load_sql("devices/applications_filter_options")
+        cursor.execute(options_query, {"include_archived": include_archived})
+        option_rows = cursor.fetchall()
+        
+        app_names = set()
+        windows_app_names = set()
+        mac_app_names = set()
+        publishers = set()
+        categories = set()
+        
+        for app_name, publisher, category, platform in option_rows:
+            if app_name and app_name.strip():
+                app_names.add(app_name.strip())
+                if platform in ('Windows NT', 'Windows'):
+                    windows_app_names.add(app_name.strip())
+                elif platform in ('Darwin', 'macOS'):
+                    mac_app_names.add(app_name.strip())
+            if publisher and publisher.strip():
+                publishers.add(publisher.strip())
+            if category and category.strip():
+                categories.add(category.strip())
+        
+        # 2. Get lightweight device list with inventory metadata
+        devices_query = load_sql("devices/applications_filter_devices")
+        cursor.execute(devices_query, {"include_archived": include_archived})
+        device_rows = cursor.fetchall()
+        
+        conn.close()
+        
+        usages = set()
+        catalogs = set()
+        locations = set()
+        devices = []
+        
+        for serial, device_name, usage, catalog, location in device_rows:
+            devices.append({
+                'serialNumber': serial,
+                'name': device_name or serial,
+                'usage': usage or '',
+                'catalog': catalog or '',
+                'location': location or '',
+                'room': location or ''
+            })
+            if usage:
+                usages.add(usage)
+            if catalog:
+                catalogs.add(catalog)
+            if location:
+                locations.add(location)
+        
+        logger.info(f"Applications filters: {len(app_names)} unique apps, {len(publishers)} publishers, {len(devices)} devices")
+        
+        return {
+            'applicationNames': sorted(app_names),
+            'windowsApplicationNames': sorted(windows_app_names),
+            'macApplicationNames': sorted(mac_app_names),
+            'publishers': sorted(publishers),
+            'categories': sorted(categories),
+            'usages': sorted(usages),
+            'catalogs': sorted(catalogs),
+            'locations': sorted(locations),
+            'rooms': sorted(locations),
+            'fleets': [],
+            'devices': devices,
+            'devicesWithData': len(devices)
+        }
+        
+    except Exception as e:
+        logger.error(f"Failed to get applications filters: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to retrieve applications filters: {str(e)}")
 
 
 @app.get("/api/devices/applications", dependencies=[Depends(verify_authentication)])
@@ -1758,8 +1852,7 @@ async def get_bulk_applications(
                         'catalog': catalog,
                         'location': location,
                         'assetTag': asset_tag,
-                        'platform': platform,
-                        'raw': app
+                        'platform': platform
                     })
             
             except Exception as e:
@@ -1824,6 +1917,38 @@ async def get_bulk_hardware(
                 # Extract hardware details
                 hw_details = hardware_data if isinstance(hardware_data, dict) else {}
                 
+                # Pre-extract fields the frontend needs (eliminates raw blob)
+                processor_data = hw_details.get('processor') or hw_details.get('cpu')
+                memory_data = hw_details.get('memory') or hw_details.get('totalMemory') or hw_details.get('physicalMemory')
+                graphics_data = hw_details.get('graphics') or hw_details.get('gpu') or hw_details.get('displayAdapter')
+                storage_data = hw_details.get('storage') or hw_details.get('drives')
+                
+                # Slim storage to summary only (removes rootDirectories tree which is ~40KB per device)
+                slim_storage = None
+                if storage_data:
+                    if isinstance(storage_data, list):
+                        slim_storage = [{
+                            'name': d.get('name'),
+                            'type': d.get('type'),
+                            'capacity': d.get('capacity') or d.get('size'),
+                            'freeSpace': d.get('freeSpace') or d.get('free_space'),
+                            'health': d.get('health'),
+                            'interface': d.get('interface'),
+                            'isInternal': d.get('isInternal'),
+                        } for d in storage_data]
+                    elif isinstance(storage_data, dict):
+                        slim_storage = storage_data
+                
+                # Slim processor to summary fields only
+                slim_processor = processor_data
+                if isinstance(processor_data, dict):
+                    slim_processor = {
+                        'name': processor_data.get('name') or processor_data.get('model') or processor_data.get('brand'),
+                        'cores': processor_data.get('cores') or processor_data.get('core_count') or processor_data.get('logicalCores'),
+                        'speed': processor_data.get('speed') or processor_data.get('frequency') or processor_data.get('currentSpeed'),
+                        'architecture': processor_data.get('architecture'),
+                    }
+                
                 all_hardware.append({
                     'serialNumber': serial_number,
                     'deviceId': device_uuid,
@@ -1832,14 +1957,15 @@ async def get_bulk_hardware(
                     'collectedAt': collected_at.isoformat() if collected_at else None,
                     'manufacturer': hw_details.get('manufacturer') or hw_details.get('systemManufacturer'),
                     'model': hw_details.get('model') or hw_details.get('systemProductName'),
-                    'cpu': hw_details.get('processor') or hw_details.get('cpu'),
-                    'memory': hw_details.get('totalMemory') or hw_details.get('physicalMemory'),
-                    'storage': hw_details.get('storage') or hw_details.get('drives'),
-                    'gpu': hw_details.get('gpu') or hw_details.get('displayAdapter'),
+                    'processor': slim_processor,
+                    'memory': memory_data,
+                    'storage': slim_storage,
+                    'graphics': graphics_data,
                     'osName': os_info.get('name'),
                     'osVersion': os_info.get('version') or os_info.get('displayVersion'),
                     'architecture': os_info.get('architecture'),
-                    'raw': hardware_data
+                    'inventory': hw_details.get('inventory', {}),
+                    'assetTag': (hw_details.get('inventory') or {}).get('assetTag') or (hw_details.get('inventory') or {}).get('asset_tag'),
                 })
             
             except Exception as e:
@@ -1853,6 +1979,225 @@ async def get_bulk_hardware(
     except Exception as e:
         logger.error(f"Failed to get bulk hardware: {e}")
         raise HTTPException(status_code=500, detail=f"Failed to retrieve bulk hardware: {str(e)}")
+
+
+@app.get("/api/devices/installs/filters", dependencies=[Depends(verify_authentication)], tags=["fleet"])
+async def get_installs_filters(
+    include_archived: bool = Query(default=False, alias="includeArchived")
+):
+    """
+    Lightweight endpoint for installs filter options.
+    
+    Returns unique managed install names, inventory filter values, config metadata,
+    and a lightweight device list with pre-computed status counts.
+    
+    This replaces downloading the full /api/devices/installs/full (52MB+) just
+    to extract filter options client-side.
+    """
+    try:
+        logger.info(f"Fetching installs filter options (includeArchived={include_archived})")
+        
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        
+        query = load_sql("devices/installs_filter_options")
+        cursor.execute(query, {"include_archived": include_archived})
+        rows = cursor.fetchall()
+        conn.close()
+        
+        managed_installs = set()
+        cimian_installs = set()
+        munki_installs = set()
+        usages = set()
+        catalogs = set()
+        rooms = set()
+        fleets = set()
+        platforms = set()
+        software_repos = set()
+        manifests = set()
+        devices = []
+        
+        for row in rows:
+            serial, device_name, usage, catalog, location, asset_tag, fleet, platform, installs_data, last_seen = row
+            
+            if usage:
+                usages.add(usage)
+            if catalog:
+                catalogs.add(catalog)
+            if location:
+                rooms.add(location)
+            if fleet:
+                fleets.add(fleet)
+            if platform:
+                normalized_platform = 'Macintosh' if platform == 'Darwin' else 'Windows' if platform == 'Windows NT' else platform
+                platforms.add(normalized_platform)
+            
+            installs_obj = installs_data if isinstance(installs_data, dict) else {}
+            cimian_data = installs_obj.get('cimian', {})
+            munki_data = installs_obj.get('munki', {})
+            
+            # Extract unique item names
+            for item in cimian_data.get('items', []):
+                name = item.get('itemName') or item.get('displayName')
+                if name and name not in ('managed_apps', 'managed_profiles'):
+                    managed_installs.add(name.strip())
+                    cimian_installs.add(name.strip())
+            
+            for item in munki_data.get('items', []):
+                name = item.get('name') or item.get('displayName')
+                if name:
+                    managed_installs.add(name.strip())
+                    munki_installs.add(name.strip())
+            
+            # Extract config metadata
+            config = cimian_data.get('config', {})
+            if config.get('SoftwareRepoURL'):
+                software_repos.add(config['SoftwareRepoURL'])
+            if config.get('softwareRepoUrl'):
+                software_repos.add(config['softwareRepoUrl'])
+            if config.get('ClientIdentifier'):
+                manifests.add(config['ClientIdentifier'])
+            if config.get('clientIdentifier'):
+                manifests.add(config['clientIdentifier'])
+            
+            munki_repo = munki_data.get('softwareRepoURL')
+            if munki_repo:
+                software_repos.add(munki_repo)
+            munki_client = munki_data.get('clientIdentifier')
+            if munki_client:
+                manifests.add(munki_client)
+            
+            # Pre-compute item status counts
+            items = cimian_data.get('items', []) or munki_data.get('items', [])
+            installed_count = 0
+            pending_count = 0
+            error_count = 0
+            warning_count = 0
+            removed_count = 0
+            
+            for item in items:
+                status = (item.get('currentStatus') or item.get('status') or '').lower()
+                if status in ('installed', 'install-of-', 'install_of', 'present'):
+                    installed_count += 1
+                elif status in ('will-be-installed', 'will_be_installed', 'pending', 'downloading', 'installing'):
+                    pending_count += 1
+                elif status in ('install-failed', 'install_failed', 'error', 'failed'):
+                    error_count += 1
+                elif status in ('warning', 'needs-update', 'needs_update'):
+                    warning_count += 1
+                elif status in ('removed', 'will-be-removed', 'will_be_removed', 'removal-of-'):
+                    removed_count += 1
+                else:
+                    installed_count += 1  # Default to installed
+            
+            # Determine config type
+            is_cimian = bool(cimian_data)
+            config_type = 'Cimian' if is_cimian else ('Munki' if munki_data else 'None')
+            
+            # Get most recent session
+            sessions = cimian_data.get('sessions', []) or munki_data.get('sessions', [])
+            latest_session = sessions[0] if sessions else None
+            
+            # Build device record with slimmed items — keep only fields the frontend needs
+            # for status categorization, error/warning widgets, and drill-down tables.
+            # Drops: type, category, developer, updateCount, failureCount, installCount,
+            # mappedStatus, warningCount, installMethod, pendingReason, totalSessions,
+            # hasInstallLoop, recentAttempts, lastAttemptStatus, lastSeenInSession, installLoopDetected
+            ITEM_KEEP_FIELDS = ('id', 'itemName', 'displayName', 'name', 'itemType',
+                                'currentStatus', 'status', 'lastError', 'lastWarning',
+                                'latestVersion', 'installedVersion', 'lastUpdate', 'lastAttemptTime')
+            
+            cimian_slim = None
+            if cimian_data:
+                slim_items = [
+                    {k: item.get(k) for k in ITEM_KEEP_FIELDS if item.get(k) is not None and item.get(k) != ''}
+                    for item in cimian_data.get('items', [])
+                ]
+                cimian_slim = {
+                    'config': config,
+                    'version': cimian_data.get('version'),
+                    'status': cimian_data.get('status'),
+                    'sessions': (cimian_data.get('sessions') or [])[:5],
+                    'items': slim_items,
+                    'itemCounts': {
+                        'total': len(cimian_data.get('items', [])),
+                        'installed': installed_count,
+                        'pending': pending_count,
+                        'error': error_count,
+                        'warning': warning_count,
+                        'removed': removed_count,
+                    }
+                }
+            
+            munki_slim = None
+            if munki_data:
+                slim_munki_items = [
+                    {k: item.get(k) for k in ITEM_KEEP_FIELDS if item.get(k) is not None and item.get(k) != ''}
+                    for item in munki_data.get('items', [])
+                ]
+                munki_slim = {
+                    'version': munki_data.get('version'),
+                    'status': munki_data.get('status'),
+                    'manifestName': munki_data.get('manifestName'),
+                    'clientIdentifier': munki_data.get('clientIdentifier'),
+                    'softwareRepoURL': munki_data.get('softwareRepoURL'),
+                    'lastRunSuccess': munki_data.get('lastRunSuccess'),
+                    'items': slim_munki_items,
+                    'itemCounts': {
+                        'total': len(munki_data.get('items', [])),
+                        'installed': installed_count,
+                        'pending': pending_count,
+                        'error': error_count,
+                        'warning': warning_count,
+                        'removed': removed_count,
+                    }
+                }
+            
+            devices.append({
+                'serialNumber': serial,
+                'deviceName': device_name or serial,
+                'deviceId': None,
+                'lastSeen': last_seen.isoformat() if last_seen else None,
+                'platform': platform,
+                'modules': {
+                    'installs': {
+                        'cimian': cimian_slim,
+                        'munki': munki_slim,
+                    },
+                    'inventory': {
+                        'deviceName': device_name,
+                        'usage': usage,
+                        'catalog': catalog,
+                        'location': location,
+                        'assetTag': asset_tag,
+                        'fleet': fleet,
+                    }
+                }
+            })
+        
+        logger.info(f"Installs filters: {len(managed_installs)} unique installs, {len(devices)} devices")
+        
+        return {
+            'success': True,
+            'managedInstalls': sorted(managed_installs),
+            'cimianInstalls': sorted(cimian_installs),
+            'munkiInstalls': sorted(munki_installs),
+            'otherInstalls': [],
+            'usages': sorted(usages),
+            'catalogs': sorted(catalogs),
+            'rooms': sorted(rooms),
+            'fleets': sorted(fleets),
+            'platforms': sorted(platforms),
+            'softwareRepos': sorted(software_repos),
+            'manifests': sorted(manifests),
+            'devicesWithData': len(devices),
+            'devices': devices
+        }
+        
+    except Exception as e:
+        logger.error(f"Failed to get installs filters: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to retrieve installs filters: {str(e)}")
+
 
 @app.get("/api/devices/installs", dependencies=[Depends(verify_authentication)], tags=["fleet"])
 async def get_bulk_installs(
@@ -1923,8 +2268,7 @@ async def get_bulk_installs(
                         'assetTag': asset_tag,
                         'fleet': fleet,
                         'platform': platform or 'Windows',
-                        'source': 'cimian',
-                        'raw': item
+                        'source': 'cimian'
                     })
                 
                 # Flatten Munki installs (macOS)
@@ -1949,8 +2293,7 @@ async def get_bulk_installs(
                         'assetTag': asset_tag,
                         'fleet': fleet,
                         'platform': platform or 'macOS',
-                        'source': 'munki',
-                        'raw': item
+                        'source': 'munki'
                     })
             
             except Exception as e:
@@ -2340,90 +2683,6 @@ async def search_fleet_certificates(
         logger.error(f"Failed to search fleet certificates: {e}")
         raise HTTPException(status_code=500, detail=f"Failed to search certificates: {str(e)}")
 
-@app.get("/api/devices/profiles", dependencies=[Depends(verify_authentication)], tags=["fleet"])
-async def get_bulk_profiles(
-    include_archived: bool = Query(default=False, alias="includeArchived", description="Include archived devices in results")
-):
-    """
-    **DEPRECATED:** This endpoint is deprecated. Profiles functionality has been integrated into Management module.
-    
-    **Use `/api/devices/management` instead** for profile data.
-    
-    This endpoint is maintained for backward compatibility but will be removed in a future version.
-    
-    Bulk profiles endpoint for fleet-wide configuration profiles.
-    
-    Returns devices with MDM profiles and configuration policies.
-    Used by /devices/profiles page for fleet-wide profile visibility.
-    By default, archived devices are excluded. Use includeArchived=true to include them.
-    
-    **Response includes:**
-    - Device identifiers and inventory
-    - Profile data (MDM, Intune, security configurations)
-    - Profile metadata and configuration details
-    
-    **Migration Guide:**
-    - Replace `/api/devices/profiles` calls with `/api/devices/management`
-    - Profile data is available in the `management` module of device responses
-    - Use `/api/device/{serial}/modules/management` for individual device profiles
-    """
-    try:
-        logger.info("Fetching bulk profiles data")
-        
-        conn = get_db_connection()
-        cursor = conn.cursor()
-        
-        # Load SQL from external file - uses parameterized archive filter
-        query = load_sql("devices/bulk_profiles")
-        
-        cursor.execute(query, {"include_archived": include_archived})
-        rows = cursor.fetchall()
-        
-        logger.info(f"Retrieved {len(rows)} devices with profiles data")
-        
-        devices = []
-        for row in rows:
-            try:
-                serial_number, device_uuid, last_seen, profiles_data, profiles_collected_at, profiles_updated_at, device_name, computer_name, usage, catalog, location, asset_tag = row
-                
-                # Parse profiles_data JSONB
-                profile_data = json.loads(profiles_data) if isinstance(profiles_data, str) else profiles_data or {}
-                
-                # Count policies from profiles data if available
-                intune_count = len(profile_data.get('intune_policies', profile_data.get('intunePolicies', [])))
-                security_count = len(profile_data.get('security_policies', profile_data.get('securityPolicies', [])))
-                mdm_count = len(profile_data.get('mdm_configurations', profile_data.get('mdmConfigurations', [])))
-                total_policies = intune_count + security_count + mdm_count
-                
-                devices.append({
-                    'id': serial_number,
-                    'deviceId': serial_number,
-                    'deviceName': device_name or computer_name or serial_number,
-                    'serialNumber': serial_number,
-                    'assetTag': asset_tag,
-                    'lastSeen': last_seen.isoformat() if last_seen else None,
-                    'collectedAt': profiles_updated_at.isoformat() if profiles_updated_at else None,
-                    'usage': usage,
-                    'catalog': catalog,
-                    'location': location,
-                    'totalPolicies': total_policies,
-                    'intunePolicyCount': intune_count,
-                    'securityPolicyCount': security_count,
-                    'mdmConfigCount': mdm_count,
-                    'raw': profile_data
-                })
-            except Exception as e:
-                logger.warning(f"Error processing profiles for device {row[0]}: {e}")
-                continue
-        
-        conn.close()
-        logger.info(f"Processed {len(devices)} devices with profiles data")
-        return devices
-        
-    except Exception as e:
-        logger.error(f"Failed to get bulk profiles: {e}")
-        raise HTTPException(status_code=500, detail=f"Failed to retrieve bulk profiles: {str(e)}")
-
 @app.get("/api/devices/management", dependencies=[Depends(verify_authentication)], tags=["fleet"])
 async def get_bulk_management(
     include_archived: bool = Query(default=False, alias="includeArchived", description="Include archived devices in results")
@@ -2527,6 +2786,15 @@ async def get_bulk_management(
                 if not enrollment_type:
                     enrollment_type = 'N/A'
                 
+                # Determine platform from provider
+                provider_lower = (provider or '').lower()
+                if provider in ('MicroMDM', 'NanoMDM', 'Apple', 'Mosyle', 'Kandji') or 'jamf' in provider_lower:
+                    device_platform = 'macOS'
+                elif provider == 'Microsoft Intune':
+                    device_platform = 'Windows'
+                else:
+                    device_platform = None
+                
                 devices.append({
                     'id': serial_number,
                     'deviceId': serial_number,
@@ -2543,11 +2811,23 @@ async def get_bulk_management(
                     'provider': provider,
                     'enrollmentStatus': enrollment_status,
                     'enrollmentType': enrollment_type,
+                    'platform': device_platform,
                     'intuneId': device_details.get('intuneDeviceId') or device_details.get('intune_device_id') or (management_data.get('device_identifiers', {}) or {}).get('uuid') or device_uuid or 'N/A',
                     'tenantName': tenant_details.get('tenantName') or tenant_details.get('tenant_name') or tenant_details.get('organization') or 'N/A',
                     'isEnrolled': is_enrolled,
-                    'raw': management_data
+                    # Pre-extracted fields (replaces raw blob)
+                    'autopilotConfig': management_data.get('autopilot_config') or management_data.get('autopilotConfig') if management_data else None,
+                    'osName': None  # populated below from system data if available
                 })
+                
+                # Try to populate osName from system data via a separate query if needed
+                # For now, set from management_data if system info is embedded
+                if management_data:
+                    sys_data = management_data.get('system', {})
+                    if sys_data:
+                        os_obj = sys_data.get('operatingSystem', {}) or sys_data.get('operating_system', {})
+                        if os_obj:
+                            devices[-1]['osName'] = os_obj.get('name')
             except Exception as e:
                 logger.warning(f"Error processing management for device {row[0]}: {e}")
                 continue
@@ -2606,8 +2886,7 @@ async def get_bulk_inventory(
                     'usage': usage,
                     'catalog': catalog,
                     'location': location,
-                    'department': department,
-                    'raw': inventory_data
+                    'department': department
                 })
             except Exception as e:
                 logger.warning(f"Error processing inventory for device {row[0]}: {e}")
@@ -2798,7 +3077,15 @@ async def get_bulk_peripherals(
                     'catalog': catalog,
                     'location': location,
                     'platform': platform,
-                    'raw': peripherals_data or {}
+                    # Pre-extracted peripheral categories (replaces raw blob)
+                    'usbDevices': (peripherals_data or {}).get('usb', {}).get('usb_devices', []) if isinstance(peripherals_data, dict) else [],
+                    'bluetoothDevices': (peripherals_data or {}).get('bluetooth', {}).get('bluetooth_devices', []) if isinstance(peripherals_data, dict) else [],
+                    'printers': (peripherals_data or {}).get('printers', {}).get('print_queues', []) if isinstance(peripherals_data, dict) else [],
+                    'cameras': (peripherals_data or {}).get('cameras', {}).get('camera_devices', []) if isinstance(peripherals_data, dict) else [],
+                    'audioDevices': (peripherals_data or {}).get('audio', {}).get('audio_devices', []) if isinstance(peripherals_data, dict) else [],
+                    'displayDevices': (peripherals_data or {}).get('displays', {}).get('monitors', []) if isinstance(peripherals_data, dict) else [],
+                    'inputDevices': (peripherals_data or {}).get('input', {}).get('input_devices', []) if isinstance(peripherals_data, dict) else [],
+                    'storageDevices': (peripherals_data or {}).get('storage', {}).get('storage_devices', []) if isinstance(peripherals_data, dict) else []
                 })
             except Exception as e:
                 logger.warning(f"Error processing peripherals for device {row[0]}: {e}")
