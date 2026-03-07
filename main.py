@@ -35,6 +35,11 @@ except ImportError:
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+# Dashboard response cache (in-memory, per-process, 15s TTL)
+# Avoids re-running heavy SQL on every 30s frontend poll
+_DASHBOARD_CACHE: dict = {}
+_DASHBOARD_CACHE_TTL = 15  # seconds
+
 # -----------------------------------------------------------------------------
 # SQL Query Loader - Load queries from external .sql files at startup
 # -----------------------------------------------------------------------------
@@ -679,6 +684,13 @@ async def get_dashboard_data(
     try:
         import time as _time
         _t0 = _time.monotonic()
+
+        # Check in-memory cache before hitting the database
+        _cache_key = (include_archived, events_limit)
+        _cached = _DASHBOARD_CACHE.get(_cache_key)
+        if _cached and (_t0 - _cached[1]) < _DASHBOARD_CACHE_TTL:
+            return _cached[0]
+
         conn = get_db_connection()
         cursor = conn.cursor()
         
@@ -783,7 +795,7 @@ async def get_dashboard_data(
         _t5 = _time.monotonic()
         logger.info(f"[DASHBOARD PERF] device transform: {_t5-_t4:.3f}s")
 
-        # === INSTALL STATS (single combined query) ===
+        # === INSTALL STATS - single-pass correlated subqueries (one scan of installs) ===
         install_stats = {
             "devicesWithErrors": 0, "devicesWithWarnings": 0,
             "totalErrorItems": 0, "totalWarningItems": 0,
@@ -792,53 +804,34 @@ async def get_dashboard_data(
         try:
             cursor.execute("""
                 SELECT
-                    SUM(CASE WHEN category = 'cimian_error' THEN cnt ELSE 0 END),
-                    SUM(CASE WHEN category = 'munki_error' THEN cnt ELSE 0 END),
-                    SUM(CASE WHEN category = 'cimian_warning' THEN cnt ELSE 0 END),
-                    SUM(CASE WHEN category = 'munki_warning' THEN cnt ELSE 0 END),
-                    MAX(CASE WHEN category = 'has_data' THEN cnt ELSE 0 END)
-                FROM (
-                    SELECT 'cimian_error' AS category, COUNT(*) AS cnt
-                    FROM installs i
-                    INNER JOIN devices d ON d.serial_number = i.device_id AND d.archived = FALSE
-                    CROSS JOIN LATERAL jsonb_array_elements(i.data->'cimian'->'items') AS item
-                    WHERE LOWER(item->>'currentStatus') ~ '(error|failed|problem|install-error)'
-
-                    UNION ALL
-                    SELECT 'munki_error', COUNT(*)
-                    FROM installs i
-                    INNER JOIN devices d ON d.serial_number = i.device_id AND d.archived = FALSE
-                    CROSS JOIN LATERAL jsonb_array_elements(i.data->'munki'->'items') AS item
-                    WHERE LOWER(item->>'status') ~ '(error|failed)'
-
-                    UNION ALL
-                    SELECT 'cimian_warning', COUNT(*)
-                    FROM installs i
-                    INNER JOIN devices d ON d.serial_number = i.device_id AND d.archived = FALSE
-                    CROSS JOIN LATERAL jsonb_array_elements(i.data->'cimian'->'items') AS item
-                    WHERE LOWER(item->>'currentStatus') ~ '(warning|needs-attention)'
-
-                    UNION ALL
-                    SELECT 'munki_warning', COUNT(*)
-                    FROM installs i
-                    INNER JOIN devices d ON d.serial_number = i.device_id AND d.archived = FALSE
-                    CROSS JOIN LATERAL jsonb_array_elements(i.data->'munki'->'items') AS item
-                    WHERE LOWER(item->>'status') LIKE '%warning%'
-
-                    UNION ALL
-                    SELECT 'has_data', CASE WHEN EXISTS(
-                        SELECT 1 FROM installs i2
-                        INNER JOIN devices d2 ON d2.serial_number = i2.device_id AND d2.archived = FALSE
-                        WHERE jsonb_array_length(COALESCE(i2.data->'cimian'->'items', '[]'::jsonb)) > 0
-                           OR jsonb_array_length(COALESCE(i2.data->'munki'->'items', '[]'::jsonb)) > 0
-                    ) THEN 1 ELSE 0 END
-                ) sub
+                    COALESCE(SUM(
+                        (SELECT COUNT(*) FROM jsonb_array_elements(COALESCE(i.data->'cimian'->'items','[]'::jsonb)) item
+                         WHERE LOWER(item->>'currentStatus') ~ '(error|failed|problem|install-error)')
+                        +
+                        (SELECT COUNT(*) FROM jsonb_array_elements(COALESCE(i.data->'munki'->'items','[]'::jsonb)) item
+                         WHERE LOWER(item->>'status') ~ '(error|failed)')
+                    ), 0) AS total_errors,
+                    COALESCE(SUM(
+                        (SELECT COUNT(*) FROM jsonb_array_elements(COALESCE(i.data->'cimian'->'items','[]'::jsonb)) item
+                         WHERE LOWER(item->>'currentStatus') ~ '(warning|needs-attention)')
+                        +
+                        (SELECT COUNT(*) FROM jsonb_array_elements(COALESCE(i.data->'munki'->'items','[]'::jsonb)) item
+                         WHERE LOWER(item->>'status') LIKE '%%warning%%')
+                    ), 0) AS total_warnings,
+                    COUNT(*) > 0 AS has_data
+                FROM installs i
+                INNER JOIN devices d ON d.serial_number = i.device_id
+                WHERE d.archived = FALSE
+                  AND (
+                      jsonb_typeof(i.data->'cimian'->'items') = 'array'
+                      OR jsonb_typeof(i.data->'munki'->'items') = 'array'
+                  )
             """)
             stats_row = cursor.fetchone()
             if stats_row:
-                install_stats["totalErrorItems"] = (stats_row[0] or 0) + (stats_row[1] or 0)
-                install_stats["totalWarningItems"] = (stats_row[2] or 0) + (stats_row[3] or 0)
-                install_stats["hasInstallData"] = bool(stats_row[4])
+                install_stats["totalErrorItems"] = int(stats_row[0] or 0)
+                install_stats["totalWarningItems"] = int(stats_row[1] or 0)
+                install_stats["hasInstallData"] = bool(stats_row[2])
         except Exception as stats_error:
             logger.warning(f"Failed to calculate install stats: {stats_error}")
 
@@ -883,7 +876,7 @@ async def get_dashboard_data(
 
         conn.close()
 
-        return {
+        result = {
             "devices": devices,
             "totalDevices": len(devices),
             "installStats": install_stats,
@@ -891,6 +884,11 @@ async def get_dashboard_data(
             "totalEvents": len(events),
             "lastUpdated": datetime.now(timezone.utc).isoformat()
         }
+
+        # Store in cache
+        _DASHBOARD_CACHE[_cache_key] = (result, _time.monotonic())
+
+        return result
         
     except Exception as e:
         logger.error(f"Failed to get dashboard data: {e}")
