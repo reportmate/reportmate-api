@@ -579,6 +579,40 @@ async def root():
         }
     }
 
+# Ensure performance indexes exist on startup
+_indexes_ensured = False
+
+@app.on_event("startup")
+async def ensure_performance_indexes():
+    """Create indexes needed for fast dashboard queries (idempotent)."""
+    global _indexes_ensured
+    if _indexes_ensured:
+        return
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        for stmt in [
+            "CREATE INDEX IF NOT EXISTS idx_events_timestamp_desc ON events(timestamp DESC)",
+            "CREATE INDEX IF NOT EXISTS idx_events_device_id ON events(device_id)",
+            "CREATE INDEX IF NOT EXISTS idx_installs_device_id ON installs(device_id)",
+            "CREATE INDEX IF NOT EXISTS idx_inventory_device_id ON inventory(device_id)",
+            "CREATE INDEX IF NOT EXISTS idx_system_device_id ON system(device_id)",
+            "CREATE INDEX IF NOT EXISTS idx_hardware_device_id ON hardware(device_id)",
+            "CREATE INDEX IF NOT EXISTS idx_network_device_id ON network(device_id)",
+            "CREATE INDEX IF NOT EXISTS idx_devices_serial ON devices(serial_number)",
+            "CREATE INDEX IF NOT EXISTS idx_devices_archived ON devices(archived)",
+        ]:
+            try:
+                cursor.execute(stmt)
+            except Exception:
+                pass  # Index may already exist or table may not exist yet
+        conn.commit()
+        conn.close()
+        _indexes_ensured = True
+        logger.info("[STARTUP] Performance indexes ensured")
+    except Exception as e:
+        logger.warning(f"[STARTUP] Could not ensure indexes: {e}")
+
 @app.get("/api/health", tags=["health"])
 async def health_check():
     """
@@ -641,24 +675,16 @@ async def get_dashboard_data(
             "lastUpdated": str          # ISO8601 timestamp
         }
     """
+    import time as _time
+    t_start = _time.monotonic()
     conn = None
     try:
         conn = get_db_connection()
         cursor = conn.cursor()
+        t_db = _time.monotonic()
         
         # === DEVICES QUERY (from /api/devices) ===
         archive_filter_where = "" if include_archived else "WHERE d.archived = FALSE"
-        
-        # Get total device count
-        total_devices = 0
-        try:
-            archive_filter = "" if include_archived else "WHERE archived = FALSE"
-            cursor.execute(f"SELECT COUNT(*) FROM devices {archive_filter}")
-            total_result = cursor.fetchone()
-            if total_result and total_result[0] is not None:
-                total_devices = int(total_result[0])
-        except Exception as count_error:
-            logger.warning(f"Failed to get total device count: {count_error}")
 
         # Fetch all devices with inventory and system data (NO installs - too large)
         # Install stats are calculated via optimized SQL queries below
@@ -811,146 +837,84 @@ async def get_dashboard_data(
             }
             devices.append(device)
         
-        # === INSTALL STATS QUERY - OPTIMIZED FOR DASHBOARD ===
-        # Count ITEMS (not devices) with errors and warnings
-        # Includes both Cimian (Windows) and Munki (macOS) items
+        total_devices = len(devices)
+        t_devices = _time.monotonic()
+        logger.info(f"[DASHBOARD PERF] devices query + transform: {t_devices - t_db:.3f}s ({total_devices} devices)")
+        
+        # === INSTALL STATS - SINGLE OPTIMIZED QUERY ===
+        # Replaces 6 separate CROSS JOIN LATERAL queries with 1 combined query
         install_stats = {
             "devicesWithErrors": 0,
             "devicesWithWarnings": 0,
-            "totalErrorItems": 0,      # Total error items across all devices
-            "totalWarningItems": 0,    # Total warning items across all devices
-            "hasInstallData": False    # Whether any install data exists
+            "totalErrorItems": 0,
+            "totalWarningItems": 0,
+            "hasInstallData": False
         }
         
         try:
-            # Count total ERROR ITEMS from Cimian (Windows)
             cursor.execute("""
-                SELECT COUNT(*)
-                FROM devices d
-                INNER JOIN installs i ON d.serial_number = i.device_id
-                CROSS JOIN LATERAL jsonb_array_elements(i.data->'cimian'->'items') AS item
+                SELECT
+                    COALESCE(SUM(
+                        (SELECT COUNT(*) FROM jsonb_array_elements(i.data->'cimian'->'items') item
+                         WHERE LOWER(item->>'currentStatus') IN ('error','failed','problem','install-error')
+                           OR LOWER(item->>'currentStatus') LIKE '%%error%%'
+                           OR LOWER(item->>'currentStatus') LIKE '%%failed%%')
+                        +
+                        (SELECT COUNT(*) FROM jsonb_array_elements(i.data->'munki'->'items') item
+                         WHERE LOWER(item->>'status') LIKE '%%error%%'
+                           OR LOWER(item->>'status') LIKE '%%failed%%')
+                    ), 0) AS total_errors,
+                    COALESCE(SUM(
+                        (SELECT COUNT(*) FROM jsonb_array_elements(i.data->'cimian'->'items') item
+                         WHERE LOWER(item->>'currentStatus') LIKE '%%warning%%'
+                           OR LOWER(item->>'currentStatus') = 'needs-attention')
+                        +
+                        (SELECT COUNT(*) FROM jsonb_array_elements(i.data->'munki'->'items') item
+                         WHERE LOWER(item->>'status') LIKE '%%warning%%')
+                    ), 0) AS total_warnings,
+                    COUNT(*) > 0 AS has_data
+                FROM installs i
+                INNER JOIN devices d ON d.serial_number = i.device_id
                 WHERE d.archived = FALSE
-                    AND (
-                        LOWER(item->>'currentStatus') LIKE '%error%'
-                        OR LOWER(item->>'currentStatus') LIKE '%failed%'
-                        OR LOWER(item->>'currentStatus') = 'problem'
-                        OR LOWER(item->>'currentStatus') = 'install-error'
-                    )
+                  AND (
+                      jsonb_typeof(i.data->'cimian'->'items') = 'array'
+                      OR jsonb_typeof(i.data->'munki'->'items') = 'array'
+                  )
             """)
-            cimian_errors = cursor.fetchone()
-            if cimian_errors and cimian_errors[0]:
-                install_stats["totalErrorItems"] += cimian_errors[0]
+            stats_row = cursor.fetchone()
+            if stats_row:
+                install_stats["totalErrorItems"] = stats_row[0] or 0
+                install_stats["totalWarningItems"] = stats_row[1] or 0
+                install_stats["hasInstallData"] = bool(stats_row[2])
             
-            # Count total ERROR ITEMS from Munki (macOS)
-            cursor.execute("""
-                SELECT COUNT(*)
-                FROM devices d
-                INNER JOIN installs i ON d.serial_number = i.device_id
-                CROSS JOIN LATERAL jsonb_array_elements(i.data->'munki'->'items') AS item
-                WHERE d.archived = FALSE
-                    AND (
-                        LOWER(item->>'status') LIKE '%error%'
-                        OR LOWER(item->>'status') LIKE '%failed%'
-                    )
-            """)
-            munki_errors = cursor.fetchone()
-            if munki_errors and munki_errors[0]:
-                install_stats["totalErrorItems"] += munki_errors[0]
-            
-            # Count total WARNING ITEMS from Cimian (Windows)
-            # Note: 'pending' is NOT a warning - it's in the pending category
-            cursor.execute("""
-                SELECT COUNT(*)
-                FROM devices d
-                INNER JOIN installs i ON d.serial_number = i.device_id
-                CROSS JOIN LATERAL jsonb_array_elements(i.data->'cimian'->'items') AS item
-                WHERE d.archived = FALSE
-                    AND (
-                        LOWER(item->>'currentStatus') LIKE '%warning%'
-                        OR LOWER(item->>'currentStatus') = 'needs-attention'
-                    )
-            """)
-            cimian_warnings = cursor.fetchone()
-            if cimian_warnings and cimian_warnings[0]:
-                install_stats["totalWarningItems"] += cimian_warnings[0]
-            
-            # Count total WARNING ITEMS from Munki (macOS)
-            cursor.execute("""
-                SELECT COUNT(*)
-                FROM devices d
-                INNER JOIN installs i ON d.serial_number = i.device_id
-                CROSS JOIN LATERAL jsonb_array_elements(i.data->'munki'->'items') AS item
-                WHERE d.archived = FALSE
-                    AND LOWER(item->>'status') LIKE '%warning%'
-            """)
-            munki_warnings = cursor.fetchone()
-            if munki_warnings and munki_warnings[0]:
-                install_stats["totalWarningItems"] += munki_warnings[0]
-            
-            # Check if any install data exists (for hasInstallData flag)
-            cursor.execute("""
-                SELECT EXISTS(
-                    SELECT 1 FROM installs i
-                    INNER JOIN devices d ON d.serial_number = i.device_id
-                    WHERE d.archived = FALSE
-                    AND (
-                        jsonb_array_length(COALESCE(i.data->'cimian'->'items', '[]'::jsonb)) > 0
-                        OR jsonb_array_length(COALESCE(i.data->'munki'->'items', '[]'::jsonb)) > 0
-                    )
-                )
-            """)
-            has_data = cursor.fetchone()
-            install_stats["hasInstallData"] = has_data[0] if has_data else False
-            
-            logger.info(f"Install stats: {install_stats['totalErrorItems']} error items, {install_stats['totalWarningItems']} warning items, hasData={install_stats['hasInstallData']}")
+            t_stats = _time.monotonic()
+            logger.info(f"[DASHBOARD PERF] install stats: {t_stats - t_devices:.3f}s (errors={install_stats['totalErrorItems']}, warnings={install_stats['totalWarningItems']})")
         except Exception as stats_error:
             logger.warning(f"Failed to calculate install stats: {stats_error}")
-            # Keep zeros if query fails
+            t_stats = _time.monotonic()
         
-        # === EVENTS QUERY ===
-        # Fetch the last N events per event_type so the dashboard always has
-        # a pool of each type visible — prevents the widget appearing empty
-        # when recent activity is dominated by a single filtered type (e.g. info).
+        # === EVENTS QUERY - SIMPLIFIED ===
+        # Simple recent events with device name lookup via pre-built device name map
         events = []
-        per_type_limit = max(50, events_limit // 5)  # at least 50 per type
         try:
             cursor.execute("""
-                WITH ranked AS (
-                    SELECT
-                        e.id,
-                        e.device_id,
-                        COALESCE(
-                            NULLIF(NULLIF(i.data->>'deviceName', ''), 'Unknown'),
-                            NULLIF(NULLIF(i.data->>'device_name', ''), 'Unknown'),
-                            NULLIF(h.data->'system'->>'computer_name', ''),
-                            NULLIF(h.data->'system'->>'hostname', ''),
-                            NULLIF(n.data->>'hostname', '')
-                        ) as device_name,
-                        e.event_type,
-                        e.message,
-                        e.timestamp,
-                        ROW_NUMBER() OVER (
-                            PARTITION BY e.event_type
-                            ORDER BY e.timestamp DESC
-                        ) AS rn
-                    FROM events e
-                    LEFT JOIN inventory i ON e.device_id = i.device_id
-                    LEFT JOIN hardware h ON e.device_id = h.device_id
-                    LEFT JOIN network n ON e.device_id = n.device_id
-                )
-                SELECT id, device_id, device_name, event_type, message, timestamp
-                FROM ranked
-                WHERE rn <= %s
-                ORDER BY timestamp DESC
-            """, (per_type_limit,))
+                SELECT e.id, e.device_id, e.event_type, e.message, e.timestamp
+                FROM events e
+                ORDER BY e.timestamp DESC
+                LIMIT %s
+            """, (events_limit,))
             
             event_rows = cursor.fetchall()
+            
+            # Build device name map from already-fetched devices (no extra JOINs needed)
+            device_name_map = {d["serialNumber"]: d["name"] for d in devices}
+            
             for row in event_rows:
-                event_id, device_id, device_name, event_type, message, timestamp = row
+                event_id, device_id, event_type, message, timestamp = row
                 events.append({
                     "id": event_id,
                     "device": device_id,
-                    "deviceName": device_name or device_id,
+                    "deviceName": device_name_map.get(device_id, device_id),
                     "kind": event_type,
                     "message": message,
                     "ts": timestamp.isoformat() if timestamp else None,
@@ -958,10 +922,15 @@ async def get_dashboard_data(
                     "eventType": event_type,
                     "timestamp": timestamp.isoformat() if timestamp else None
                 })
+            t_events = _time.monotonic()
+            logger.info(f"[DASHBOARD PERF] events query: {t_events - t_stats:.3f}s ({len(events)} events)")
         except Exception as events_error:
             logger.warning(f"Failed to get events for dashboard: {events_error}")
         
         conn.close()
+        
+        t_total = _time.monotonic() - t_start
+        logger.info(f"[DASHBOARD PERF] total: {t_total:.3f}s")
         
         # Return consolidated dashboard data
         return {
