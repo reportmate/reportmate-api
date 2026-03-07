@@ -675,157 +675,101 @@ async def get_dashboard_data(
             "lastUpdated": str          # ISO8601 timestamp
         }
     """
-    import time as _time
-    t_start = _time.monotonic()
     conn = None
     try:
+        import time as _time
+        _t0 = _time.monotonic()
         conn = get_db_connection()
         cursor = conn.cursor()
-        t_db = _time.monotonic()
         
-        # === DEVICES QUERY (from /api/devices) ===
-        archive_filter_where = "" if include_archived else "WHERE d.archived = FALSE"
+        archive_filter = "" if include_archived else "WHERE archived = FALSE"
 
-        # Fetch all devices with inventory and system data (NO installs - too large)
-        # Install stats are calculated via optimized SQL queries below
-        device_query = f"""
-        SELECT 
-            d.id,
-            d.device_id,
-            d.serial_number,
-            d.name,
-            d.os,
-            d.os_name,
-            d.os_version,
-            d.last_seen,
-            d.archived,
-            d.created_at,
-            i.data as inventory_data,
-            s.data as system_data,
-            d.platform as stored_platform,
-            COALESCE(
-                NULLIF(h.data->'system'->>'computer_name', ''),
-                NULLIF(h.data->'system'->>'hostname', '')
-            ) as hw_device_name,
-            NULLIF(n.data->>'hostname', '') as net_device_name
-        FROM devices d
-        LEFT JOIN inventory i ON d.serial_number = i.device_id
-        LEFT JOIN system s ON d.serial_number = s.device_id
-        LEFT JOIN hardware h ON d.serial_number = h.device_id
-        LEFT JOIN network n ON d.serial_number = n.device_id
-        {archive_filter_where}
-        ORDER BY d.last_seen DESC NULLS LAST
-        """
-        
-        cursor.execute(device_query)
+        # === STEP 1: Devices table only (no JOINs = fast) ===
+        _t1 = _time.monotonic()
+        cursor.execute(f"""
+            SELECT id, device_id, serial_number, name, os, os_name, os_version,
+                   last_seen, archived, created_at, platform
+            FROM devices {archive_filter}
+            ORDER BY last_seen DESC NULLS LAST
+        """)
         device_rows = cursor.fetchall()
-        
+        _t2 = _time.monotonic()
+        logger.info(f"[DASHBOARD PERF] devices query: {_t2-_t1:.3f}s ({len(device_rows)} devices)")
+
+        # === STEP 2: Batch-fetch inventory data (single query, Python dict lookup) ===
+        inv_lookup = {}
+        try:
+            cursor.execute("SELECT device_id, data FROM inventory")
+            for inv_row in cursor.fetchall():
+                inv_lookup[inv_row[0]] = inv_row[1]
+        except Exception as inv_err:
+            logger.warning(f"Failed to batch-fetch inventory: {inv_err}")
+        _t3 = _time.monotonic()
+        logger.info(f"[DASHBOARD PERF] inventory batch: {_t3-_t2:.3f}s ({len(inv_lookup)} rows)")
+
+        # System OS data is NOT fetched for dashboard — devices table has os_name/os_version
+        # Detailed OS info (build, edition, architecture) loads on device detail pages only
+        _t4 = _t3
+
+        # === STEP 4: Build device list in Python (fast dict lookups) ===
+        now_utc = datetime.now(timezone.utc)
         devices = []
         for row in device_rows:
-            (db_id, device_id, serial_number, device_name, os_val, os_name_db, os_version_db, 
-             last_seen, archived, created_at, inventory_data_raw, system_data_raw, stored_platform,
-             hw_device_name, net_device_name) = row
-            
-            # Extract full OS details from system module
-            system_os = {}
-            if system_data_raw:
-                try:
-                    system_data = system_data_raw if isinstance(system_data_raw, dict) else json.loads(system_data_raw)
-                    # System data might be a list or dict depending on how it was stored
-                    if isinstance(system_data, list) and len(system_data) > 0:
-                        system_data = system_data[0]
-                    
-                    # Extract operatingSystem from system module
-                    if "operatingSystem" in system_data:
-                        system_os = system_data["operatingSystem"]
-                    elif "operating_system" in system_data:
-                        system_os = system_data["operating_system"]
-                except Exception as sys_error:
-                    logger.warning(f"Failed to parse system data for {serial_number}: {sys_error}")
-            
-            # Use system module OS data if available, otherwise fall back to devices table
-            final_os_name = system_os.get("name") or os_name_db or os_val or "Unknown"
-            final_os_version = system_os.get("version") or os_version_db or ""
-            os_build = system_os.get("build") or system_os.get("buildNumber") or ""
-            os_display_version = system_os.get("displayVersion") or ""
-            os_feature_update = system_os.get("featureUpdate") or ""
-            os_edition = system_os.get("edition") or ""
-            os_architecture = system_os.get("architecture") or ""
-            
-            # Determine platform from OS name, fall back to stored platform column
-            platform = "Windows" if "windows" in (final_os_name or "").lower() else "macOS" if "mac" in (final_os_name or "").lower() else (stored_platform or "Unknown")
-            
-            # Determine status based on last_seen
+            (db_id, device_id, serial_number, device_name, os_val, os_name_db,
+             os_version_db, last_seen, archived, created_at, stored_platform) = row
+
+            final_os_name = os_name_db or os_val or "Unknown"
+            final_os_version = os_version_db or ""
+
+            # Platform from stored column or inferred from OS name
+            platform = stored_platform or (
+                "Windows" if "windows" in (final_os_name or "").lower()
+                else "macOS" if "mac" in (final_os_name or "").lower()
+                else "Unknown"
+            )
+
+            # Status from last_seen
             status = "online"
             if last_seen:
-                time_diff = datetime.now(timezone.utc) - last_seen.replace(tzinfo=timezone.utc) if last_seen.tzinfo is None else datetime.now(timezone.utc) - last_seen
-                if time_diff.total_seconds() > 86400:  # 24 hours
+                ls = last_seen if last_seen.tzinfo else last_seen.replace(tzinfo=timezone.utc)
+                diff_s = (now_utc - ls).total_seconds()
+                if diff_s > 86400:
                     status = "offline"
-                elif time_diff.total_seconds() > 3600:  # 1 hour
+                elif diff_s > 3600:
                     status = "idle"
-            
-            # Extract inventory data (catalog, usage, department, location)
-            inv_device_name = None
-            inv_catalog = None
-            inv_usage = None
-            inv_department = None
-            inv_location = None
-            
-            if inventory_data_raw:
+
+            # Inventory from batch lookup
+            inv_device_name = device_name
+            inv_catalog = inv_usage = inv_department = inv_location = None
+            inv_raw = inv_lookup.get(serial_number)
+            if inv_raw:
                 try:
-                    inventory = inventory_data_raw if isinstance(inventory_data_raw, dict) else json.loads(inventory_data_raw)
-                    inv_device_name = inventory.get("deviceName") or None
+                    inventory = inv_raw if isinstance(inv_raw, dict) else json.loads(inv_raw)
+                    inv_device_name = inventory.get("deviceName") or device_name
                     inv_catalog = inventory.get("catalog")
                     inv_usage = inventory.get("usage")
                     inv_department = inventory.get("department")
                     inv_location = inventory.get("location")
-                except Exception as inv_error:
-                    logger.warning(f"Failed to parse inventory for {serial_number}: {inv_error}")
+                except Exception:
+                    pass
 
-            # hw_device_name and net_device_name are already extracted by SQL JSONB expressions
-            # (no Python-level JSON parsing needed for these)
-
-            # NOTE: We no longer include full installs data in dashboard response
-            # Install error/warning counts are calculated via optimized SQL queries below
-            # This reduces response size from ~26MB to ~1MB
-            
-            # Build complete OS info object with all version details
             os_info = {
                 "name": final_os_name,
-                "version": final_os_version,
-                "build": os_build,
-                "displayVersion": os_display_version,
-                "featureUpdate": os_feature_update,
-                "edition": os_edition,
-                "architecture": os_architecture
+                "version": final_os_version
             }
-            
-            # Build modules object (NO installs - counts come from installStats)
-            modules_obj = {
-                "system": {
-                    "operatingSystem": os_info
-                }
-            }
-            
-            # Normalize device name - chain: inventory.deviceName → hardware.computer_name → hardware.hostname → network.hostname → d.name → serial
-            raw_name = inv_device_name or hw_device_name or net_device_name or device_name
-            final_device_name = raw_name if (raw_name and raw_name.lower() != "unknown") else serial_number
 
-            # Add inventory if present
-            if any([inv_device_name, inv_catalog, inv_usage, inv_department, inv_location]):
+            modules_obj = {"system": {"operatingSystem": os_info}}
+            if any([inv_catalog, inv_usage, inv_department, inv_location]):
                 modules_obj["inventory"] = {
-                    "deviceName": final_device_name if final_device_name != serial_number else None,
-                    "catalog": inv_catalog,
-                    "usage": inv_usage,
-                    "department": inv_department,
-                    "location": inv_location
+                    "catalog": inv_catalog, "usage": inv_usage,
+                    "department": inv_department, "location": inv_location
                 }
-            
-            device = {
+
+            devices.append({
                 "id": db_id,
                 "deviceId": device_id,
                 "serialNumber": serial_number,
-                "name": final_device_name,
+                "name": inv_device_name or serial_number,
                 "platform": platform,
                 "osName": final_os_name,
                 "osVersion": final_os_version,
@@ -834,67 +778,74 @@ async def get_dashboard_data(
                 "lastSeen": last_seen.isoformat() if last_seen else None,
                 "createdAt": created_at.isoformat() if created_at else None,
                 "modules": modules_obj
-            }
-            devices.append(device)
-        
-        total_devices = len(devices)
-        t_devices = _time.monotonic()
-        logger.info(f"[DASHBOARD PERF] devices query + transform: {t_devices - t_db:.3f}s ({total_devices} devices)")
-        
-        # === INSTALL STATS - SINGLE OPTIMIZED QUERY ===
-        # Replaces 6 separate CROSS JOIN LATERAL queries with 1 combined query
+            })
+
+        _t5 = _time.monotonic()
+        logger.info(f"[DASHBOARD PERF] device transform: {_t5-_t4:.3f}s")
+
+        # === INSTALL STATS (single combined query) ===
         install_stats = {
-            "devicesWithErrors": 0,
-            "devicesWithWarnings": 0,
-            "totalErrorItems": 0,
-            "totalWarningItems": 0,
+            "devicesWithErrors": 0, "devicesWithWarnings": 0,
+            "totalErrorItems": 0, "totalWarningItems": 0,
             "hasInstallData": False
         }
-        
         try:
             cursor.execute("""
                 SELECT
-                    COALESCE(SUM(
-                        (SELECT COUNT(*) FROM jsonb_array_elements(i.data->'cimian'->'items') item
-                         WHERE LOWER(item->>'currentStatus') IN ('error','failed','problem','install-error')
-                           OR LOWER(item->>'currentStatus') LIKE '%%error%%'
-                           OR LOWER(item->>'currentStatus') LIKE '%%failed%%')
-                        +
-                        (SELECT COUNT(*) FROM jsonb_array_elements(i.data->'munki'->'items') item
-                         WHERE LOWER(item->>'status') LIKE '%%error%%'
-                           OR LOWER(item->>'status') LIKE '%%failed%%')
-                    ), 0) AS total_errors,
-                    COALESCE(SUM(
-                        (SELECT COUNT(*) FROM jsonb_array_elements(i.data->'cimian'->'items') item
-                         WHERE LOWER(item->>'currentStatus') LIKE '%%warning%%'
-                           OR LOWER(item->>'currentStatus') = 'needs-attention')
-                        +
-                        (SELECT COUNT(*) FROM jsonb_array_elements(i.data->'munki'->'items') item
-                         WHERE LOWER(item->>'status') LIKE '%%warning%%')
-                    ), 0) AS total_warnings,
-                    COUNT(*) > 0 AS has_data
-                FROM installs i
-                INNER JOIN devices d ON d.serial_number = i.device_id
-                WHERE d.archived = FALSE
-                  AND (
-                      jsonb_typeof(i.data->'cimian'->'items') = 'array'
-                      OR jsonb_typeof(i.data->'munki'->'items') = 'array'
-                  )
+                    SUM(CASE WHEN category = 'cimian_error' THEN cnt ELSE 0 END),
+                    SUM(CASE WHEN category = 'munki_error' THEN cnt ELSE 0 END),
+                    SUM(CASE WHEN category = 'cimian_warning' THEN cnt ELSE 0 END),
+                    SUM(CASE WHEN category = 'munki_warning' THEN cnt ELSE 0 END),
+                    MAX(CASE WHEN category = 'has_data' THEN cnt ELSE 0 END)
+                FROM (
+                    SELECT 'cimian_error' AS category, COUNT(*) AS cnt
+                    FROM installs i
+                    INNER JOIN devices d ON d.serial_number = i.device_id AND d.archived = FALSE
+                    CROSS JOIN LATERAL jsonb_array_elements(i.data->'cimian'->'items') AS item
+                    WHERE LOWER(item->>'currentStatus') ~ '(error|failed|problem|install-error)'
+
+                    UNION ALL
+                    SELECT 'munki_error', COUNT(*)
+                    FROM installs i
+                    INNER JOIN devices d ON d.serial_number = i.device_id AND d.archived = FALSE
+                    CROSS JOIN LATERAL jsonb_array_elements(i.data->'munki'->'items') AS item
+                    WHERE LOWER(item->>'status') ~ '(error|failed)'
+
+                    UNION ALL
+                    SELECT 'cimian_warning', COUNT(*)
+                    FROM installs i
+                    INNER JOIN devices d ON d.serial_number = i.device_id AND d.archived = FALSE
+                    CROSS JOIN LATERAL jsonb_array_elements(i.data->'cimian'->'items') AS item
+                    WHERE LOWER(item->>'currentStatus') ~ '(warning|needs-attention)'
+
+                    UNION ALL
+                    SELECT 'munki_warning', COUNT(*)
+                    FROM installs i
+                    INNER JOIN devices d ON d.serial_number = i.device_id AND d.archived = FALSE
+                    CROSS JOIN LATERAL jsonb_array_elements(i.data->'munki'->'items') AS item
+                    WHERE LOWER(item->>'status') LIKE '%warning%'
+
+                    UNION ALL
+                    SELECT 'has_data', CASE WHEN EXISTS(
+                        SELECT 1 FROM installs i2
+                        INNER JOIN devices d2 ON d2.serial_number = i2.device_id AND d2.archived = FALSE
+                        WHERE jsonb_array_length(COALESCE(i2.data->'cimian'->'items', '[]'::jsonb)) > 0
+                           OR jsonb_array_length(COALESCE(i2.data->'munki'->'items', '[]'::jsonb)) > 0
+                    ) THEN 1 ELSE 0 END
+                ) sub
             """)
             stats_row = cursor.fetchone()
             if stats_row:
-                install_stats["totalErrorItems"] = stats_row[0] or 0
-                install_stats["totalWarningItems"] = stats_row[1] or 0
-                install_stats["hasInstallData"] = bool(stats_row[2])
-            
-            t_stats = _time.monotonic()
-            logger.info(f"[DASHBOARD PERF] install stats: {t_stats - t_devices:.3f}s (errors={install_stats['totalErrorItems']}, warnings={install_stats['totalWarningItems']})")
+                install_stats["totalErrorItems"] = (stats_row[0] or 0) + (stats_row[1] or 0)
+                install_stats["totalWarningItems"] = (stats_row[2] or 0) + (stats_row[3] or 0)
+                install_stats["hasInstallData"] = bool(stats_row[4])
         except Exception as stats_error:
             logger.warning(f"Failed to calculate install stats: {stats_error}")
-            t_stats = _time.monotonic()
-        
-        # === EVENTS QUERY - SIMPLIFIED ===
-        # Simple recent events with device name lookup via pre-built device name map
+
+        _t6 = _time.monotonic()
+        logger.info(f"[DASHBOARD PERF] install stats: {_t6-_t5:.3f}s (errors={install_stats['totalErrorItems']}, warnings={install_stats['totalWarningItems']})")
+
+        # === EVENTS (simple query, fast) ===
         events = []
         try:
             cursor.execute("""
@@ -903,39 +854,38 @@ async def get_dashboard_data(
                 ORDER BY e.timestamp DESC
                 LIMIT %s
             """, (events_limit,))
-            
-            event_rows = cursor.fetchall()
-            
-            # Build device name map from already-fetched devices (no extra JOINs needed)
-            device_name_map = {d["serialNumber"]: d["name"] for d in devices}
-            
-            for row in event_rows:
+
+            # Build name lookup from already-fetched inventory data
+            for row in cursor.fetchall():
                 event_id, device_id, event_type, message, timestamp = row
+                inv = inv_lookup.get(device_id)
+                ev_name = device_id
+                if inv:
+                    try:
+                        inv_d = inv if isinstance(inv, dict) else json.loads(inv)
+                        ev_name = inv_d.get("deviceName") or device_id
+                    except Exception:
+                        pass
                 events.append({
-                    "id": event_id,
-                    "device": device_id,
-                    "deviceName": device_name_map.get(device_id, device_id),
-                    "kind": event_type,
+                    "id": event_id, "device": device_id,
+                    "deviceName": ev_name, "kind": event_type,
                     "message": message,
                     "ts": timestamp.isoformat() if timestamp else None,
-                    "serialNumber": device_id,
-                    "eventType": event_type,
+                    "serialNumber": device_id, "eventType": event_type,
                     "timestamp": timestamp.isoformat() if timestamp else None
                 })
-            t_events = _time.monotonic()
-            logger.info(f"[DASHBOARD PERF] events query: {t_events - t_stats:.3f}s ({len(events)} events)")
         except Exception as events_error:
             logger.warning(f"Failed to get events for dashboard: {events_error}")
-        
+
+        _t7 = _time.monotonic()
+        logger.info(f"[DASHBOARD PERF] events: {_t7-_t6:.3f}s ({len(events)} events)")
+        logger.info(f"[DASHBOARD PERF] TOTAL: {_t7-_t0:.3f}s ({len(devices)} devices)")
+
         conn.close()
-        
-        t_total = _time.monotonic() - t_start
-        logger.info(f"[DASHBOARD PERF] total: {t_total:.3f}s")
-        
-        # Return consolidated dashboard data
+
         return {
             "devices": devices,
-            "totalDevices": total_devices,
+            "totalDevices": len(devices),
             "installStats": install_stats,
             "events": events,
             "totalEvents": len(events),
