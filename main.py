@@ -35,10 +35,62 @@ except ImportError:
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Dashboard response cache (in-memory, per-process, 15s TTL)
-# Avoids re-running heavy SQL on every 30s frontend poll
-_DASHBOARD_CACHE: dict = {}
-_DASHBOARD_CACHE_TTL = 15  # seconds
+# ---------------------------------------------------------------------------
+# Endpoint response cache — write-through invalidation on data ingestion
+# Every POST /api/events (new device data) or PATCH (archive/unarchive)
+# calls invalidate_caches() so fresh data is served immediately.
+# The TTL is only a safety net for edge cases, not the freshness mechanism.
+# ---------------------------------------------------------------------------
+import time as _time
+
+_CACHE: dict = {}           # {(namespace, key_tuple): (response_dict, monotonic_ts)}
+_CACHE_TTL: dict = {        # per-namespace max-age in seconds
+    "dashboard": 30,
+    "devices": 30,
+    "stats_installs": 30,
+    "applications": 30,
+    "applications_filters": 60,
+    "applications_usage": 60,
+    "installs": 30,
+    "installs_filters": 60,
+    "installs_full": 30,
+    "hardware": 30,
+    "management": 30,
+    "network": 30,
+    "security": 30,
+    "security_certs": 30,
+    "peripherals": 30,
+    "profiles": 30,
+    "identity": 30,
+    "system": 30,
+    "inventory": 30,
+    "events": 15,
+}
+
+def cache_get(namespace: str, key: tuple = ()):
+    """Return cached response or None if expired/missing."""
+    entry = _CACHE.get((namespace, key))
+    if entry is None:
+        return None
+    data, ts = entry
+    ttl = _CACHE_TTL.get(namespace, 30)
+    if (_time.monotonic() - ts) >= ttl:
+        _CACHE.pop((namespace, key), None)
+        return None
+    return data
+
+def cache_set(namespace: str, data, key: tuple = ()):
+    """Store response in cache."""
+    _CACHE[(namespace, key)] = (data, _time.monotonic())
+
+def invalidate_caches():
+    """Clear ALL cached responses. Called after any data write."""
+    _CACHE.clear()
+    logger.info("[CACHE] All caches invalidated (data write detected)")
+
+# Legacy alias used by dashboard endpoint
+_DASHBOARD_CACHE = _CACHE
+_DASHBOARD_CACHE_TTL = 30
 
 # -----------------------------------------------------------------------------
 # SQL Query Loader - Load queries from external .sql files at startup
@@ -622,6 +674,25 @@ async def ensure_performance_indexes():
             "CREATE INDEX IF NOT EXISTS idx_usage_history_device_date ON usage_history(device_id, date DESC)",
             "CREATE INDEX IF NOT EXISTS idx_usage_history_app_date ON usage_history(app_name, date DESC)",
             "CREATE INDEX IF NOT EXISTS idx_usage_history_date ON usage_history(date)",
+            # Module tables missing indexes
+            "CREATE INDEX IF NOT EXISTS idx_security_device_id ON security(device_id)",
+            "CREATE INDEX IF NOT EXISTS idx_profiles_device_id ON profiles(device_id)",
+            "CREATE INDEX IF NOT EXISTS idx_management_device_id ON management(device_id)",
+            "CREATE INDEX IF NOT EXISTS idx_applications_device_id ON applications(device_id)",
+            "CREATE INDEX IF NOT EXISTS idx_peripherals_device_id ON peripherals(device_id)",
+            "CREATE INDEX IF NOT EXISTS idx_identity_device_id ON identity(device_id)",
+            "CREATE INDEX IF NOT EXISTS idx_displays_device_id ON displays(device_id)",
+            "CREATE INDEX IF NOT EXISTS idx_printers_device_id ON printers(device_id)",
+            # Composite indexes for DISTINCT ON ... ORDER BY updated_at DESC pattern
+            "CREATE INDEX IF NOT EXISTS idx_applications_device_updated ON applications(device_id, updated_at DESC)",
+            "CREATE INDEX IF NOT EXISTS idx_installs_device_updated ON installs(device_id, updated_at DESC)",
+            "CREATE INDEX IF NOT EXISTS idx_security_device_updated ON security(device_id, updated_at DESC)",
+            "CREATE INDEX IF NOT EXISTS idx_hardware_device_updated ON hardware(device_id, updated_at DESC)",
+            "CREATE INDEX IF NOT EXISTS idx_network_device_updated ON network(device_id, updated_at DESC)",
+            "CREATE INDEX IF NOT EXISTS idx_management_device_updated ON management(device_id, updated_at DESC)",
+            "CREATE INDEX IF NOT EXISTS idx_profiles_device_updated ON profiles(device_id, updated_at DESC)",
+            "CREATE INDEX IF NOT EXISTS idx_system_device_updated ON system(device_id, updated_at DESC)",
+            "CREATE INDEX IF NOT EXISTS idx_inventory_device_updated ON inventory(device_id, updated_at DESC)",
         ]:
             try:
                 cursor.execute(stmt)
@@ -698,14 +769,13 @@ async def get_dashboard_data(
     """
     conn = None
     try:
-        import time as _time
         _t0 = _time.monotonic()
 
         # Check in-memory cache before hitting the database
-        _cache_key = (include_archived, events_limit)
-        _cached = _DASHBOARD_CACHE.get(_cache_key)
-        if _cached and (_t0 - _cached[1]) < _DASHBOARD_CACHE_TTL:
-            return _cached[0]
+        _ckey = (include_archived, events_limit)
+        _cached = cache_get("dashboard", _ckey)
+        if _cached is not None:
+            return _cached
 
         conn = get_db_connection()
         cursor = conn.cursor()
@@ -902,7 +972,7 @@ async def get_dashboard_data(
         }
 
         # Store in cache
-        _DASHBOARD_CACHE[_cache_key] = (result, _time.monotonic())
+        cache_set("dashboard", result, _ckey)
 
         return result
         
@@ -936,11 +1006,14 @@ async def get_all_devices(
     """
     conn = None
     try:
+        _t0 = _time.monotonic()
+        _ckey = (include_archived, limit, offset)
+        _cached = cache_get("devices", _ckey)
+        if _cached is not None:
+            return _cached
+
         conn = get_db_connection()
         cursor = conn.cursor()
-
-        # Build archive filter for count query
-        archive_filter = "" if include_archived else "WHERE archived = FALSE"
         
         total_devices = 0
         try:
@@ -1136,7 +1209,7 @@ async def get_all_devices(
         page = (offset // page_size) + 1 if page_size else 1
         has_more = bool(limit is not None and (offset + len(devices)) < total_devices)
 
-        return {
+        response = {
             "devices": devices,
             "total": total_devices or len(devices),
             "message": f"Successfully retrieved {len(devices)} devices",
@@ -1144,6 +1217,11 @@ async def get_all_devices(
             "pageSize": page_size,
             "hasMore": has_more,
         }
+
+        _t1 = _time.monotonic()
+        logger.info(f"[DEVICES PERF] {_t1-_t0:.3f}s ({len(devices)} devices)")
+        cache_set("devices", response, _ckey)
+        return response
 
     except Exception as e:
         print(f"[ERROR] get_all_devices failed: {e}")
@@ -1552,6 +1630,11 @@ async def get_applications_filters(
     and processing 200K+ records client-side.
     """
     try:
+        _ckey = (include_archived,)
+        _cached = cache_get("applications_filters", _ckey)
+        if _cached is not None:
+            return _cached
+        _t0 = _time.monotonic()
         logger.info(f"Fetching applications filter options (includeArchived={include_archived})")
         
         conn = get_db_connection()
@@ -1610,7 +1693,7 @@ async def get_applications_filters(
         
         logger.info(f"Applications filters: {len(app_names)} unique apps, {len(publishers)} publishers, {len(devices)} devices")
         
-        return {
+        _result = {
             'applicationNames': sorted(app_names),
             'windowsApplicationNames': sorted(windows_app_names),
             'macApplicationNames': sorted(mac_app_names),
@@ -1624,6 +1707,9 @@ async def get_applications_filters(
             'devices': devices,
             'devicesWithData': len(devices)
         }
+        cache_set("applications_filters", _result, _ckey)
+        logger.info(f"[PERF] /api/devices/applications/filters: {_time.monotonic()-_t0:.3f}s")
+        return _result
         
     except Exception as e:
         logger.error(f"Failed to get applications filters: {e}")
@@ -1656,6 +1742,11 @@ async def get_bulk_applications(
     """
     conn = None
     try:
+        _ckey = (str(dict(sorted(request.query_params.items()))),)
+        _cached = cache_get("applications", _ckey)
+        if _cached is not None:
+            return _cached
+        _t0 = _time.monotonic()
         logger.info(f"Fetching bulk applications (loadAll={loadAll}, includeArchived={include_archived}, filters={dict(request.query_params)})")
         
         conn = get_db_connection()
@@ -1798,7 +1889,8 @@ async def get_bulk_applications(
                 continue
         
         logger.info(f"Processed {len(all_applications)} applications from {len(rows)} devices")
-        
+        cache_set("applications", all_applications, _ckey)
+        logger.info(f"[PERF] /api/devices/applications: {_time.monotonic()-_t0:.3f}s ({len(all_applications)} apps)")
         return all_applications
         
     except Exception as e:
@@ -1827,6 +1919,11 @@ async def get_bulk_hardware(
     - OS information (name, version, architecture)
     """
     try:
+        _ckey = (include_archived,)
+        _cached = cache_get("hardware", _ckey)
+        if _cached is not None:
+            return _cached
+        _t0 = _time.monotonic()
         logger.info("Fetching bulk hardware data")
         
         conn = get_db_connection()
@@ -1917,7 +2014,8 @@ async def get_bulk_hardware(
                 continue
         
         logger.info(f"Processed {len(all_hardware)} hardware records")
-        
+        cache_set("hardware", all_hardware, _ckey)
+        logger.info(f"[PERF] /api/devices/hardware: {_time.monotonic()-_t0:.3f}s ({len(all_hardware)} devices)")
         return all_hardware
         
     except Exception as e:
@@ -1939,6 +2037,11 @@ async def get_installs_filters(
     to extract filter options client-side.
     """
     try:
+        _ckey = (include_archived,)
+        _cached = cache_get("installs_filters", _ckey)
+        if _cached is not None:
+            return _cached
+        _t0 = _time.monotonic()
         logger.info(f"Fetching installs filter options (includeArchived={include_archived})")
         
         conn = get_db_connection()
@@ -2121,7 +2224,7 @@ async def get_installs_filters(
         
         logger.info(f"Installs filters: {len(managed_installs)} unique installs, {len(devices)} devices")
         
-        return {
+        _result = {
             'success': True,
             'managedInstalls': sorted(managed_installs),
             'cimianInstalls': sorted(cimian_installs),
@@ -2137,6 +2240,9 @@ async def get_installs_filters(
             'devicesWithData': len(devices),
             'devices': devices
         }
+        cache_set("installs_filters", _result, _ckey)
+        logger.info(f"[PERF] /api/devices/installs/filters: {_time.monotonic()-_t0:.3f}s")
+        return _result
         
     except Exception as e:
         logger.error(f"Failed to get installs filters: {e}")
@@ -2159,6 +2265,11 @@ async def get_bulk_installs(
     - Install dates and last check timestamps
     """
     try:
+        _ckey = (include_archived,)
+        _cached = cache_get("installs", _ckey)
+        if _cached is not None:
+            return _cached
+        _t0 = _time.monotonic()
         logger.info("Fetching bulk installs data")
         
         conn = get_db_connection()
@@ -2245,7 +2356,8 @@ async def get_bulk_installs(
                 continue
         
         logger.info(f"Processed {len(all_installs)} install records from {len(rows)} devices")
-        
+        cache_set("installs", all_installs, _ckey)
+        logger.info(f"[PERF] /api/devices/installs: {_time.monotonic()-_t0:.3f}s ({len(all_installs)} records)")
         return all_installs
         
     except Exception as e:
@@ -2268,6 +2380,11 @@ async def get_bulk_installs_full(
     By default, archived devices are excluded. Use includeArchived=true to include them.
     """
     try:
+        _ckey = (include_archived,)
+        _cached = cache_get("installs_full", _ckey)
+        if _cached is not None:
+            return _cached
+        _t0 = _time.monotonic()
         logger.info("Fetching bulk installs (full structure)")
         
         conn = get_db_connection()
@@ -2368,7 +2485,8 @@ async def get_bulk_installs_full(
                 continue
         
         logger.info(f"Processed {len(devices)} devices with full installs structure")
-        
+        cache_set("installs_full", devices, _ckey)
+        logger.info(f"[PERF] /api/devices/installs/full: {_time.monotonic()-_t0:.3f}s ({len(devices)} devices)")
         return devices
         
     except Exception as e:
@@ -2393,6 +2511,11 @@ async def get_bulk_network(
     - DNS configuration, gateways, and network type
     """
     try:
+        _ckey = (include_archived,)
+        _cached = cache_get("network", _ckey)
+        if _cached is not None:
+            return _cached
+        _t0 = _time.monotonic()
         logger.info("Fetching bulk network data")
         
         conn = get_db_connection()
@@ -2437,7 +2560,8 @@ async def get_bulk_network(
                 continue
         
         logger.info(f"Processed {len(devices)} devices with network data")
-        
+        cache_set("network", devices, _ckey)
+        logger.info(f"[PERF] /api/devices/network: {_time.monotonic()-_t0:.3f}s ({len(devices)} devices)")
         return devices
         
     except Exception as e:
@@ -2462,6 +2586,11 @@ async def get_bulk_security(
     - Firewall and security baseline compliance
     """
     try:
+        _ckey = (include_archived,)
+        _cached = cache_get("security", _ckey)
+        if _cached is not None:
+            return _cached
+        _t0 = _time.monotonic()
         logger.info("Fetching bulk security data")
         
         conn = get_db_connection()
@@ -2547,6 +2676,8 @@ async def get_bulk_security(
                 continue
         
         logger.info(f"Processed {len(devices)} devices with security data")
+        cache_set("security", devices, _ckey)
+        logger.info(f"[PERF] /api/devices/security: {_time.monotonic()-_t0:.3f}s ({len(devices)} devices)")
         return devices
         
     except Exception as e:
@@ -2571,6 +2702,11 @@ async def search_fleet_certificates(
     - includeArchived: Include archived devices
     """
     try:
+        _ckey = (search.strip(), status.strip().lower(), include_archived)
+        _cached = cache_get("security_certs", _ckey)
+        if _cached is not None:
+            return _cached
+        _t0 = _time.monotonic()
         logger.info(f"Searching fleet certificates: search='{search}', status='{status}'")
         
         conn = get_db_connection()
@@ -2621,6 +2757,8 @@ async def search_fleet_certificates(
                 logger.warning(f"Error processing certificate row: {e}")
                 continue
         
+        cache_set("security_certs", results, _ckey)
+        logger.info(f"[PERF] /api/devices/security/certificates: {_time.monotonic()-_t0:.3f}s ({len(results)} certs)")
         return results
         
     except Exception as e:
@@ -2645,6 +2783,11 @@ async def get_bulk_management(
     - Tenant information
     """
     try:
+        _ckey = (include_archived,)
+        _cached = cache_get("management", _ckey)
+        if _cached is not None:
+            return _cached
+        _t0 = _time.monotonic()
         logger.info("Fetching bulk management data")
         
         conn = get_db_connection()
@@ -2777,6 +2920,8 @@ async def get_bulk_management(
                 continue
         
         logger.info(f"Processed {len(devices)} devices with management data")
+        cache_set("management", devices, _ckey)
+        logger.info(f"[PERF] /api/devices/management: {_time.monotonic()-_t0:.3f}s ({len(devices)} devices)")
         return devices
         
     except Exception as e:
@@ -2800,6 +2945,11 @@ async def get_bulk_inventory(
     - Usage classification and catalog assignment
     """
     try:
+        _ckey = (include_archived,)
+        _cached = cache_get("inventory", _ckey)
+        if _cached is not None:
+            return _cached
+        _t0 = _time.monotonic()
         logger.info("Fetching bulk inventory data")
         
         conn = get_db_connection()
@@ -2837,6 +2987,8 @@ async def get_bulk_inventory(
                 continue
         
         logger.info(f"Processed {len(devices)} devices with inventory data")
+        cache_set("inventory", devices, _ckey)
+        logger.info(f"[PERF] /api/devices/inventory: {_time.monotonic()-_t0:.3f}s ({len(devices)} devices)")
         return devices
         
     except Exception as e:
@@ -2864,6 +3016,11 @@ async def get_bulk_system(
     - Pending updates and service status (in raw field)
     """
     try:
+        _ckey = (include_archived, limit)
+        _cached = cache_get("system", _ckey)
+        if _cached is not None:
+            return _cached
+        _t0 = _time.monotonic()
         logger.info(f"Fetching bulk system data (limit: {limit})")
         
         conn = get_db_connection()
@@ -2960,6 +3117,8 @@ async def get_bulk_system(
                 continue
         
         logger.info(f"Processed {len(devices)} devices with system data")
+        cache_set("system", devices, _ckey)
+        logger.info(f"[PERF] /api/devices/system: {_time.monotonic()-_t0:.3f}s ({len(devices)} devices)")
         return devices
         
     except Exception as e:
@@ -2990,6 +3149,11 @@ async def get_bulk_peripherals(
     - External storage (USB drives, SD cards)
     """
     try:
+        _ckey = (include_archived,)
+        _cached = cache_get("peripherals", _ckey)
+        if _cached is not None:
+            return _cached
+        _t0 = _time.monotonic()
         logger.info("Fetching bulk peripherals data")
         
         conn = get_db_connection()
@@ -3036,6 +3200,8 @@ async def get_bulk_peripherals(
                 continue
         
         logger.info(f"Processed {len(devices)} devices with peripherals data")
+        cache_set("peripherals", devices, _ckey)
+        logger.info(f"[PERF] /api/devices/peripherals: {_time.monotonic()-_t0:.3f}s ({len(devices)} devices)")
         return devices
         
     except Exception as e:
@@ -3064,6 +3230,11 @@ async def get_bulk_identity(
     - Platform SSO registration status
     """
     try:
+        _ckey = (include_archived,)
+        _cached = cache_get("identity", _ckey)
+        if _cached is not None:
+            return _cached
+        _t0 = _time.monotonic()
         logger.info("Fetching bulk identity data")
         
         conn = get_db_connection()
@@ -3192,6 +3363,8 @@ async def get_bulk_identity(
                 continue
         
         logger.info(f"Processed {len(devices)} devices with identity data")
+        cache_set("identity", devices, _ckey)
+        logger.info(f"[PERF] /api/devices/identity: {_time.monotonic()-_t0:.3f}s ({len(devices)} devices)")
         return devices
         
     except Exception as e:
@@ -3225,6 +3398,11 @@ async def get_events(
     - Total count for pagination
     """
     try:
+        _ckey = (limit, offset, startDate or '', endDate or '', type or '')
+        _cached = cache_get("events", _ckey)
+        if _cached is not None:
+            return _cached
+        _t0 = _time.monotonic()
         conn = get_db_connection()
         cursor = conn.cursor()
         
@@ -3287,15 +3465,18 @@ async def get_events(
                 "timestamp": timestamp.isoformat() if timestamp else None
             })
         
-        return {
+        _result = {
             "success": True,
             "events": events, 
             "total": total_count,
-            "totalEvents": total_count,  # Frontend expects this field
+            "totalEvents": total_count,
             "count": len(events),
             "limit": limit,
             "offset": offset
         }
+        cache_set("events", _result, _ckey)
+        logger.info(f"[PERF] /api/events: {_time.monotonic()-_t0:.3f}s ({len(events)} events)")
+        return _result
         
     except Exception as e:
         logger.error(f"Failed to get events: {e}")
@@ -3629,6 +3810,11 @@ async def get_fleet_application_usage(
     This endpoint aggregates activeSessions by app name across all devices.
     """
     try:
+        _ckey = (days, applicationNames or '', usages or '', catalogs or '', locations or '', minHours, minLaunches, includeUnused, include_archived)
+        _cached = cache_get("applications_usage", _ckey)
+        if _cached is not None:
+            return _cached
+        _t0 = _time.monotonic()
         logger.info(f"Fetching fleet application usage from applications module (days={days}, includeArchived={include_archived})")
         
         conn = get_db_connection()
@@ -4068,9 +4254,9 @@ async def get_fleet_application_usage(
         
         conn.close()
         
-        return {
+        _result = {
             "status": "available",
-            "dataSource": "applications_module",  # Indicate we're using module data
+            "dataSource": "applications_module",
             "applications": applications,
             "topUsers": top_users,
             "singleUserApps": single_user_apps,
@@ -4096,6 +4282,9 @@ async def get_fleet_application_usage(
             },
             "lastUpdated": datetime.now(timezone.utc).isoformat()
         }
+        cache_set("applications_usage", _result, _ckey)
+        logger.info(f"[PERF] /api/devices/applications/usage: {_time.monotonic()-_t0:.3f}s ({len(applications)} apps)")
+        return _result
         
     except Exception as e:
         logger.error(f"Failed to get fleet application usage: {e}")
@@ -4407,77 +4596,50 @@ async def get_install_stats():
         }
     """
     try:
+        _cached = cache_get("stats_installs")
+        if _cached is not None:
+            return _cached
+
+        _t0 = _time.monotonic()
         conn = get_db_connection()
         cursor = conn.cursor()
         
-        # Count devices with install errors from Cimian items (not events)
-        # Items have currentStatus field with values like: failed, error, Pending Update, etc.
-        logger.debug("Counting devices with install errors from cimian->items...")
+        # Single-pass aggregate: counts errors, warnings, and device-level stats
         cursor.execute("""
-            SELECT COUNT(DISTINCT i.device_id)
+            SELECT
+                COUNT(DISTINCT CASE WHEN device_errors > 0 THEN i.device_id END) AS devices_with_errors,
+                COUNT(DISTINCT CASE WHEN device_warnings > 0 AND device_errors = 0 THEN i.device_id END) AS devices_with_warnings,
+                COALESCE(SUM(device_errors), 0) AS total_errors,
+                COALESCE(SUM(device_warnings), 0) AS total_warnings
             FROM installs i
-            CROSS JOIN LATERAL jsonb_array_elements(i.data->'cimian'->'items') as item
-            WHERE LOWER(item->>'currentStatus') IN ('failed', 'error', 'needs_reinstall')
-               OR LOWER(item->>'mappedStatus') IN ('failed', 'error')
+            INNER JOIN devices d ON d.serial_number = i.device_id AND d.archived = FALSE
+            CROSS JOIN LATERAL (
+                SELECT
+                    (SELECT COUNT(*) FROM jsonb_array_elements(COALESCE(i.data->'cimian'->'items','[]'::jsonb)) item
+                     WHERE LOWER(item->>'currentStatus') IN ('failed','error','needs_reinstall')
+                        OR LOWER(item->>'mappedStatus') IN ('failed','error')
+                    ) AS device_errors,
+                    (SELECT COUNT(*) FROM jsonb_array_elements(COALESCE(i.data->'cimian'->'items','[]'::jsonb)) item
+                     WHERE LOWER(item->>'currentStatus') LIKE '%%pending%%'
+                        OR LOWER(item->>'currentStatus') LIKE '%%update%%'
+                        OR LOWER(item->>'currentStatus') = 'warning'
+                    ) AS device_warnings
+            ) counts
         """)
-        devices_with_errors = cursor.fetchone()[0] or 0
-        logger.debug(f"Devices with errors: {devices_with_errors}")
-        
-        # Count devices with warnings (pending/update status, but NO errors)
-        logger.debug("Counting devices with warnings (excluding devices with errors)...")
-        cursor.execute("""
-            SELECT COUNT(DISTINCT i.device_id)
-            FROM installs i
-            CROSS JOIN LATERAL jsonb_array_elements(i.data->'cimian'->'items') as item
-            WHERE (LOWER(item->>'currentStatus') LIKE '%%pending%%'
-                OR LOWER(item->>'currentStatus') LIKE '%%update%%'
-                OR LOWER(item->>'currentStatus') = 'warning')
-            AND i.device_id NOT IN (
-                -- Exclude devices that have any errors
-                SELECT DISTINCT device_id
-                FROM installs
-                CROSS JOIN LATERAL jsonb_array_elements(data->'cimian'->'items') as err_item
-                WHERE LOWER(err_item->>'currentStatus') IN ('failed', 'error', 'needs_reinstall')
-                   OR LOWER(err_item->>'mappedStatus') IN ('failed', 'error')
-            )
-        """)
-        devices_with_warnings = cursor.fetchone()[0] or 0
-        logger.debug(f"Devices with warnings: {devices_with_warnings}")
-        
-        # Count total failed install items across all devices
-        logger.debug("Counting total failed installs...")
-        cursor.execute("""
-            SELECT COUNT(*)
-            FROM installs i
-            CROSS JOIN LATERAL jsonb_array_elements(i.data->'cimian'->'items') as item
-            WHERE LOWER(item->>'currentStatus') IN ('failed', 'error', 'needs_reinstall')
-               OR LOWER(item->>'mappedStatus') IN ('failed', 'error')
-        """)
-        total_failed = cursor.fetchone()[0] or 0
-        
-        # Count total warning items across all devices
-        logger.debug("Counting total warnings...")
-        cursor.execute("""
-            SELECT COUNT(*)
-            FROM installs i
-            CROSS JOIN LATERAL jsonb_array_elements(i.data->'cimian'->'items') as item
-            WHERE LOWER(item->>'currentStatus') LIKE '%%pending%%'
-               OR LOWER(item->>'currentStatus') LIKE '%%update%%'
-               OR LOWER(item->>'currentStatus') = 'warning'
-        """)
-        total_warnings = cursor.fetchone()[0] or 0
-        
+        row = cursor.fetchone()
         conn.close()
         
         result = {
-            "devicesWithErrors": devices_with_errors,
-            "devicesWithWarnings": devices_with_warnings,
-            "totalFailedInstalls": total_failed,
-            "totalWarnings": total_warnings,
+            "devicesWithErrors": int(row[0] or 0),
+            "devicesWithWarnings": int(row[1] or 0),
+            "totalFailedInstalls": int(row[2] or 0),
+            "totalWarnings": int(row[3] or 0),
             "lastUpdated": datetime.now(timezone.utc).isoformat()
         }
         
-        logger.info(f"Install stats: {devices_with_errors} errors, {devices_with_warnings} warnings")
+        _t1 = _time.monotonic()
+        logger.info(f"[STATS/INSTALLS PERF] {_t1-_t0:.3f}s ({result['devicesWithErrors']} errors, {result['devicesWithWarnings']} warnings)")
+        cache_set("stats_installs", result)
         return result
         
     except Exception as e:
@@ -4883,6 +5045,7 @@ async def submit_events(request: Request):
         
         conn.commit()
         conn.close()
+        invalidate_caches()
         
         logger.info(f"[SUCCESS] Successfully processed device {serial_number}: {len(modules_processed)} modules, {events_stored} events")
         
@@ -5066,6 +5229,7 @@ async def archive_device(serial_number: str):
         
         conn.commit()
         conn.close()
+        invalidate_caches()
         
         logger.info(f"[SUCCESS] Archived device: {serial_number}")
         
@@ -5136,6 +5300,7 @@ async def unarchive_device(serial_number: str):
         
         conn.commit()
         conn.close()
+        invalidate_caches()
         
         logger.info(f"[SUCCESS] Unarchived device: {serial_number}")
         
@@ -5231,6 +5396,7 @@ async def delete_device(serial_number: str, confirm: bool = Query(False)):
         
         conn.commit()
         conn.close()
+        invalidate_caches()
         
         if deleted_count == 0:
             raise HTTPException(status_code=404, detail=f"Device {serial_number} not found")
