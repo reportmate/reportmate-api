@@ -606,6 +606,22 @@ async def ensure_performance_indexes():
             "CREATE INDEX IF NOT EXISTS idx_network_device_id ON network(device_id)",
             "CREATE INDEX IF NOT EXISTS idx_devices_serial ON devices(serial_number)",
             "CREATE INDEX IF NOT EXISTS idx_devices_archived ON devices(archived)",
+            # usage_history table + indexes (migration 009)
+            """CREATE TABLE IF NOT EXISTS usage_history (
+                id BIGSERIAL PRIMARY KEY,
+                device_id TEXT NOT NULL,
+                date DATE NOT NULL,
+                app_name TEXT NOT NULL,
+                publisher TEXT NOT NULL DEFAULT '',
+                launches INTEGER NOT NULL DEFAULT 0,
+                total_seconds DOUBLE PRECISION NOT NULL DEFAULT 0,
+                users JSONB NOT NULL DEFAULT '[]'::jsonb,
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                UNIQUE(device_id, date, app_name)
+            )""",
+            "CREATE INDEX IF NOT EXISTS idx_usage_history_device_date ON usage_history(device_id, date DESC)",
+            "CREATE INDEX IF NOT EXISTS idx_usage_history_app_date ON usage_history(app_name, date DESC)",
+            "CREATE INDEX IF NOT EXISTS idx_usage_history_date ON usage_history(date)",
         ]:
             try:
                 cursor.execute(stmt)
@@ -4088,6 +4104,158 @@ async def get_fleet_application_usage(
         raise HTTPException(status_code=500, detail=f"Failed to retrieve fleet application usage: {str(e)}")
 
 
+# ── Usage History Endpoints (daily aggregated time-series) ──────────────
+
+
+@app.get("/api/devices/applications/usage/history", dependencies=[Depends(verify_authentication)])
+async def get_fleet_usage_history(
+    days: int = Query(default=90, ge=1, le=548, description="Number of days to look back"),
+    app_name: Optional[str] = Query(default=None, alias="appName", description="Filter by application name (exact match)"),
+    device_id: Optional[str] = Query(default=None, alias="deviceId", description="Filter by device serial number")
+):
+    """
+    Fleet-wide daily application usage time-series from the usage_history table.
+    Returns per-day aggregated data suitable for charting.
+    Retention: 18 months. Each row = one device + one app + one day.
+    """
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+
+        cutoff = datetime.now(timezone.utc) - timedelta(days=days)
+
+        where_parts = ["uh.date >= %s"]
+        params: list = [cutoff.date()]
+
+        if app_name:
+            where_parts.append("uh.app_name = %s")
+            params.append(app_name)
+        if device_id:
+            where_parts.append("uh.device_id = %s")
+            params.append(device_id)
+
+        where_clause = " AND ".join(where_parts)
+
+        cursor.execute(f"""
+            SELECT
+                uh.date::text,
+                uh.app_name,
+                SUM(uh.launches) AS launches,
+                SUM(uh.total_seconds) AS total_seconds,
+                COUNT(DISTINCT uh.device_id) AS device_count
+            FROM usage_history uh
+            WHERE {where_clause}
+            GROUP BY uh.date, uh.app_name
+            ORDER BY uh.date, total_seconds DESC
+        """, params)
+
+        rows = cursor.fetchall()
+        conn.close()
+
+        results = []
+        for date_str, name, launches, total_secs, dev_count in rows:
+            results.append({
+                "date": date_str,
+                "appName": name,
+                "launches": int(launches or 0),
+                "totalSeconds": float(total_secs or 0),
+                "totalHours": round(float(total_secs or 0) / 3600, 2),
+                "deviceCount": dev_count or 0
+            })
+
+        return {
+            "days": days,
+            "filters": {"appName": app_name, "deviceId": device_id},
+            "data": results,
+            "count": len(results)
+        }
+
+    except Exception as e:
+        logger.error(f"Failed to get usage history: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/device/{serial_number}/applications/usage/history", dependencies=[Depends(verify_authentication)])
+async def get_device_usage_history(
+    serial_number: str,
+    days: int = Query(default=90, ge=1, le=548, description="Number of days to look back"),
+    app_name: Optional[str] = Query(default=None, alias="appName", description="Filter by application name")
+):
+    """
+    Per-device daily application usage time-series.
+    Returns day-by-day usage for a single device, suitable for device detail page charts.
+    """
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+
+        cutoff = datetime.now(timezone.utc) - timedelta(days=days)
+
+        if app_name:
+            cursor.execute("""
+                SELECT date::text, app_name, launches, total_seconds, users
+                FROM usage_history
+                WHERE device_id = %s AND date >= %s AND app_name = %s
+                ORDER BY date DESC
+            """, (serial_number, cutoff.date(), app_name))
+        else:
+            cursor.execute("""
+                SELECT date::text, app_name, launches, total_seconds, users
+                FROM usage_history
+                WHERE device_id = %s AND date >= %s
+                ORDER BY date DESC, total_seconds DESC
+            """, (serial_number, cutoff.date()))
+
+        rows = cursor.fetchall()
+        conn.close()
+
+        results = []
+        for date_str, name, launches, total_secs, users_json in rows:
+            results.append({
+                "date": date_str,
+                "appName": name,
+                "launches": launches or 0,
+                "totalSeconds": float(total_secs or 0),
+                "totalHours": round(float(total_secs or 0) / 3600, 2),
+                "users": users_json if isinstance(users_json, list) else []
+            })
+
+        return {
+            "serialNumber": serial_number,
+            "days": days,
+            "filters": {"appName": app_name},
+            "data": results,
+            "count": len(results)
+        }
+
+    except Exception as e:
+        logger.error(f"Failed to get device usage history for {serial_number}: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.delete("/api/admin/usage-history/cleanup", dependencies=[Depends(verify_authentication)])
+async def cleanup_usage_history(
+    months: int = Query(default=18, ge=1, le=36, description="Retain data for this many months")
+):
+    """
+    Delete usage_history rows older than the specified retention period.
+    Default retention: 18 months. Call via scheduled task or manually.
+    """
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cutoff = datetime.now(timezone.utc) - timedelta(days=months * 30)
+        cursor.execute("DELETE FROM usage_history WHERE date < %s", (cutoff.date(),))
+        deleted = cursor.rowcount
+        conn.commit()
+        conn.close()
+        logger.info(f"Usage history cleanup: deleted {deleted} rows older than {cutoff.date()}")
+        return {"deleted": deleted, "cutoffDate": str(cutoff.date()), "retentionMonths": months}
+    except Exception as e:
+        logger.error(f"Usage history cleanup failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @app.get("/api/device/{serial_number}/applications/usage", dependencies=[Depends(verify_authentication)], deprecated=True)
 async def get_device_application_usage(
     serial_number: str,
@@ -4498,6 +4666,40 @@ async def submit_events(request: Request):
                     conn.commit()
                     modules_processed.append(module_name)
                     logger.info(f"Stored {module_name} module for device {serial_number}")
+                    
+                    # Extract daily usage history from applications module and UPSERT
+                    if module_name == 'applications' and isinstance(module_data, dict):
+                        daily_history = module_data.get('dailyUsageHistory', [])
+                        if daily_history:
+                            try:
+                                for entry in daily_history:
+                                    date_val = entry.get('date')
+                                    app_name = entry.get('appName')
+                                    if not date_val or not app_name:
+                                        continue
+                                    cursor.execute("""
+                                        INSERT INTO usage_history (device_id, date, app_name, publisher, launches, total_seconds, users, updated_at)
+                                        VALUES (%s, %s, %s, %s, %s, %s, %s::jsonb, NOW())
+                                        ON CONFLICT (device_id, date, app_name) DO UPDATE SET
+                                            publisher = EXCLUDED.publisher,
+                                            launches = EXCLUDED.launches,
+                                            total_seconds = EXCLUDED.total_seconds,
+                                            users = EXCLUDED.users,
+                                            updated_at = NOW()
+                                    """, (
+                                        serial_number,
+                                        date_val,
+                                        app_name,
+                                        entry.get('publisher', ''),
+                                        entry.get('launches', 0),
+                                        entry.get('totalSeconds', 0),
+                                        json.dumps(entry.get('users', []))
+                                    ))
+                                conn.commit()
+                                logger.info(f"Stored {len(daily_history)} daily usage entries for device {serial_number}")
+                            except Exception as usage_err:
+                                logger.error(f"Failed to store daily usage history for {serial_number}: {usage_err}")
+                                conn.rollback()
                     
                     # Update devices table with OS info if system module
                     if module_name == 'system':
