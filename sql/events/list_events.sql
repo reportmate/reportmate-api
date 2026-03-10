@@ -4,7 +4,7 @@
 --   %(offset)s: integer - number of events to skip (for pagination)
 --   %(start_date)s: timestamp - filter events after this date (nullable)
 --   %(end_date)s: timestamp - filter events before this date (nullable)
---   %(event_type)s: text - filter by event type (nullable, e.g. 'error', 'warning', 'success', 'info', 'system')
+--   %(event_types)s: text[] - filter by event types (nullable array, e.g. ['error','warning'])
 
 SELECT 
     e.id,
@@ -32,7 +32,7 @@ LEFT JOIN hardware h ON e.device_id = h.device_id
 LEFT JOIN network n ON e.device_id = n.device_id
 WHERE (%(start_date)s::timestamptz IS NULL OR e.timestamp >= %(start_date)s::timestamptz)
   AND (%(end_date)s::timestamptz IS NULL OR e.timestamp <= %(end_date)s::timestamptz)
-  AND (%(event_type)s::text IS NULL OR e.event_type = %(event_type)s::text)
+  AND (%(event_types)s::text[] IS NULL OR e.event_type = ANY(%(event_types)s::text[]))
 ORDER BY e.timestamp DESC 
 LIMIT %(limit)s
 OFFSET %(offset)s
