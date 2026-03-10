@@ -3143,6 +3143,15 @@ async def get_bulk_system(
                     deferred_updates_count = 0
                     if isinstance(pending, list):
                         deferred_updates_count = sum(1 for u in pending if isinstance(u, dict) and (u.get('deferred') or u.get('deferredUntil')))
+                    # Windows pending updates from SystemModule collection
+                    if pending_updates_count == 0:
+                        win_count = system_data.get('pendingWindowsUpdatesCount', 0)
+                        if isinstance(win_count, int) and win_count > 0:
+                            pending_updates_count = win_count
+                        else:
+                            win_pending = system_data.get('pendingWindowsUpdates') or system_data.get('pending_windows_updates', [])
+                            if isinstance(win_pending, list) and len(win_pending) > 0:
+                                pending_updates_count = len(win_pending)
                     litems = system_data.get('loginItems') or system_data.get('login_items', [])
                     login_items_count = len(litems) if isinstance(litems, list) else 0
                     sext = system_data.get('systemExtensions') or system_data.get('system_extensions', [])
