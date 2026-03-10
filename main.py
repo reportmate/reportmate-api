@@ -744,7 +744,7 @@ async def health_check():
 
 @app.get("/api/dashboard", dependencies=[Depends(verify_authentication)])
 async def get_dashboard_data(
-    events_limit: int = Query(default=50, ge=1, le=200, alias="eventsLimit"),
+    events_limit: int = Query(default=200, ge=1, le=500, alias="eventsLimit"),
     include_archived: bool = Query(default=False, alias="includeArchived")
 ):
     """
@@ -885,25 +885,33 @@ async def get_dashboard_data(
         install_stats = {
             "devicesWithErrors": 0, "devicesWithWarnings": 0,
             "totalErrorItems": 0, "totalWarningItems": 0,
+            "winErrorItems": 0, "winWarningItems": 0,
+            "macErrorItems": 0, "macWarningItems": 0,
             "hasInstallData": False
         }
         try:
             cursor.execute("""
                 SELECT
-                    COALESCE(SUM(
-                        (SELECT COUNT(*) FROM jsonb_array_elements(COALESCE(i.data->'cimian'->'items','[]'::jsonb)) item
-                         WHERE LOWER(item->>'currentStatus') ~ '(error|failed|problem|install-error)')
-                        +
-                        (SELECT COUNT(*) FROM jsonb_array_elements(COALESCE(i.data->'munki'->'items','[]'::jsonb)) item
-                         WHERE LOWER(item->>'status') ~ '(error|failed)')
-                    ), 0) AS total_errors,
-                    COALESCE(SUM(
-                        (SELECT COUNT(*) FROM jsonb_array_elements(COALESCE(i.data->'cimian'->'items','[]'::jsonb)) item
-                         WHERE LOWER(item->>'currentStatus') ~ '(warning|needs-attention)')
-                        +
-                        (SELECT COUNT(*) FROM jsonb_array_elements(COALESCE(i.data->'munki'->'items','[]'::jsonb)) item
-                         WHERE LOWER(item->>'status') LIKE '%%warning%%')
-                    ), 0) AS total_warnings,
+                    -- Windows (Cimian) errors
+                    COALESCE(SUM(CASE WHEN LOWER(COALESCE(d.platform,'')) LIKE '%%windows%%'
+                        THEN (SELECT COUNT(*) FROM jsonb_array_elements(COALESCE(i.data->'cimian'->'items','[]'::jsonb)) item
+                              WHERE LOWER(item->>'currentStatus') ~ '(error|failed|problem|install-error)')
+                        ELSE 0 END), 0) AS win_errors,
+                    -- Windows (Cimian) warnings
+                    COALESCE(SUM(CASE WHEN LOWER(COALESCE(d.platform,'')) LIKE '%%windows%%'
+                        THEN (SELECT COUNT(*) FROM jsonb_array_elements(COALESCE(i.data->'cimian'->'items','[]'::jsonb)) item
+                              WHERE LOWER(item->>'currentStatus') ~ '(warning|needs-attention)')
+                        ELSE 0 END), 0) AS win_warnings,
+                    -- macOS (Munki) errors
+                    COALESCE(SUM(CASE WHEN LOWER(COALESCE(d.platform,'')) LIKE '%%mac%%'
+                        THEN (SELECT COUNT(*) FROM jsonb_array_elements(COALESCE(i.data->'munki'->'items','[]'::jsonb)) item
+                              WHERE LOWER(item->>'status') ~ '(error|failed)')
+                        ELSE 0 END), 0) AS mac_errors,
+                    -- macOS (Munki) warnings
+                    COALESCE(SUM(CASE WHEN LOWER(COALESCE(d.platform,'')) LIKE '%%mac%%'
+                        THEN (SELECT COUNT(*) FROM jsonb_array_elements(COALESCE(i.data->'munki'->'items','[]'::jsonb)) item
+                              WHERE LOWER(item->>'status') LIKE '%%warning%%')
+                        ELSE 0 END), 0) AS mac_warnings,
                     COUNT(*) > 0 AS has_data
                 FROM installs i
                 INNER JOIN devices d ON d.serial_number = i.device_id
@@ -915,43 +923,77 @@ async def get_dashboard_data(
             """)
             stats_row = cursor.fetchone()
             if stats_row:
-                install_stats["totalErrorItems"] = int(stats_row[0] or 0)
-                install_stats["totalWarningItems"] = int(stats_row[1] or 0)
-                install_stats["hasInstallData"] = bool(stats_row[2])
+                win_errors   = int(stats_row[0] or 0)
+                win_warnings = int(stats_row[1] or 0)
+                mac_errors   = int(stats_row[2] or 0)
+                mac_warnings = int(stats_row[3] or 0)
+                install_stats["winErrorItems"]    = win_errors
+                install_stats["winWarningItems"]  = win_warnings
+                install_stats["macErrorItems"]    = mac_errors
+                install_stats["macWarningItems"]  = mac_warnings
+                install_stats["totalErrorItems"]  = win_errors + mac_errors
+                install_stats["totalWarningItems"] = win_warnings + mac_warnings
+                install_stats["hasInstallData"]   = bool(stats_row[4])
         except Exception as stats_error:
             logger.warning(f"Failed to calculate install stats: {stats_error}")
 
         _t6 = _time.monotonic()
         logger.info(f"[DASHBOARD PERF] install stats: {_t6-_t5:.3f}s (errors={install_stats['totalErrorItems']}, warnings={install_stats['totalWarningItems']})")
 
-        # === EVENTS (simple query, fast) ===
+        # === EVENTS (per-type diverse fetch via window function) ===
+        # A plain ORDER BY timestamp returns 100% info events because every
+        # module collection creates one.  Window function picks top-N per type
+        # so success/warning/error/system are always represented.
         events = []
         try:
             cursor.execute("""
-                SELECT e.id, e.device_id, e.event_type, e.message, e.timestamp
-                FROM events e
-                ORDER BY e.timestamp DESC
-                LIMIT %s
+                WITH ranked AS (
+                    SELECT e.id, e.device_id, e.event_type, e.message, e.timestamp,
+                           ROW_NUMBER() OVER (
+                               PARTITION BY e.event_type
+                               ORDER BY e.timestamp DESC
+                           ) AS rn
+                    FROM events e
+                    WHERE e.event_type IN ('success','warning','error','system','info')
+                )
+                SELECT r.id, r.device_id, r.event_type, r.message, r.timestamp,
+                       COALESCE(
+                           NULLIF(NULLIF(i.data->>'deviceName',''),'Unknown'),
+                           NULLIF(NULLIF(i.data->>'device_name',''),'Unknown')
+                       ) AS device_name,
+                       COALESCE(i.data->>'asset_tag', i.data->>'assetTag') AS asset_tag,
+                       COALESCE(
+                           s.data->'operating_system'->>'name',
+                           s.data->'operatingSystem'->>'name',
+                           i.data->>'platform'
+                       ) AS platform
+                FROM ranked r
+                LEFT JOIN inventory i ON r.device_id = i.device_id
+                LEFT JOIN system s ON r.device_id = s.device_id
+                WHERE r.rn <= %s
+                ORDER BY r.timestamp DESC
             """, (events_limit,))
 
-            # Build name lookup from already-fetched inventory data
             for row in cursor.fetchall():
-                event_id, device_id, event_type, message, timestamp = row
-                inv = inv_lookup.get(device_id)
-                ev_name = device_id
-                if inv:
-                    try:
-                        inv_d = inv if isinstance(inv, dict) else json.loads(inv)
-                        ev_name = inv_d.get("deviceName") or device_id
-                    except Exception:
-                        pass
+                event_id, device_id, event_type, message, timestamp, device_name, asset_tag, platform = row
+                ev_name = device_name or device_id
+                if not ev_name or ev_name == device_id:
+                    inv = inv_lookup.get(device_id)
+                    if inv:
+                        try:
+                            inv_d = inv if isinstance(inv, dict) else json.loads(inv)
+                            ev_name = inv_d.get("deviceName") or device_id
+                        except Exception:
+                            pass
                 events.append({
                     "id": event_id, "device": device_id,
                     "deviceName": ev_name, "kind": event_type,
                     "message": message,
                     "ts": timestamp.isoformat() if timestamp else None,
                     "serialNumber": device_id, "eventType": event_type,
-                    "timestamp": timestamp.isoformat() if timestamp else None
+                    "timestamp": timestamp.isoformat() if timestamp else None,
+                    "assetTag": asset_tag,
+                    "platform": platform,
                 })
         except Exception as events_error:
             logger.warning(f"Failed to get events for dashboard: {events_error}")
@@ -3084,13 +3126,64 @@ async def get_bulk_system(
                 services_count = 0
                 updates_count = 0
                 tasks_count = 0
+                pending_updates_count = 0
+                login_items_count = 0
+                extensions_count = 0
+                kernel_extensions_count = 0
                 if system_data:
                     services = system_data.get('services', [])
                     updates = system_data.get('updates', [])
-                    tasks = system_data.get('scheduled_tasks', [])
+                    tasks = system_data.get('scheduled_tasks') or system_data.get('scheduledTasks', [])
                     services_count = len(services) if isinstance(services, list) else 0
                     updates_count = len(updates) if isinstance(updates, list) else 0
                     tasks_count = len(tasks) if isinstance(tasks, list) else 0
+                    # Mac-specific counts
+                    pending = system_data.get('pendingAppleUpdates') or system_data.get('pending_apple_updates', [])
+                    pending_updates_count = len(pending) if isinstance(pending, list) else 0
+                    litems = system_data.get('loginItems') or system_data.get('login_items', [])
+                    login_items_count = len(litems) if isinstance(litems, list) else 0
+                    sext = system_data.get('systemExtensions') or system_data.get('system_extensions', [])
+                    extensions_count = len(sext) if isinstance(sext, list) else 0
+                    kext = system_data.get('kernelExtensions') or system_data.get('kernel_extensions', [])
+                    kernel_extensions_count = len(kext) if isinstance(kext, list) else 0
+                
+                # Extract additional OS details already in the JSONB
+                architecture = os_info.get('architecture') or os_info.get('arch', '')
+                locale = os_info.get('locale', '')
+                time_zone = os_info.get('timeZone') or os_info.get('time_zone', '')
+                install_date = os_info.get('installDate') or os_info.get('install_date', '')
+                feature_update = os_info.get('featureUpdate') or os_info.get('feature_update', '')
+                uptime_string = system_data.get('uptimeString') or system_data.get('uptime_string', '') if system_data else ''
+                
+                # Check systemDetails for Mac locale/timezone/keyboard if not on os_info
+                sys_details = system_data.get('systemDetails') or system_data.get('system_details', {}) if system_data else {}
+                if not locale:
+                    locale = sys_details.get('locale', '')
+                if not time_zone:
+                    time_zone = sys_details.get('timeZone') or sys_details.get('time_zone', '')
+                
+                keyboard_layouts = os_info.get('activeKeyboardLayout') or os_info.get('active_keyboard_layout', '')
+                if not keyboard_layouts:
+                    kb_list = os_info.get('keyboard_layouts') or os_info.get('keyboardLayouts') or sys_details.get('keyboardLayouts', [])
+                    if isinstance(kb_list, list) and kb_list:
+                        keyboard_layouts = ', '.join(str(k) for k in kb_list if k)
+                
+                # Activation details (Windows)
+                activation = os_info.get('activation', {}) or {}
+                activation_status = activation.get('isActivated', activation.get('is_activated'))
+                license_type = activation.get('licenseType') or activation.get('license_type', '')
+                license_source = activation.get('licenseSource') or activation.get('license_source', '')
+                has_firmware_license = activation.get('hasFirmwareLicense', activation.get('has_firmware_license'))
+                
+                # Detect platform
+                os_platform = os_info.get('platform', '')
+                os_name_lower = (os_name or '').lower()
+                if os_platform.lower() == 'darwin' or 'macos' in os_name_lower or 'mac os' in os_name_lower:
+                    platform = 'macOS'
+                elif 'windows' in os_name_lower:
+                    platform = 'Windows'
+                else:
+                    platform = 'Unknown'
                 
                 devices.append({
                     'id': serial_number,
@@ -3107,10 +3200,30 @@ async def get_bulk_system(
                     'osVersion': os_info.get('version'),
                     'buildNumber': os_info.get('build'),
                     'uptime': uptime_seconds,
+                    'uptimeString': uptime_string or None,
                     'bootTime': system_data.get('bootTime') or system_data.get('last_boot_time') if system_data else None,
                     'servicesCount': services_count,
                     'updatesCount': updates_count,
-                    'tasksCount': tasks_count
+                    'tasksCount': tasks_count,
+                    # New enriched fields
+                    'platform': platform,
+                    'architecture': architecture or None,
+                    'edition': os_edition or None,
+                    'displayVersion': os_display_version or None,
+                    'locale': locale or None,
+                    'timeZone': time_zone or None,
+                    'keyboardLayout': keyboard_layouts or None,
+                    'installDate': install_date or None,
+                    'featureUpdate': feature_update or None,
+                    'activationStatus': activation_status,
+                    'licenseType': license_type or None,
+                    'licenseSource': license_source or None,
+                    'hasFirmwareLicense': has_firmware_license,
+                    # Mac-specific counts
+                    'pendingUpdatesCount': pending_updates_count,
+                    'loginItemsCount': login_items_count,
+                    'extensionsCount': extensions_count,
+                    'kernelExtensionsCount': kernel_extensions_count,
                 })
             except Exception as e:
                 logger.warning(f"Error processing system for device {row[0]}: {e}")
@@ -3390,7 +3503,7 @@ async def get_events(
     - offset: Number of events to skip (for pagination, default 0)
     - startDate: Filter events after this ISO8601 date (optional)
     - endDate: Filter events before this ISO8601 date (optional)
-    - type: Filter by event type - success, warning, error, info, system (optional)
+    - type: Filter by event type(s). Single value (e.g. `error`) or comma-separated (e.g. `success,warning,error,system`)
     
     **Response includes:**
     - Event ID, type, message, timestamp
@@ -3420,17 +3533,20 @@ async def get_events(
             except ValueError as e:
                 logger.warning(f"Invalid endDate format: {endDate}, error: {e}")
         
-        # Validate event type filter
+        # Validate event type filter — supports single value or comma-separated list
         VALID_EVENT_TYPES = ['success', 'warning', 'error', 'info', 'system']
-        event_type = None
-        if type and type.lower() in VALID_EVENT_TYPES:
-            event_type = type.lower()
-        elif type:
-            logger.warning(f"Invalid event type filter: {type}")
+        event_types = None  # None means no filter (all types)
+        if type:
+            parts = [t.strip().lower() for t in type.split(',') if t.strip()]
+            valid = [t for t in parts if t in VALID_EVENT_TYPES]
+            if valid:
+                event_types = valid
+            elif parts:
+                logger.warning(f"Invalid event type filter: {type}")
         
         # Get total count first for pagination info
         count_query = load_sql("events/count_events")
-        cursor.execute(count_query, {"start_date": start_date, "end_date": end_date, "event_type": event_type})
+        cursor.execute(count_query, {"start_date": start_date, "end_date": end_date, "event_types": event_types})
         total_count = cursor.fetchone()[0]
         
         # JOIN with inventory to get device names and assetTag in single query
@@ -3440,7 +3556,7 @@ async def get_events(
             "offset": offset,
             "start_date": start_date,
             "end_date": end_date,
-            "event_type": event_type
+            "event_types": event_types
         })
         
         rows = cursor.fetchall()
