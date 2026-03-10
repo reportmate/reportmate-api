@@ -3140,6 +3140,9 @@ async def get_bulk_system(
                     # Mac-specific counts
                     pending = system_data.get('pendingAppleUpdates') or system_data.get('pending_apple_updates', [])
                     pending_updates_count = len(pending) if isinstance(pending, list) else 0
+                    deferred_updates_count = 0
+                    if isinstance(pending, list):
+                        deferred_updates_count = sum(1 for u in pending if isinstance(u, dict) and (u.get('deferred') or u.get('deferredUntil')))
                     litems = system_data.get('loginItems') or system_data.get('login_items', [])
                     login_items_count = len(litems) if isinstance(litems, list) else 0
                     sext = system_data.get('systemExtensions') or system_data.get('system_extensions', [])
@@ -3221,6 +3224,7 @@ async def get_bulk_system(
                     'hasFirmwareLicense': has_firmware_license,
                     # Mac-specific counts
                     'pendingUpdatesCount': pending_updates_count,
+                    'deferredUpdatesCount': deferred_updates_count,
                     'loginItemsCount': login_items_count,
                     'extensionsCount': extensions_count,
                     'kernelExtensionsCount': kernel_extensions_count,
