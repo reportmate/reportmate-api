@@ -3403,6 +3403,7 @@ async def get_bulk_identity(
                     platform_sso = identity_data.get('platformSSOUsers') or identity_data.get('platform_sso_users') or {}
                     domain_trust = identity_data.get('domainTrust') or {}
                     windows_hello = identity_data.get('windowsHello') or {}
+                    session_summary = identity_data.get('sessionSummary') or {}
                     
                     admin_count = sum(1 for u in users if isinstance(u, dict) and u.get('isAdmin')) if isinstance(users, list) else 0
                     disabled_count = sum(1 for u in users if isinstance(u, dict) and u.get('disabled')) if isinstance(users, list) else 0
@@ -3484,6 +3485,12 @@ async def get_bulk_identity(
                     'windowsHello': {
                         'statusDisplay': windows_hello.get('statusDisplay'),
                     } if windows_hello else None,
+                    'sessionSummary': {
+                        'totalSessions': session_summary.get('totalSessions') or session_summary.get('total_sessions', 0),
+                        'uniqueUsers': session_summary.get('uniqueUsers') or session_summary.get('unique_users', 0),
+                        'avgSessionMinutes': session_summary.get('avgSessionMinutes') or session_summary.get('avg_session_minutes', 0),
+                        'medianSessionMinutes': session_summary.get('medianSessionMinutes') or session_summary.get('median_session_minutes', 0),
+                    } if session_summary else None,
                 })
             except Exception as e:
                 logger.warning(f"Error processing identity for device {row[0]}: {e}")
