@@ -679,6 +679,7 @@ async def ensure_performance_indexes():
             "CREATE INDEX IF NOT EXISTS idx_profiles_device_id ON profiles(device_id)",
             "CREATE INDEX IF NOT EXISTS idx_management_device_id ON management(device_id)",
             "CREATE INDEX IF NOT EXISTS idx_applications_device_id ON applications(device_id)",
+            "CREATE INDEX IF NOT EXISTS idx_applications_data_gin ON applications USING gin(data)",
             "CREATE INDEX IF NOT EXISTS idx_peripherals_device_id ON peripherals(device_id)",
             "CREATE INDEX IF NOT EXISTS idx_identity_device_id ON identity(device_id)",
             "CREATE INDEX IF NOT EXISTS idx_displays_device_id ON displays(device_id)",
