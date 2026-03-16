@@ -615,6 +615,20 @@ VALID_MODULE_NAMES = frozenset({
     'displays', 'printers', 'peripherals', 'identity',
 })
 
+class ErrorResponse(BaseModel):
+    """Standard error response body returned by all error handlers."""
+    error: str
+    detail: str
+    status_code: int
+
+class HealthResponse(BaseModel):
+    """Response from /api/health."""
+    status: str
+    timestamp: str
+    database: str
+    version: str
+    deviceIdStandard: str = "serialNumber"
+
 class EventMetadata(BaseModel):
     """Metadata block for event submissions."""
     deviceId: str = Field(..., min_length=1, description="Device UUID")
@@ -647,6 +661,15 @@ class EventSubmission(BaseModel):
 
     class Config:
         extra = "allow"  # module data at top level
+
+
+def paginate(items: list, limit: Optional[int], offset: int) -> list:
+    """Apply offset/limit pagination to a list. Returns full list when limit is None and offset is 0."""
+    if offset:
+        items = items[offset:]
+    if limit is not None:
+        items = items[:limit]
+    return items
 
 
 def infer_platform(os_name: Optional[str]) -> Optional[str]:
@@ -770,7 +793,7 @@ async def ensure_performance_indexes():
     except Exception as e:
         logger.warning(f"[STARTUP] Could not ensure indexes: {e}")
 
-@app.get("/api/health", tags=["health"])
+@app.get("/api/health", response_model=HealthResponse, tags=["health"])
 async def health_check():
     """
     Health check endpoint for monitoring and load balancers.
@@ -1548,8 +1571,8 @@ async def get_device_events(
         raise HTTPException(status_code=500, detail=f"Failed to retrieve events: {str(e)}")
 
 
-@app.get("/api/device/{device_id}/info", dependencies=[Depends(verify_authentication)], tags=["devices"])
-async def get_device_info_fast(device_id: str):
+@app.get("/api/device/{serial_number}/info", dependencies=[Depends(verify_authentication)], tags=["devices"])
+async def get_device_info_fast(serial_number: str):
     """
     Fast endpoint returning only InfoTab data for progressive loading.
     
@@ -1574,7 +1597,7 @@ async def get_device_info_fast(device_id: str):
                    archived, archived_at, client_version, platform, status
             FROM devices 
             WHERE serial_number = %s OR id = %s
-        """, (device_id, device_id))
+        """, (serial_number, serial_number))
         
         device_row = cursor.fetchone()
         if not device_row:
@@ -1636,18 +1659,18 @@ async def get_device_info_fast(device_id: str):
             }
         }
         
-        logger.info(f"Fast info fetch for {device_id}: {len(json.dumps(response))} bytes")
+        logger.info(f"Fast info fetch for {serial_number}: {len(json.dumps(response))} bytes")
         return response
         
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Failed to get fast info for {device_id}: {e}")
+        logger.error(f"Failed to get fast info for {serial_number}: {e}")
         raise HTTPException(status_code=500, detail=f"Failed to retrieve device info: {str(e)}")
 
 
-@app.get("/api/device/{device_id}/modules/{module_name}", dependencies=[Depends(verify_authentication)], tags=["devices"])
-async def get_device_module(device_id: str, module_name: str):
+@app.get("/api/device/{serial_number}/modules/{module_name}", dependencies=[Depends(verify_authentication)], tags=["devices"])
+async def get_device_module(serial_number: str, module_name: str):
     """
     Get individual module data for progressive/on-demand loading.
     
@@ -1677,7 +1700,7 @@ async def get_device_module(device_id: str, module_name: str):
         cursor.execute("""
             SELECT serial_number FROM devices 
             WHERE serial_number = %s OR id = %s
-        """, (device_id, device_id))
+        """, (serial_number, serial_number))
         
         device_row = cursor.fetchone()
         if not device_row:
@@ -1711,13 +1734,13 @@ async def get_device_module(device_id: str, module_name: str):
             "data": module_data
         }
         
-        logger.info(f"Module fetch {module_name} for {device_id}: {len(json.dumps(response))} bytes")
+        logger.info(f"Module fetch {module_name} for {serial_number}: {len(json.dumps(response))} bytes")
         return response
         
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Failed to get module {module_name} for {device_id}: {e}")
+        logger.error(f"Failed to get module {module_name} for {serial_number}: {e}")
         raise HTTPException(status_code=500, detail=f"Failed to retrieve module: {str(e)}")
 
 
@@ -1837,7 +1860,9 @@ async def get_bulk_applications(
     sizeMin: Optional[int] = None,
     sizeMax: Optional[int] = None,
     loadAll: bool = False,
-    include_archived: bool = Query(default=False, alias="includeArchived")
+    include_archived: bool = Query(default=False, alias="includeArchived"),
+    limit: Optional[int] = Query(default=None, ge=1, le=5000, description="Maximum items to return"),
+    offset: int = Query(default=0, ge=0, description="Number of items to skip"),
 ):
     """
     Bulk applications endpoint with filtering support.
@@ -1852,7 +1877,7 @@ async def get_bulk_applications(
         _ckey = (str(dict(sorted(request.query_params.items()))),)
         _cached = cache_get("applications", _ckey)
         if _cached is not None:
-            return _cached
+            return paginate(_cached, limit, offset)
         _t0 = _time.monotonic()
         logger.info(f"Fetching bulk applications (loadAll={loadAll}, includeArchived={include_archived}, filters={dict(request.query_params)})")
         
@@ -1998,7 +2023,7 @@ async def get_bulk_applications(
         logger.info(f"Processed {len(all_applications)} applications from {len(rows)} devices")
         cache_set("applications", all_applications, _ckey)
         logger.info(f"[PERF] /api/devices/applications: {_time.monotonic()-_t0:.3f}s ({len(all_applications)} apps)")
-        return all_applications
+        return paginate(all_applications, limit, offset)
         
     except Exception as e:
         logger.error(f"Failed to get bulk applications: {e}")
@@ -2012,7 +2037,9 @@ async def get_bulk_applications(
 
 @app.get("/api/devices/hardware", dependencies=[Depends(verify_authentication)], tags=["fleet"])
 async def get_bulk_hardware(
-    include_archived: bool = Query(default=False, alias="includeArchived", description="Include archived devices in results")
+    include_archived: bool = Query(default=False, alias="includeArchived", description="Include archived devices in results"),
+    limit: Optional[int] = Query(default=None, ge=1, le=5000, description="Maximum items to return"),
+    offset: int = Query(default=0, ge=0, description="Number of items to skip"),
 ):
     """
     Bulk hardware endpoint.
@@ -2029,7 +2056,7 @@ async def get_bulk_hardware(
         _ckey = (include_archived,)
         _cached = cache_get("hardware", _ckey)
         if _cached is not None:
-            return _cached
+            return paginate(_cached, limit, offset)
         _t0 = _time.monotonic()
         logger.info("Fetching bulk hardware data")
         
@@ -2123,7 +2150,7 @@ async def get_bulk_hardware(
         logger.info(f"Processed {len(all_hardware)} hardware records")
         cache_set("hardware", all_hardware, _ckey)
         logger.info(f"[PERF] /api/devices/hardware: {_time.monotonic()-_t0:.3f}s ({len(all_hardware)} devices)")
-        return all_hardware
+        return paginate(all_hardware, limit, offset)
         
     except Exception as e:
         logger.error(f"Failed to get bulk hardware: {e}")
@@ -2358,7 +2385,9 @@ async def get_installs_filters(
 
 @app.get("/api/devices/installs", dependencies=[Depends(verify_authentication)], tags=["fleet"])
 async def get_bulk_installs(
-    include_archived: bool = Query(default=False, alias="includeArchived", description="Include archived devices in results")
+    include_archived: bool = Query(default=False, alias="includeArchived", description="Include archived devices in results"),
+    limit: Optional[int] = Query(default=None, ge=1, le=5000, description="Maximum items to return"),
+    offset: int = Query(default=0, ge=0, description="Number of items to skip"),
 ):
     """
     Bulk installs endpoint for Cimian managed packages.
@@ -2375,7 +2404,7 @@ async def get_bulk_installs(
         _ckey = (include_archived,)
         _cached = cache_get("installs", _ckey)
         if _cached is not None:
-            return _cached
+            return paginate(_cached, limit, offset)
         _t0 = _time.monotonic()
         logger.info("Fetching bulk installs data")
         
@@ -2465,7 +2494,7 @@ async def get_bulk_installs(
         logger.info(f"Processed {len(all_installs)} install records from {len(rows)} devices")
         cache_set("installs", all_installs, _ckey)
         logger.info(f"[PERF] /api/devices/installs: {_time.monotonic()-_t0:.3f}s ({len(all_installs)} records)")
-        return all_installs
+        return paginate(all_installs, limit, offset)
         
     except Exception as e:
         logger.error(f"Failed to get bulk installs: {e}")
@@ -2475,7 +2504,9 @@ async def get_bulk_installs(
 
 @app.get("/api/devices/installs/full", dependencies=[Depends(verify_authentication)], tags=["fleet"])
 async def get_bulk_installs_full(
-    include_archived: bool = Query(default=False, alias="includeArchived")
+    include_archived: bool = Query(default=False, alias="includeArchived"),
+    limit: Optional[int] = Query(default=None, ge=1, le=5000, description="Maximum items to return"),
+    offset: int = Query(default=0, ge=0, description="Number of items to skip"),
 ):
     """
     Bulk installs endpoint returning FULL device records with nested structure.
@@ -2490,7 +2521,7 @@ async def get_bulk_installs_full(
         _ckey = (include_archived,)
         _cached = cache_get("installs_full", _ckey)
         if _cached is not None:
-            return _cached
+            return paginate(_cached, limit, offset)
         _t0 = _time.monotonic()
         logger.info("Fetching bulk installs (full structure)")
         
@@ -2594,7 +2625,7 @@ async def get_bulk_installs_full(
         logger.info(f"Processed {len(devices)} devices with full installs structure")
         cache_set("installs_full", devices, _ckey)
         logger.info(f"[PERF] /api/devices/installs/full: {_time.monotonic()-_t0:.3f}s ({len(devices)} devices)")
-        return devices
+        return paginate(devices, limit, offset)
         
     except Exception as e:
         logger.error(f"Failed to get bulk installs (full): {e}")
@@ -2603,7 +2634,9 @@ async def get_bulk_installs_full(
 
 @app.get("/api/devices/network", dependencies=[Depends(verify_authentication)], tags=["fleet"])
 async def get_bulk_network(
-    include_archived: bool = Query(default=False, alias="includeArchived", description="Include archived devices in results")
+    include_archived: bool = Query(default=False, alias="includeArchived", description="Include archived devices in results"),
+    limit: Optional[int] = Query(default=None, ge=1, le=5000, description="Maximum items to return"),
+    offset: int = Query(default=0, ge=0, description="Number of items to skip"),
 ):
     """
     Bulk network endpoint for fleet-wide network overview.
@@ -2621,7 +2654,7 @@ async def get_bulk_network(
         _ckey = (include_archived,)
         _cached = cache_get("network", _ckey)
         if _cached is not None:
-            return _cached
+            return paginate(_cached, limit, offset)
         _t0 = _time.monotonic()
         logger.info("Fetching bulk network data")
         
@@ -2669,7 +2702,7 @@ async def get_bulk_network(
         logger.info(f"Processed {len(devices)} devices with network data")
         cache_set("network", devices, _ckey)
         logger.info(f"[PERF] /api/devices/network: {_time.monotonic()-_t0:.3f}s ({len(devices)} devices)")
-        return devices
+        return paginate(devices, limit, offset)
         
     except Exception as e:
         logger.error(f"Failed to get bulk network: {e}")
@@ -2677,7 +2710,9 @@ async def get_bulk_network(
 
 @app.get("/api/devices/security", dependencies=[Depends(verify_authentication)], tags=["fleet"])
 async def get_bulk_security(
-    include_archived: bool = Query(default=False, alias="includeArchived", description="Include archived devices in results")
+    include_archived: bool = Query(default=False, alias="includeArchived", description="Include archived devices in results"),
+    limit: Optional[int] = Query(default=None, ge=1, le=5000, description="Maximum items to return"),
+    offset: int = Query(default=0, ge=0, description="Number of items to skip"),
 ):
     """
     Bulk security endpoint for fleet-wide security overview.
@@ -2696,7 +2731,7 @@ async def get_bulk_security(
         _ckey = (include_archived,)
         _cached = cache_get("security", _ckey)
         if _cached is not None:
-            return _cached
+            return paginate(_cached, limit, offset)
         _t0 = _time.monotonic()
         logger.info("Fetching bulk security data")
         
@@ -2785,7 +2820,7 @@ async def get_bulk_security(
         logger.info(f"Processed {len(devices)} devices with security data")
         cache_set("security", devices, _ckey)
         logger.info(f"[PERF] /api/devices/security: {_time.monotonic()-_t0:.3f}s ({len(devices)} devices)")
-        return devices
+        return paginate(devices, limit, offset)
         
     except Exception as e:
         logger.error(f"Failed to get bulk security: {e}")
@@ -2874,7 +2909,9 @@ async def search_fleet_certificates(
 
 @app.get("/api/devices/management", dependencies=[Depends(verify_authentication)], tags=["fleet"])
 async def get_bulk_management(
-    include_archived: bool = Query(default=False, alias="includeArchived", description="Include archived devices in results")
+    include_archived: bool = Query(default=False, alias="includeArchived", description="Include archived devices in results"),
+    limit: Optional[int] = Query(default=None, ge=1, le=5000, description="Maximum items to return"),
+    offset: int = Query(default=0, ge=0, description="Number of items to skip"),
 ):
     """
     Bulk management endpoint for fleet-wide MDM status.
@@ -2893,7 +2930,7 @@ async def get_bulk_management(
         _ckey = (include_archived,)
         _cached = cache_get("management", _ckey)
         if _cached is not None:
-            return _cached
+            return paginate(_cached, limit, offset)
         _t0 = _time.monotonic()
         logger.info("Fetching bulk management data")
         
@@ -3029,7 +3066,7 @@ async def get_bulk_management(
         logger.info(f"Processed {len(devices)} devices with management data")
         cache_set("management", devices, _ckey)
         logger.info(f"[PERF] /api/devices/management: {_time.monotonic()-_t0:.3f}s ({len(devices)} devices)")
-        return devices
+        return paginate(devices, limit, offset)
         
     except Exception as e:
         logger.error(f"Failed to get bulk management: {e}")
@@ -3037,7 +3074,9 @@ async def get_bulk_management(
 
 @app.get("/api/devices/inventory", dependencies=[Depends(verify_authentication)], tags=["fleet"])
 async def get_bulk_inventory(
-    include_archived: bool = Query(default=False, alias="includeArchived", description="Include archived devices in results")
+    include_archived: bool = Query(default=False, alias="includeArchived", description="Include archived devices in results"),
+    limit: Optional[int] = Query(default=None, ge=1, le=5000, description="Maximum items to return"),
+    offset: int = Query(default=0, ge=0, description="Number of items to skip"),
 ):
     """
     Bulk inventory endpoint for fleet-wide device inventory.
@@ -3055,7 +3094,7 @@ async def get_bulk_inventory(
         _ckey = (include_archived,)
         _cached = cache_get("inventory", _ckey)
         if _cached is not None:
-            return _cached
+            return paginate(_cached, limit, offset)
         _t0 = _time.monotonic()
         logger.info("Fetching bulk inventory data")
         
@@ -3096,7 +3135,7 @@ async def get_bulk_inventory(
         logger.info(f"Processed {len(devices)} devices with inventory data")
         cache_set("inventory", devices, _ckey)
         logger.info(f"[PERF] /api/devices/inventory: {_time.monotonic()-_t0:.3f}s ({len(devices)} devices)")
-        return devices
+        return paginate(devices, limit, offset)
         
     except Exception as e:
         logger.error(f"Failed to get bulk inventory: {e}")
@@ -3105,7 +3144,8 @@ async def get_bulk_inventory(
 @app.get("/api/devices/system", dependencies=[Depends(verify_authentication)], tags=["fleet"])
 async def get_bulk_system(
     include_archived: bool = Query(default=False, alias="includeArchived", description="Include archived devices in results"),
-    limit: int = Query(default=1000, le=5000, description="Maximum number of devices to return (default 1000, max 5000)")
+    limit: int = Query(default=1000, le=5000, description="Maximum number of devices to return (default 1000, max 5000)"),
+    offset: int = Query(default=0, ge=0, description="Number of items to skip"),
 ):
     """
     Bulk system endpoint for fleet-wide OS and system information.
@@ -3126,7 +3166,7 @@ async def get_bulk_system(
         _ckey = (include_archived, limit)
         _cached = cache_get("system", _ckey)
         if _cached is not None:
-            return _cached
+            return paginate(_cached, limit, offset)
         _t0 = _time.monotonic()
         logger.info(f"Fetching bulk system data (limit: {limit})")
         
@@ -3310,7 +3350,7 @@ async def get_bulk_system(
         logger.info(f"Processed {len(devices)} devices with system data")
         cache_set("system", devices, _ckey)
         logger.info(f"[PERF] /api/devices/system: {_time.monotonic()-_t0:.3f}s ({len(devices)} devices)")
-        return devices
+        return paginate(devices, limit, offset)
         
     except Exception as e:
         logger.error(f"Failed to get bulk system: {e}")
@@ -3318,7 +3358,9 @@ async def get_bulk_system(
 
 @app.get("/api/devices/peripherals", dependencies=[Depends(verify_authentication)], tags=["fleet"])
 async def get_bulk_peripherals(
-    include_archived: bool = Query(default=False, alias="includeArchived", description="Include archived devices in results")
+    include_archived: bool = Query(default=False, alias="includeArchived", description="Include archived devices in results"),
+    limit: Optional[int] = Query(default=None, ge=1, le=5000, description="Maximum items to return"),
+    offset: int = Query(default=0, ge=0, description="Number of items to skip"),
 ):
     """
     Bulk peripherals endpoint for fleet-wide peripheral devices.
@@ -3343,7 +3385,7 @@ async def get_bulk_peripherals(
         _ckey = (include_archived,)
         _cached = cache_get("peripherals", _ckey)
         if _cached is not None:
-            return _cached
+            return paginate(_cached, limit, offset)
         _t0 = _time.monotonic()
         logger.info("Fetching bulk peripherals data")
         
@@ -3393,7 +3435,7 @@ async def get_bulk_peripherals(
         logger.info(f"Processed {len(devices)} devices with peripherals data")
         cache_set("peripherals", devices, _ckey)
         logger.info(f"[PERF] /api/devices/peripherals: {_time.monotonic()-_t0:.3f}s ({len(devices)} devices)")
-        return devices
+        return paginate(devices, limit, offset)
         
     except Exception as e:
         logger.error(f"Failed to get bulk peripherals: {e}")
@@ -3401,7 +3443,9 @@ async def get_bulk_peripherals(
 
 @app.get("/api/devices/identity", dependencies=[Depends(verify_authentication)], tags=["fleet"])
 async def get_bulk_identity(
-    include_archived: bool = Query(default=False, alias="includeArchived", description="Include archived devices in results")
+    include_archived: bool = Query(default=False, alias="includeArchived", description="Include archived devices in results"),
+    limit: Optional[int] = Query(default=None, ge=1, le=5000, description="Maximum items to return"),
+    offset: int = Query(default=0, ge=0, description="Number of items to skip"),
 ):
     """
     Bulk identity endpoint for fleet-wide user account and identity data.
@@ -3424,7 +3468,7 @@ async def get_bulk_identity(
         _ckey = (include_archived,)
         _cached = cache_get("identity", _ckey)
         if _cached is not None:
-            return _cached
+            return paginate(_cached, limit, offset)
         _t0 = _time.monotonic()
         logger.info("Fetching bulk identity data")
         
@@ -3563,7 +3607,7 @@ async def get_bulk_identity(
         logger.info(f"Processed {len(devices)} devices with identity data")
         cache_set("identity", devices, _ckey)
         logger.info(f"[PERF] /api/devices/identity: {_time.monotonic()-_t0:.3f}s ({len(devices)} devices)")
-        return devices
+        return paginate(devices, limit, offset)
         
     except Exception as e:
         logger.error(f"Failed to get bulk identity: {e}")
@@ -3572,7 +3616,9 @@ async def get_bulk_identity(
 
 @app.get("/api/devices/profiles", dependencies=[Depends(verify_authentication)], tags=["fleet"])
 async def get_bulk_profiles(
-    include_archived: bool = Query(default=False, alias="includeArchived", description="Include archived devices in results")
+    include_archived: bool = Query(default=False, alias="includeArchived", description="Include archived devices in results"),
+    limit: Optional[int] = Query(default=None, ge=1, le=5000, description="Maximum items to return"),
+    offset: int = Query(default=0, ge=0, description="Number of items to skip"),
 ):
     """
     Bulk profiles endpoint for fleet-wide MDM profile and configuration data.
@@ -3585,7 +3631,7 @@ async def get_bulk_profiles(
         _ckey = (include_archived,)
         _cached = cache_get("profiles", _ckey)
         if _cached is not None:
-            return _cached
+            return paginate(_cached, limit, offset)
         _t0 = _time.monotonic()
         logger.info("Fetching bulk profiles data")
         
@@ -3637,7 +3683,7 @@ async def get_bulk_profiles(
         logger.info(f"Processed {len(devices)} devices with profiles data")
         cache_set("profiles", devices, _ckey)
         logger.info(f"[PERF] /api/devices/profiles: {_time.monotonic()-_t0:.3f}s ({len(devices)} devices)")
-        return devices
+        return paginate(devices, limit, offset)
         
     except Exception as e:
         logger.error(f"Failed to get bulk profiles: {e}")
@@ -5486,20 +5532,35 @@ async def debug_database():
         logger.error(f"Database diagnostic failed: {e}")
         raise HTTPException(status_code=500, detail=f"Database diagnostic failed: {str(e)}")
 
-# Error handlers
+# Error handlers -- standard format: {"error": str, "detail": str, "status_code": int}
 
-@app.exception_handler(404)
-async def not_found_handler(request: Request, exc: HTTPException):
+_HTTP_ERROR_LABELS = {
+    400: "Bad request",
+    401: "Unauthorized",
+    403: "Forbidden",
+    404: "Not found",
+    405: "Method not allowed",
+    409: "Conflict",
+    422: "Validation error",
+    429: "Too many requests",
+    500: "Internal server error",
+    502: "Bad gateway",
+    503: "Service unavailable",
+}
+
+@app.exception_handler(HTTPException)
+async def http_exception_handler(request: Request, exc: HTTPException):
+    label = _HTTP_ERROR_LABELS.get(exc.status_code, "Error")
     return JSONResponse(
-        status_code=404,
-        content={"error": "Not found", "detail": exc.detail}
+        status_code=exc.status_code,
+        content={"error": label, "detail": exc.detail or label, "status_code": exc.status_code},
     )
 
 @app.exception_handler(500)
 async def internal_error_handler(request: Request, exc: Exception):
     return JSONResponse(
         status_code=500,
-        content={"error": "Internal server error", "detail": str(exc)}
+        content={"error": "Internal server error", "detail": str(exc), "status_code": 500},
     )
 
 if __name__ == "__main__":
