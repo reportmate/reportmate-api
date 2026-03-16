@@ -12,6 +12,7 @@ ReportMate FastAPI Application
 import json
 import logging
 import os
+import re
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
@@ -20,8 +21,12 @@ import pg8000
 # Use pyformat paramstyle for named parameters like %(name)s
 pg8000.paramstyle = 'pyformat'
 from fastapi import FastAPI, HTTPException, Query, Request, Header, Depends
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
+from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi.util import get_remote_address
+from slowapi.errors import RateLimitExceeded
 
 # Azure Web PubSub for real-time events
 try:
@@ -236,8 +241,8 @@ API requests are subject to rate limiting. Contact support for increased limits.
         "email": "support@ecuad.ca"
     },
     license_info={
-        "name": "Apache 2.0",
-        "url": "https://www.apache.org/licenses/LICENSE-2.0.html"
+        "name": "AGPL-3.0",
+        "url": "https://www.gnu.org/licenses/agpl-3.0.html"
     },
     openapi_tags=[
         {
@@ -266,6 +271,23 @@ API requests are subject to rate limiting. Contact support for increased limits.
         }
     ]
 )
+
+# CORS middleware — explicit allowed origins for frontend and marketing domains
+CORS_ORIGINS = os.getenv("CORS_ORIGINS", "").split(",") if os.getenv("CORS_ORIGINS") else []
+CORS_ORIGINS = [o.strip() for o in CORS_ORIGINS if o.strip()]
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=CORS_ORIGINS,
+    allow_credentials=True,
+    allow_methods=["GET", "POST", "PATCH", "DELETE", "OPTIONS"],
+    allow_headers=["X-Client-Passphrase", "X-Internal-Secret", "X-API-PASSPHRASE", "Content-Type", "Authorization"],
+)
+
+# Rate limiting
+limiter = Limiter(key_func=get_remote_address, default_limits=["120/minute"])
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
 # Database connection configuration
 DATABASE_URL = os.getenv('DATABASE_URL', 'postgresql://reportmate:password@localhost:5432/reportmate')
@@ -585,6 +607,48 @@ class DevicesResponse(BaseModel):
     hasMore: Optional[bool] = None
 
 
+# --- Event submission models ---
+
+VALID_MODULE_NAMES = frozenset({
+    'system', 'hardware', 'network', 'installs', 'security',
+    'applications', 'inventory', 'management', 'profiles',
+    'displays', 'printers', 'peripherals', 'identity',
+})
+
+class EventMetadata(BaseModel):
+    """Metadata block for event submissions."""
+    deviceId: str = Field(..., min_length=1, description="Device UUID")
+    serialNumber: str = Field(..., min_length=1, description="Hardware serial number")
+    collectedAt: Optional[str] = None
+    clientVersion: Optional[str] = None
+    platform: Optional[str] = Field(default="Unknown", pattern=r'^(Windows|macOS|Linux|Unknown)$')
+    collectionType: Optional[str] = Field(default="Full", pattern=r'^(Full|Single)$')
+    enabledModules: Optional[List[str]] = None
+
+    # Accept snake_case aliases from older clients
+    class Config:
+        populate_by_name = True
+
+    device_id: Optional[str] = Field(None, alias='device_id', exclude=True)
+    serial_number: Optional[str] = Field(None, alias='serial_number', exclude=True)
+    collected_at: Optional[str] = Field(None, alias='collected_at', exclude=True)
+    client_version: Optional[str] = Field(None, alias='client_version', exclude=True)
+    collection_type: Optional[str] = Field(None, alias='collection_type', exclude=True)
+    enabled_modules: Optional[List[str]] = Field(None, alias='enabled_modules', exclude=True)
+
+class EventSubmission(BaseModel):
+    """
+    Top-level payload for POST /api/events.
+    Module data lives at the top level alongside metadata.
+    """
+    metadata: EventMetadata
+    events: Optional[List[Dict[str, Any]]] = None
+    modules: Optional[Dict[str, Any]] = None
+
+    class Config:
+        extra = "allow"  # module data at top level
+
+
 def infer_platform(os_name: Optional[str]) -> Optional[str]:
     """Infer platform from OS name."""
     if not os_name:
@@ -632,7 +696,7 @@ async def root():
             "events": "/api/events",
             "events_submit": "/api/events (POST)",
             "signalr": "/api/negotiate",
-            "debug_database": "/api/debug/database"
+            "debug_database": "/api/debug/database (admin)"
         }
     }
 
@@ -743,7 +807,7 @@ async def health_check():
             }
         )
 
-@app.get("/api/dashboard", dependencies=[Depends(verify_authentication)])
+@app.get("/api/dashboard", dependencies=[Depends(verify_authentication)], tags=["statistics"])
 async def get_dashboard_data(
     events_limit: int = Query(default=200, ge=1, le=500, alias="eventsLimit"),
     include_archived: bool = Query(default=False, alias="includeArchived")
@@ -1370,7 +1434,7 @@ async def get_device_by_serial(serial_number: str):
         raise HTTPException(status_code=500, detail=f"Failed to retrieve device: {str(e)}")
 
 
-@app.get("/api/device/{serial_number}/installs/log", dependencies=[Depends(verify_authentication)])
+@app.get("/api/device/{serial_number}/installs/log", dependencies=[Depends(verify_authentication)], tags=["devices"])
 async def get_device_installs_log(serial_number: str):
     """
     Get the full run log for the installs module.
@@ -1400,7 +1464,7 @@ async def get_device_installs_log(serial_number: str):
     except Exception as e:
         logger.error(f"Failed to get installs log for {serial_number}: {e}")
         raise HTTPException(status_code=500, detail=f"Failed to retrieve installs log: {str(e)}")
-@app.get("/api/device/{serial_number}/events", dependencies=[Depends(verify_authentication)])
+@app.get("/api/device/{serial_number}/events", dependencies=[Depends(verify_authentication)], tags=["devices"])
 async def get_device_events(
     serial_number: str,
     limit: int = 100,
@@ -1484,7 +1548,7 @@ async def get_device_events(
         raise HTTPException(status_code=500, detail=f"Failed to retrieve events: {str(e)}")
 
 
-@app.get("/api/device/{device_id}/info", dependencies=[Depends(verify_authentication)])
+@app.get("/api/device/{device_id}/info", dependencies=[Depends(verify_authentication)], tags=["devices"])
 async def get_device_info_fast(device_id: str):
     """
     Fast endpoint returning only InfoTab data for progressive loading.
@@ -1582,7 +1646,7 @@ async def get_device_info_fast(device_id: str):
         raise HTTPException(status_code=500, detail=f"Failed to retrieve device info: {str(e)}")
 
 
-@app.get("/api/device/{device_id}/modules/{module_name}", dependencies=[Depends(verify_authentication)])
+@app.get("/api/device/{device_id}/modules/{module_name}", dependencies=[Depends(verify_authentication)], tags=["devices"])
 async def get_device_module(device_id: str, module_name: str):
     """
     Get individual module data for progressive/on-demand loading.
@@ -1759,7 +1823,7 @@ async def get_applications_filters(
         raise HTTPException(status_code=500, detail=f"Failed to retrieve applications filters: {str(e)}")
 
 
-@app.get("/api/devices/applications", dependencies=[Depends(verify_authentication)])
+@app.get("/api/devices/applications", dependencies=[Depends(verify_authentication)], tags=["fleet"])
 async def get_bulk_applications(
     request: Request,
     deviceNames: Optional[str] = None,
@@ -2409,7 +2473,7 @@ async def get_bulk_installs(
 
 
 
-@app.get("/api/devices/installs/full", dependencies=[Depends(verify_authentication)])
+@app.get("/api/devices/installs/full", dependencies=[Depends(verify_authentication)], tags=["fleet"])
 async def get_bulk_installs_full(
     include_archived: bool = Query(default=False, alias="includeArchived")
 ):
@@ -3505,6 +3569,81 @@ async def get_bulk_identity(
         logger.error(f"Failed to get bulk identity: {e}")
         raise HTTPException(status_code=500, detail=f"Failed to retrieve bulk identity: {str(e)}")
 
+
+@app.get("/api/devices/profiles", dependencies=[Depends(verify_authentication)], tags=["fleet"])
+async def get_bulk_profiles(
+    include_archived: bool = Query(default=False, alias="includeArchived", description="Include archived devices in results")
+):
+    """
+    Bulk profiles endpoint for fleet-wide MDM profile and configuration data.
+    
+    Returns devices with MDM profiles, configuration profiles, and management settings.
+    Used by /devices/profiles page for fleet-wide profile visibility.
+    By default, archived devices are excluded. Use includeArchived=true to include them.
+    """
+    try:
+        _ckey = (include_archived,)
+        _cached = cache_get("profiles", _ckey)
+        if _cached is not None:
+            return _cached
+        _t0 = _time.monotonic()
+        logger.info("Fetching bulk profiles data")
+        
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        
+        query = load_sql("devices/bulk_profiles")
+        
+        cursor.execute(query, {"include_archived": include_archived})
+        rows = cursor.fetchall()
+        conn.close()
+        
+        logger.info(f"Retrieved {len(rows)} devices with profiles data")
+        
+        devices = []
+        for row in rows:
+            try:
+                serial_number, device_uuid, last_seen, profiles_data, profiles_collected_at, profiles_updated_at, device_name, computer_name, usage, catalog, location, asset_tag = row
+                
+                # Extract profile summary from JSONB data
+                profile_list = []
+                profile_count = 0
+                if profiles_data and isinstance(profiles_data, dict):
+                    profile_list = profiles_data.get('profiles', profiles_data.get('configurationProfiles', []))
+                    if isinstance(profile_list, list):
+                        profile_count = len(profile_list)
+                    else:
+                        profile_list = []
+                
+                devices.append({
+                    'id': serial_number,
+                    'deviceId': serial_number,
+                    'deviceName': device_name or computer_name or serial_number,
+                    'serialNumber': serial_number,
+                    'assetTag': asset_tag,
+                    'lastSeen': last_seen.isoformat() if last_seen else None,
+                    'collectedAt': profiles_collected_at.isoformat() if profiles_collected_at else None,
+                    'updatedAt': profiles_updated_at.isoformat() if profiles_updated_at else None,
+                    'usage': usage,
+                    'catalog': catalog,
+                    'location': location,
+                    'profileCount': profile_count,
+                    'profiles': profile_list[:50],  # Cap at 50 profiles per device for bulk response
+                })
+            except Exception as e:
+                logger.warning(f"Error processing profiles for device {row[0]}: {e}")
+                continue
+        
+        logger.info(f"Processed {len(devices)} devices with profiles data")
+        cache_set("profiles", devices, _ckey)
+        logger.info(f"[PERF] /api/devices/profiles: {_time.monotonic()-_t0:.3f}s ({len(devices)} devices)")
+        return devices
+        
+    except Exception as e:
+        logger.error(f"Failed to get bulk profiles: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to retrieve bulk profiles: {str(e)}")
+
+
 @app.get("/api/events", dependencies=[Depends(verify_authentication)], tags=["events"])
 async def get_events(
     limit: int = Query(default=100, ge=1, le=1000, description="Maximum number of events to return"),
@@ -3619,7 +3758,7 @@ async def get_events(
         logger.error(f"Failed to get events: {e}")
         raise HTTPException(status_code=500, detail=f"Failed to retrieve events: {str(e)}")
 
-@app.get("/api/events/{event_id}/payload", dependencies=[Depends(verify_authentication)])
+@app.get("/api/events/{event_id}/payload", dependencies=[Depends(verify_authentication)], tags=["events"])
 async def get_event_payload(event_id: int):
     """
     Get the FULL payload for a specific event including related module data.
@@ -3713,218 +3852,7 @@ async def get_event_payload(event_id: int):
         raise HTTPException(status_code=500, detail=f"Failed to retrieve event payload: {str(e)}")
 
 
-@app.get("/api/stats/applications/usage", dependencies=[Depends(verify_authentication)], deprecated=True)
-async def get_application_usage_stats(
-    days: int = Query(default=30, ge=1, le=365, description="Number of days to look back for usage data"),
-    include_archived: bool = Query(default=False, alias="includeArchived")
-):
-    """
-    DEPRECATED: This endpoint queries the empty application_usage_events table.
-    Use GET /api/devices/applications/usage instead, which extracts usage from JSONB.
-    
-    Get aggregated application usage statistics for fleet-wide analytics.
-    
-    Returns:
-        - Top applications by total usage time
-        - Top applications by launch count
-        - Top users by usage time
-        - Unused applications (no usage in specified days)
-        - Summary statistics
-    
-    This endpoint queries the application_usage_events and application_usage_summary tables
-    populated by the Windows client's kernel process telemetry.
-    """
-    try:
-        conn = get_db_connection()
-        cursor = conn.cursor()
-        
-        # Check if usage tables exist
-        cursor.execute("""
-            SELECT EXISTS (
-                SELECT FROM information_schema.tables 
-                WHERE table_name = 'application_usage_events'
-            )
-        """)
-        usage_tables_exist = cursor.fetchone()[0]
-        
-        if not usage_tables_exist:
-            # Usage tables don't exist yet - return empty stats with appropriate message
-            logger.info("Application usage tables not yet created - returning empty stats")
-            conn.close()
-            return {
-                "status": "unavailable",
-                "message": "Application usage tracking not yet deployed. Run schema migration 005-application-usage-tracking.sql to enable.",
-                "topAppsByTime": [],
-                "topAppsByLaunches": [],
-                "topUsers": [],
-                "unusedApps": [],
-                "summary": {
-                    "totalAppsTracked": 0,
-                    "totalUsageHours": 0,
-                    "totalLaunches": 0,
-                    "uniqueUsers": 0,
-                    "devicesWithUsageData": 0,
-                    "appsWithNoRecentUsage": 0
-                },
-                "lastUpdated": datetime.now(timezone.utc).isoformat(),
-                "lookbackDays": days
-            }
-        
-        cutoff_date = datetime.now(timezone.utc) - timedelta(days=days)
-        
-        # Archive filter clause
-        archive_join = ""
-        archive_where = ""
-        if not include_archived:
-            archive_join = "INNER JOIN devices d ON e.device_id = d.serial_number"
-            archive_where = "AND d.archived = FALSE"
-        
-        # Top applications by total usage time
-        cursor.execute(f"""
-            SELECT 
-                e.application_name,
-                SUM(e.duration_seconds) as total_seconds,
-                COUNT(*) as launch_count,
-                COUNT(DISTINCT e.username) as unique_users,
-                MAX(e.end_time) as last_used
-            FROM application_usage_events e
-            {archive_join}
-            WHERE e.start_time >= %s
-            {archive_where}
-            GROUP BY e.application_name
-            ORDER BY total_seconds DESC
-            LIMIT 20
-        """, (cutoff_date,))
-        
-        top_by_time = []
-        for row in cursor.fetchall():
-            app_name, total_secs, launches, users, last_used = row
-            top_by_time.append({
-                "name": app_name,
-                "totalSeconds": int(total_secs) if total_secs else 0,
-                "launchCount": launches,
-                "uniqueUsers": users,
-                "lastUsed": last_used.isoformat() if last_used else None
-            })
-        
-        # Top applications by launch count
-        cursor.execute(f"""
-            SELECT 
-                e.application_name,
-                COUNT(*) as launch_count,
-                SUM(e.duration_seconds) as total_seconds,
-                COUNT(DISTINCT e.username) as unique_users,
-                MAX(e.end_time) as last_used
-            FROM application_usage_events e
-            {archive_join}
-            WHERE e.start_time >= %s
-            {archive_where}
-            GROUP BY e.application_name
-            ORDER BY launch_count DESC
-            LIMIT 20
-        """, (cutoff_date,))
-        
-        top_by_launches = []
-        for row in cursor.fetchall():
-            app_name, launches, total_secs, users, last_used = row
-            top_by_launches.append({
-                "name": app_name,
-                "launchCount": launches,
-                "totalSeconds": int(total_secs) if total_secs else 0,
-                "uniqueUsers": users,
-                "lastUsed": last_used.isoformat() if last_used else None
-            })
-        
-        # Top users by total usage time
-        cursor.execute(f"""
-            SELECT 
-                e.username,
-                SUM(e.duration_seconds) as total_seconds,
-                COUNT(*) as launch_count,
-                COUNT(DISTINCT e.application_name) as apps_used
-            FROM application_usage_events e
-            {archive_join}
-            WHERE e.start_time >= %s
-                AND e.username IS NOT NULL
-                AND e.username != ''
-            {archive_where}
-            GROUP BY e.username
-            ORDER BY total_seconds DESC
-            LIMIT 15
-        """, (cutoff_date,))
-        
-        top_users = []
-        for row in cursor.fetchall():
-            username, total_secs, launches, apps = row
-            top_users.append({
-                "username": username,
-                "totalSeconds": int(total_secs) if total_secs else 0,
-                "launchCount": launches,
-                "appsUsed": apps
-            })
-        
-        # Summary statistics
-        cursor.execute(f"""
-            SELECT 
-                COUNT(DISTINCT e.application_name) as total_apps,
-                COALESCE(SUM(e.duration_seconds), 0) as total_seconds,
-                COUNT(*) as total_launches,
-                COUNT(DISTINCT e.username) as unique_users,
-                COUNT(DISTINCT e.device_id) as devices
-            FROM application_usage_events e
-            {archive_join}
-            WHERE e.start_time >= %s
-            {archive_where}
-        """, (cutoff_date,))
-        
-        summary_row = cursor.fetchone()
-        total_apps, total_secs, total_launches, unique_users, devices = summary_row
-        
-        # Get count of installed apps with no recent usage
-        # This requires joining with the applications table
-        cursor.execute(f"""
-            WITH recent_usage AS (
-                SELECT DISTINCT application_name 
-                FROM application_usage_events 
-                WHERE start_time >= %s
-            )
-            SELECT COUNT(DISTINCT a.data->>'name')
-            FROM applications a
-            INNER JOIN devices d ON a.device_id = d.id
-            WHERE NOT EXISTS (
-                SELECT 1 FROM recent_usage ru 
-                WHERE LOWER(ru.application_name) = LOWER(a.data->>'name')
-            )
-            {'AND d.archived = FALSE' if not include_archived else ''}
-        """, (cutoff_date,))
-        
-        unused_count = cursor.fetchone()[0] or 0
-        
-        conn.close()
-        
-        return {
-            "status": "available",
-            "topAppsByTime": top_by_time,
-            "topAppsByLaunches": top_by_launches,
-            "topUsers": top_users,
-            "summary": {
-                "totalAppsTracked": total_apps or 0,
-                "totalUsageHours": round((total_secs or 0) / 3600, 1),
-                "totalLaunches": total_launches or 0,
-                "uniqueUsers": unique_users or 0,
-                "devicesWithUsageData": devices or 0,
-                "appsWithNoRecentUsage": unused_count
-            },
-            "lastUpdated": datetime.now(timezone.utc).isoformat(),
-            "lookbackDays": days
-        }
-        
-    except Exception as e:
-        logger.error(f"Failed to get application usage stats: {e}")
-        raise HTTPException(status_code=500, detail=f"Failed to retrieve application usage statistics: {str(e)}")
-
-
-@app.get("/api/devices/applications/usage", dependencies=[Depends(verify_authentication)])
+@app.get("/api/devices/applications/usage", dependencies=[Depends(verify_authentication)], tags=["fleet"])
 async def get_fleet_application_usage(
     days: int = Query(default=30, ge=1, le=365, description="Number of days to look back for usage data"),
     applicationNames: Optional[str] = Query(default=None, description="Comma-separated list of application names to filter"),
@@ -4433,7 +4361,7 @@ async def get_fleet_application_usage(
 # ── Usage History Endpoints (daily aggregated time-series) ──────────────
 
 
-@app.get("/api/devices/applications/usage/history", dependencies=[Depends(verify_authentication)])
+@app.get("/api/devices/applications/usage/history", dependencies=[Depends(verify_authentication)], tags=["fleet"])
 async def get_fleet_usage_history(
     days: int = Query(default=90, ge=1, le=548, description="Number of days to look back"),
     app_name: Optional[str] = Query(default=None, alias="appName", description="Filter by application name (exact match)"),
@@ -4501,7 +4429,7 @@ async def get_fleet_usage_history(
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.get("/api/device/{serial_number}/applications/usage/history", dependencies=[Depends(verify_authentication)])
+@app.get("/api/device/{serial_number}/applications/usage/history", dependencies=[Depends(verify_authentication)], tags=["devices"])
 async def get_device_usage_history(
     serial_number: str,
     days: int = Query(default=90, ge=1, le=548, description="Number of days to look back"),
@@ -4559,7 +4487,7 @@ async def get_device_usage_history(
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.delete("/api/admin/usage-history/cleanup", dependencies=[Depends(verify_authentication)])
+@app.delete("/api/admin/usage-history/cleanup", dependencies=[Depends(verify_authentication)], tags=["admin"])
 async def cleanup_usage_history(
     months: int = Query(default=18, ge=1, le=36, description="Retain data for this many months")
 ):
@@ -4582,140 +4510,7 @@ async def cleanup_usage_history(
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.get("/api/device/{serial_number}/applications/usage", dependencies=[Depends(verify_authentication)], deprecated=True)
-async def get_device_application_usage(
-    serial_number: str,
-    days: int = Query(default=30, ge=1, le=365, description="Number of days to look back for usage data")
-):
-    """
-    DEPRECATED: This endpoint queries the empty application_usage_events table.
-    Use GET /api/device/{serial_number} instead — the applications module JSONB
-    already contains usage data (activeSessions, captureMethod, etc.).
-    
-    Get application usage statistics for a specific device.
-    
-    Returns usage data collected via kernel process telemetry for the specified device.
-    """
-    try:
-        conn = get_db_connection()
-        cursor = conn.cursor()
-        
-        # Check if usage tables exist
-        cursor.execute("""
-            SELECT EXISTS (
-                SELECT FROM information_schema.tables 
-                WHERE table_name = 'application_usage_events'
-            )
-        """)
-        usage_tables_exist = cursor.fetchone()[0]
-        
-        if not usage_tables_exist:
-            conn.close()
-            return {
-                "status": "unavailable",
-                "message": "Application usage tracking not yet deployed",
-                "applications": [],
-                "users": [],
-                "summary": {}
-            }
-        
-        cutoff_date = datetime.now(timezone.utc) - timedelta(days=days)
-        
-        # Get usage data aggregated by application
-        cursor.execute("""
-            SELECT 
-                application_name,
-                SUM(duration_seconds) as total_seconds,
-                COUNT(*) as launch_count,
-                array_agg(DISTINCT username) FILTER (WHERE username IS NOT NULL AND username != '') as users,
-                MAX(end_time) as last_used,
-                MIN(start_time) as first_seen,
-                AVG(duration_seconds) as avg_session
-            FROM application_usage_events
-            WHERE device_id = %s
-                AND start_time >= %s
-            GROUP BY application_name
-            ORDER BY total_seconds DESC
-        """, (serial_number, cutoff_date))
-        
-        applications = []
-        for row in cursor.fetchall():
-            app_name, total_secs, launches, users, last_used, first_seen, avg_session = row
-            applications.append({
-                "name": app_name,
-                "totalSeconds": int(total_secs) if total_secs else 0,
-                "launchCount": launches,
-                "users": users or [],
-                "uniqueUserCount": len(users) if users else 0,
-                "lastUsed": last_used.isoformat() if last_used else None,
-                "firstSeen": first_seen.isoformat() if first_seen else None,
-                "averageSessionSeconds": int(avg_session) if avg_session else 0
-            })
-        
-        # Get usage by user for this device
-        cursor.execute("""
-            SELECT 
-                username,
-                SUM(duration_seconds) as total_seconds,
-                COUNT(*) as launch_count,
-                COUNT(DISTINCT application_name) as apps_used
-            FROM application_usage_events
-            WHERE device_id = %s
-                AND start_time >= %s
-                AND username IS NOT NULL
-                AND username != ''
-            GROUP BY username
-            ORDER BY total_seconds DESC
-        """, (serial_number, cutoff_date))
-        
-        users = []
-        for row in cursor.fetchall():
-            username, total_secs, launches, apps_used = row
-            users.append({
-                "username": username,
-                "totalSeconds": int(total_secs) if total_secs else 0,
-                "launchCount": launches,
-                "appsUsed": apps_used
-            })
-        
-        # Summary for device
-        cursor.execute("""
-            SELECT 
-                COUNT(DISTINCT application_name) as total_apps,
-                COALESCE(SUM(duration_seconds), 0) as total_seconds,
-                COUNT(*) as total_launches,
-                COUNT(DISTINCT username) as unique_users
-            FROM application_usage_events
-            WHERE device_id = %s
-                AND start_time >= %s
-        """, (serial_number, cutoff_date))
-        
-        summary_row = cursor.fetchone()
-        total_apps, total_secs, total_launches, unique_users = summary_row
-        
-        conn.close()
-        
-        return {
-            "status": "available",
-            "serialNumber": serial_number,
-            "applications": applications,
-            "users": users,
-            "summary": {
-                "totalAppsUsed": total_apps or 0,
-                "totalUsageHours": round((total_secs or 0) / 3600, 1),
-                "totalLaunches": total_launches or 0,
-                "uniqueUsers": unique_users or 0
-            },
-            "lookbackDays": days,
-            "lastUpdated": datetime.now(timezone.utc).isoformat()
-        }
-        
-    except Exception as e:
-        logger.error(f"Failed to get device application usage for {serial_number}: {e}")
-        raise HTTPException(status_code=500, detail=f"Failed to retrieve device application usage: {str(e)}")
-
-
-@app.get("/api/stats/installs", dependencies=[Depends(verify_authentication)])
+@app.get("/api/stats/installs", dependencies=[Depends(verify_authentication)], tags=["statistics"])
 async def get_install_stats():
     """
     Get aggregated install statistics for dashboard widgets.
@@ -4783,7 +4578,8 @@ async def get_install_stats():
         logger.error(f"Failed to get install stats: {e}")
         raise HTTPException(status_code=500, detail=f"Failed to retrieve install statistics: {str(e)}")
 
-@app.post("/api/events", dependencies=[Depends(verify_authentication)])
+@app.post("/api/events", dependencies=[Depends(verify_authentication)], tags=["events"])
+@limiter.limit("30/minute")
 async def submit_events(request: Request):
     """
     Submit device events and unified module data.
@@ -4792,11 +4588,6 @@ async def submit_events(request: Request):
     - Device registration/update
     - Module data storage (system, hardware, installs, network, etc.)
     - Event creation for tracking
-    
-    CRITICAL EVENT TYPE VALIDATION:
-    - Events containing 'installs' module MUST use event types: 'success', 'warning', or 'error'
-    - Other event types ('info', 'system') are NOT allowed for installs-related events
-    - This ensures dashboard displays accurate install status information
     
     Expected payload structure:
     {
@@ -4819,27 +4610,24 @@ async def submit_events(request: Request):
     try:
         payload = await request.json()
         
-        # Extract metadata - support both snake_case and camelCase for Windows client compatibility
-        metadata = payload.get('metadata', {})
-        device_uuid = metadata.get('device_id') or metadata.get('deviceId', 'unknown-device')
-        serial_number = metadata.get('serial_number') or metadata.get('serialNumber', 'unknown-serial')
-        collected_at = metadata.get('collected_at') or metadata.get('collectedAt', datetime.now(timezone.utc).isoformat())
-        client_version = metadata.get('client_version') or metadata.get('clientVersion', 'unknown')
-        platform = metadata.get('platform', 'Unknown')
-        collection_type = metadata.get('collection_type') or metadata.get('collectionType', 'Full')
-        enabled_modules = metadata.get('enabled_modules') or metadata.get('enabledModules', [])
+        # Validate top-level structure via Pydantic
+        try:
+            submission = EventSubmission.model_validate(payload)
+        except Exception as validation_err:
+            raise HTTPException(status_code=422, detail=f"Invalid payload: {validation_err}")
         
-        # Validate required fields
-        if device_uuid == 'unknown-device' or serial_number == 'unknown-serial':
-            raise HTTPException(
-                status_code=400,
-                detail="Both deviceId (UUID) and serialNumber are required in metadata"
-            )
+        # Extract metadata - support both snake_case and camelCase for Windows client compatibility
+        meta = submission.metadata
+        device_uuid = meta.device_id or meta.deviceId
+        serial_number = meta.serial_number or meta.serialNumber
+        collected_at = meta.collected_at or meta.collectedAt or datetime.now(timezone.utc).isoformat()
+        client_version = meta.client_version or meta.clientVersion or 'unknown'
+        platform = meta.platform or 'Unknown'
+        collection_type = meta.collection_type or meta.collectionType or 'Full'
+        enabled_modules = meta.enabled_modules or meta.enabledModules or []
         
         # VALIDATION: Reject serial numbers that look like hostnames
         # This prevents database pollution from client bugs where hostname is sent as serial
-        # Valid serial numbers should NOT match common hostname patterns
-        import re
         hostname_patterns = [
             r'^[A-Z]+-[A-Z]+$',  # All caps with hyphens (e.g., TOLUWANI-AGBI, AWI-JUMP)
             r'^[A-Z]+\-[A-Z0-9]+\-[A-Z0-9]+$',  # Pattern like DESKTOP-ABC123
@@ -5246,7 +5034,7 @@ async def broadcast_event(event_data: dict):
     except Exception as e:
         logger.error(f"Failed to broadcast event: {e}")
 
-@app.get("/api/negotiate")
+@app.get("/api/negotiate", tags=["health"])
 async def signalr_negotiate(device: str = Query(default="dashboard")):
     """
     SignalR/WebPubSub negotiate endpoint.
@@ -5308,7 +5096,7 @@ async def signalr_negotiate(device: str = Query(default="dashboard")):
             "error": f"Token generation failed: {str(e)}"
         }
 
-@app.patch("/api/device/{serial_number}/archive", dependencies=[Depends(verify_authentication)])
+@app.patch("/api/device/{serial_number}/archive", dependencies=[Depends(verify_authentication)], tags=["devices"])
 async def archive_device(serial_number: str):
     """
     Archive a device (soft delete).
@@ -5386,7 +5174,7 @@ async def archive_device(serial_number: str):
         raise HTTPException(status_code=500, detail=f"Failed to archive device: {str(e)}")
 
 
-@app.patch("/api/device/{serial_number}/unarchive", dependencies=[Depends(verify_authentication)])
+@app.patch("/api/device/{serial_number}/unarchive", dependencies=[Depends(verify_authentication)], tags=["devices"])
 async def unarchive_device(serial_number: str):
     """
     Unarchive a device (restore from soft delete).
@@ -5456,7 +5244,7 @@ async def unarchive_device(serial_number: str):
         raise HTTPException(status_code=500, detail=f"Failed to unarchive device: {str(e)}")
 
 
-@app.delete("/api/device/{serial_number}", dependencies=[Depends(verify_authentication)])
+@app.delete("/api/device/{serial_number}", dependencies=[Depends(verify_authentication)], tags=["devices"])
 async def delete_device(serial_number: str, confirm: bool = Query(False)):
     """
     Permanently delete a device and all its data.
@@ -5566,7 +5354,7 @@ async def delete_device(serial_number: str, confirm: bool = Query(False)):
         raise HTTPException(status_code=500, detail=f"Failed to delete device: {str(e)}")
 
 
-@app.get("/api/debug/database")
+@app.get("/api/debug/database", dependencies=[Depends(verify_authentication)], tags=["admin"])
 async def debug_database():
     """
     Database diagnostic endpoint - analyze storage usage and data cleanup opportunities.
@@ -5699,137 +5487,6 @@ async def debug_database():
         raise HTTPException(status_code=500, detail=f"Database diagnostic failed: {str(e)}")
 
 # Error handlers
-class SQLExecuteRequest(BaseModel):
-    sql: str
-    db_host: str = Field(default="reportmate-database.postgres.database.azure.com")
-    db_name: str = Field(default="reportmate")
-    db_user: str = Field(default="reportmate")
-    db_pass: str
-
-@app.post("/api/admin/execute-sql")
-async def execute_sql(request: SQLExecuteRequest, auth: dict = Depends(verify_authentication)):
-    """
-    ADMIN-ONLY: Execute arbitrary SQL on the database.
-    USE WITH EXTREME CAUTION.
-    """
-    try:
-        # Check if this requires autocommit (CONCURRENTLY, VACUUM, etc.)
-        sql_upper = request.sql.strip().upper()
-        requires_autocommit = ('CONCURRENTLY' in sql_upper or 
-                              sql_upper.startswith('VACUUM') or
-                              sql_upper.startswith('REINDEX'))
-        
-        # Connect directly with provided credentials
-        conn = pg8000.connect(
-            host=request.db_host,
-            port=5432,
-            database=request.db_name,
-            user=request.db_user,
-            password=request.db_pass,
-            ssl_context=True
-        )
-        
-        # Set autocommit for commands that can't run in transaction blocks
-        if requires_autocommit:
-            conn.autocommit = True
-        
-        cursor = conn.cursor()
-        
-        # Execute SQL
-        cursor.execute(request.sql)
-        
-        # Check if this is a SELECT query
-        if sql_upper.startswith('SELECT'):
-            results = cursor.fetchall()
-            columns = [desc[0] for desc in cursor.description] if cursor.description else []
-            if not requires_autocommit:
-                conn.commit()
-            cursor.close()
-            conn.close()
-            return {
-                "success": True,
-                "rows": results,
-                "columns": columns,
-                "rowCount": len(results)
-            }
-        else:
-            # For INSERT/UPDATE/DELETE/CREATE/etc
-            rows_affected = cursor.rowcount
-            if not requires_autocommit:
-                conn.commit()
-            cursor.close()
-            conn.close()
-            return {
-                "success": True,
-                "rowsAffected": rows_affected,
-                "message": f"SQL executed successfully. Rows affected: {rows_affected}"
-            }
-    except Exception as e:
-        logger.error(f"SQL execution error: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"SQL execution failed: {str(e)}")
-
-@app.post("/api/admin/migrate-platform-column")
-async def migrate_platform_column(auth: dict = Depends(verify_authentication)):
-    """
-    Add platform column to devices table.
-    This migration is idempotent and safe to run multiple times.
-    """
-    try:
-        conn = get_db_connection()
-        cursor = conn.cursor()
-        
-        migration_steps = []
-        
-        # Step 1: Add platform column
-        try:
-            cursor.execute("ALTER TABLE devices ADD COLUMN IF NOT EXISTS platform VARCHAR(50)")
-            migration_steps.append("✓ Added platform column")
-        except Exception as e:
-            migration_steps.append(f"Platform column: {str(e)}")
-        
-        # Step 2: Create index
-        try:
-            cursor.execute("CREATE INDEX IF NOT EXISTS idx_devices_platform ON devices(platform)")
-            migration_steps.append("✓ Created platform index")
-        except Exception as e:
-            migration_steps.append(f"Platform index: {str(e)}")
-        
-        # Step 3: Update existing devices with inferred platform
-        try:
-            cursor.execute("""
-                UPDATE devices 
-                SET platform = CASE
-                    WHEN LOWER(os_name) LIKE '%windows%' OR LOWER(os) LIKE '%windows%' THEN 'Windows'
-                    WHEN LOWER(os_name) LIKE '%mac%' OR LOWER(os) LIKE '%mac%' OR LOWER(os_name) LIKE '%darwin%' THEN 'macOS'
-                    ELSE 'Unknown'
-                END
-                WHERE platform IS NULL
-            """)
-            rows_updated = cursor.rowcount
-            migration_steps.append(f"✓ Updated {rows_updated} devices with inferred platform")
-        except Exception as e:
-            migration_steps.append(f"Update platforms: {str(e)}")
-        
-        conn.commit()
-        
-        # Step 4: Verify
-        cursor.execute("SELECT serial_number, platform, os_name FROM devices LIMIT 5")
-        sample_data = cursor.fetchall()
-        
-        cursor.close()
-        conn.close()
-        
-        return {
-            "success": True,
-            "steps": migration_steps,
-            "sample_data": [
-                {"serial": row[0], "platform": row[1], "os_name": row[2]}
-                for row in sample_data
-            ]
-        }
-    except Exception as e:
-        logger.error(f"Migration failed: {e}")
-        raise HTTPException(status_code=500, detail=f"Migration failed: {str(e)}")
 
 @app.exception_handler(404)
 async def not_found_handler(request: Request, exc: HTTPException):
