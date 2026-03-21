@@ -16,8 +16,10 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir --upgrade pip && \
     pip install --no-cache-dir -r requirements.txt
 
-# Copy application code and SQL queries
+# Copy application code, shared dependencies, routers, and SQL queries
 COPY main.py .
+COPY dependencies.py .
+COPY routers/ ./routers/
 COPY sql/ ./sql/
 
 # Create non-root user for security
