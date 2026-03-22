@@ -93,12 +93,39 @@ app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
 # ── Routers ────────────────────────────────────────────────────
-app.include_router(health.router)
-app.include_router(devices.router)
-app.include_router(fleet.router)
-app.include_router(events.router)
-app.include_router(statistics.router)
-app.include_router(admin.router)
+# Canonical versioned prefix (appears in OpenAPI schema)
+for _router_mod in (health, devices, fleet, events, statistics, admin):
+    app.include_router(_router_mod.router, prefix="/api/v1")
+
+# Backward-compatible unversioned alias (hidden from docs)
+for _router_mod in (health, devices, fleet, events, statistics, admin):
+    app.include_router(_router_mod.router, prefix="/api", include_in_schema=False)
+
+
+# ── Root endpoint (unversioned) ────────────────────────────────
+@app.get("/", tags=["health"])
+async def root():
+    """API root endpoint with service information."""
+    return {
+        "name": "ReportMate API",
+        "version": "1.0.0",
+        "status": "running",
+        "platform": "FastAPI on Azure Container Apps",
+        "deviceIdStandard": "serialNumber",
+        "apiVersion": "v1",
+        "endpoints": {
+            "health": "/api/v1/health",
+            "devices": "/api/v1/devices",
+            "device": "/api/v1/device/{serial_number}",
+            "events": "/api/v1/events",
+            "events_submit": "/api/v1/events (POST)",
+            "negotiate": "/api/v1/negotiate",
+            "dashboard": "/api/v1/dashboard",
+        },
+        "deprecation": {
+            "unversioned": "/api/* routes remain available but will be removed in v2",
+        },
+    }
 
 # ── Startup: ensure performance indexes ────────────────────────
 _indexes_ensured = False

@@ -15,7 +15,7 @@ from dependencies import (
 
 router = APIRouter(tags=["fleet"])
 
-@router.get("/api/devices/applications/filters", dependencies=[Depends(verify_authentication)], tags=["fleet"])
+@router.get("/devices/applications/filters", dependencies=[Depends(verify_authentication)], tags=["fleet"])
 async def get_applications_filters(
     include_archived: bool = Query(default=False, alias="includeArchived")
 ):
@@ -117,7 +117,7 @@ async def get_applications_filters(
         raise HTTPException(status_code=500, detail=f"Failed to retrieve applications filters: {str(e)}")
 
 
-@router.get("/api/devices/applications", dependencies=[Depends(verify_authentication)], tags=["fleet"])
+@router.get("/devices/applications", dependencies=[Depends(verify_authentication)], tags=["fleet"])
 async def get_bulk_applications(
     request: Request,
     deviceNames: Optional[str] = None,
@@ -306,7 +306,7 @@ async def get_bulk_applications(
             except Exception:
                 pass
 
-@router.get("/api/devices/hardware", dependencies=[Depends(verify_authentication)], tags=["fleet"])
+@router.get("/devices/hardware", dependencies=[Depends(verify_authentication)], tags=["fleet"])
 async def get_bulk_hardware(
     include_archived: bool = Query(default=False, alias="includeArchived", description="Include archived devices in results"),
     limit: Optional[int] = Query(default=None, ge=1, le=5000, description="Maximum items to return"),
@@ -428,7 +428,7 @@ async def get_bulk_hardware(
         raise HTTPException(status_code=500, detail=f"Failed to retrieve bulk hardware: {str(e)}")
 
 
-@router.get("/api/devices/installs/filters", dependencies=[Depends(verify_authentication)], tags=["fleet"])
+@router.get("/devices/installs/filters", dependencies=[Depends(verify_authentication)], tags=["fleet"])
 async def get_installs_filters(
     include_archived: bool = Query(default=False, alias="includeArchived")
 ):
@@ -654,7 +654,7 @@ async def get_installs_filters(
         raise HTTPException(status_code=500, detail=f"Failed to retrieve installs filters: {str(e)}")
 
 
-@router.get("/api/devices/installs", dependencies=[Depends(verify_authentication)], tags=["fleet"])
+@router.get("/devices/installs", dependencies=[Depends(verify_authentication)], tags=["fleet"])
 async def get_bulk_installs(
     include_archived: bool = Query(default=False, alias="includeArchived", description="Include archived devices in results"),
     limit: Optional[int] = Query(default=None, ge=1, le=5000, description="Maximum items to return"),
@@ -773,7 +773,7 @@ async def get_bulk_installs(
 
 
 
-@router.get("/api/devices/installs/full", dependencies=[Depends(verify_authentication)], tags=["fleet"])
+@router.get("/devices/installs/full", dependencies=[Depends(verify_authentication)], tags=["fleet"])
 async def get_bulk_installs_full(
     include_archived: bool = Query(default=False, alias="includeArchived"),
     limit: Optional[int] = Query(default=None, ge=1, le=5000, description="Maximum items to return"),
@@ -903,7 +903,7 @@ async def get_bulk_installs_full(
         raise HTTPException(status_code=500, detail=f"Failed to retrieve bulk installs: {str(e)}")
 
 
-@router.get("/api/devices/network", dependencies=[Depends(verify_authentication)], tags=["fleet"])
+@router.get("/devices/network", dependencies=[Depends(verify_authentication)], tags=["fleet"])
 async def get_bulk_network(
     include_archived: bool = Query(default=False, alias="includeArchived", description="Include archived devices in results"),
     limit: Optional[int] = Query(default=None, ge=1, le=5000, description="Maximum items to return"),
@@ -979,7 +979,7 @@ async def get_bulk_network(
         logger.error(f"Failed to get bulk network: {e}")
         raise HTTPException(status_code=500, detail=f"Failed to retrieve bulk network: {str(e)}")
 
-@router.get("/api/devices/security", dependencies=[Depends(verify_authentication)], tags=["fleet"])
+@router.get("/devices/security", dependencies=[Depends(verify_authentication)], tags=["fleet"])
 async def get_bulk_security(
     include_archived: bool = Query(default=False, alias="includeArchived", description="Include archived devices in results"),
     limit: Optional[int] = Query(default=None, ge=1, le=5000, description="Maximum items to return"),
@@ -1097,7 +1097,7 @@ async def get_bulk_security(
         logger.error(f"Failed to get bulk security: {e}")
         raise HTTPException(status_code=500, detail=f"Failed to retrieve bulk security: {str(e)}")
 
-@router.get("/api/devices/security/certificates", dependencies=[Depends(verify_authentication)], tags=["fleet"])
+@router.get("/devices/security/certificates", dependencies=[Depends(verify_authentication)], tags=["fleet"])
 async def search_fleet_certificates(
     search: str = Query(default="", description="Search term to match against certificate commonName, issuer, subject, or serialNumber"),
     status: str = Query(default="all", description="Filter by certificate status: all, valid, expired, expiring"),
@@ -1178,7 +1178,7 @@ async def search_fleet_certificates(
         logger.error(f"Failed to search fleet certificates: {e}")
         raise HTTPException(status_code=500, detail=f"Failed to search certificates: {str(e)}")
 
-@router.get("/api/devices/management", dependencies=[Depends(verify_authentication)], tags=["fleet"])
+@router.get("/devices/management", dependencies=[Depends(verify_authentication)], tags=["fleet"])
 async def get_bulk_management(
     include_archived: bool = Query(default=False, alias="includeArchived", description="Include archived devices in results"),
     limit: Optional[int] = Query(default=None, ge=1, le=5000, description="Maximum items to return"),
@@ -1343,7 +1343,7 @@ async def get_bulk_management(
         logger.error(f"Failed to get bulk management: {e}")
         raise HTTPException(status_code=500, detail=f"Failed to retrieve bulk management: {str(e)}")
 
-@router.get("/api/devices/inventory", dependencies=[Depends(verify_authentication)], tags=["fleet"])
+@router.get("/devices/inventory", dependencies=[Depends(verify_authentication)], tags=["fleet"])
 async def get_bulk_inventory(
     include_archived: bool = Query(default=False, alias="includeArchived", description="Include archived devices in results"),
     limit: Optional[int] = Query(default=None, ge=1, le=5000, description="Maximum items to return"),
@@ -1412,7 +1412,7 @@ async def get_bulk_inventory(
         logger.error(f"Failed to get bulk inventory: {e}")
         raise HTTPException(status_code=500, detail=f"Failed to retrieve bulk inventory: {str(e)}")
 
-@router.get("/api/devices/system", dependencies=[Depends(verify_authentication)], tags=["fleet"])
+@router.get("/devices/system", dependencies=[Depends(verify_authentication)], tags=["fleet"])
 async def get_bulk_system(
     include_archived: bool = Query(default=False, alias="includeArchived", description="Include archived devices in results"),
     limit: int = Query(default=1000, le=5000, description="Maximum number of devices to return (default 1000, max 5000)"),
@@ -1627,7 +1627,7 @@ async def get_bulk_system(
         logger.error(f"Failed to get bulk system: {e}")
         raise HTTPException(status_code=500, detail=f"Failed to retrieve bulk system: {str(e)}")
 
-@router.get("/api/devices/peripherals", dependencies=[Depends(verify_authentication)], tags=["fleet"])
+@router.get("/devices/peripherals", dependencies=[Depends(verify_authentication)], tags=["fleet"])
 async def get_bulk_peripherals(
     include_archived: bool = Query(default=False, alias="includeArchived", description="Include archived devices in results"),
     limit: Optional[int] = Query(default=None, ge=1, le=5000, description="Maximum items to return"),
@@ -1712,7 +1712,7 @@ async def get_bulk_peripherals(
         logger.error(f"Failed to get bulk peripherals: {e}")
         raise HTTPException(status_code=500, detail=f"Failed to retrieve bulk peripherals: {str(e)}")
 
-@router.get("/api/devices/identity", dependencies=[Depends(verify_authentication)], tags=["fleet"])
+@router.get("/devices/identity", dependencies=[Depends(verify_authentication)], tags=["fleet"])
 async def get_bulk_identity(
     include_archived: bool = Query(default=False, alias="includeArchived", description="Include archived devices in results"),
     limit: Optional[int] = Query(default=None, ge=1, le=5000, description="Maximum items to return"),
@@ -1885,7 +1885,7 @@ async def get_bulk_identity(
         raise HTTPException(status_code=500, detail=f"Failed to retrieve bulk identity: {str(e)}")
 
 
-@router.get("/api/devices/profiles", dependencies=[Depends(verify_authentication)], tags=["fleet"])
+@router.get("/devices/profiles", dependencies=[Depends(verify_authentication)], tags=["fleet"])
 async def get_bulk_profiles(
     include_archived: bool = Query(default=False, alias="includeArchived", description="Include archived devices in results"),
     limit: Optional[int] = Query(default=None, ge=1, le=5000, description="Maximum items to return"),

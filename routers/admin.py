@@ -14,7 +14,7 @@ from dependencies import (
 
 router = APIRouter(tags=["admin"])
 
-@router.patch("/api/device/{serial_number}/archive", dependencies=[Depends(verify_authentication)], tags=["devices"])
+@router.patch("/device/{serial_number}/archive", dependencies=[Depends(verify_authentication)], tags=["devices"])
 async def archive_device(serial_number: str):
     """
     Archive a device (soft delete).
@@ -91,7 +91,7 @@ async def archive_device(serial_number: str):
         logger.error(f"Failed to archive device {serial_number}: {e}")
         raise HTTPException(status_code=500, detail=f"Failed to archive device: {str(e)}")
 
-@router.patch("/api/device/{serial_number}/unarchive", dependencies=[Depends(verify_authentication)], tags=["devices"])
+@router.patch("/device/{serial_number}/unarchive", dependencies=[Depends(verify_authentication)], tags=["devices"])
 async def unarchive_device(serial_number: str):
     """
     Unarchive a device (restore from soft delete).
@@ -160,7 +160,7 @@ async def unarchive_device(serial_number: str):
         logger.error(f"Failed to unarchive device {serial_number}: {e}")
         raise HTTPException(status_code=500, detail=f"Failed to unarchive device: {str(e)}")
 
-@router.delete("/api/device/{serial_number}", dependencies=[Depends(verify_authentication)], tags=["devices"])
+@router.delete("/device/{serial_number}", dependencies=[Depends(verify_authentication)], tags=["devices"])
 async def delete_device(serial_number: str, confirm: bool = Query(False)):
     """
     Permanently delete a device and all its data.
@@ -269,7 +269,7 @@ async def delete_device(serial_number: str, confirm: bool = Query(False)):
         logger.error(f"Failed to delete device {serial_number}: {e}")
         raise HTTPException(status_code=500, detail=f"Failed to delete device: {str(e)}")
 
-@router.delete("/api/admin/usage-history/cleanup", dependencies=[Depends(verify_authentication)], tags=["admin"])
+@router.delete("/admin/usage-history/cleanup", dependencies=[Depends(verify_authentication)], tags=["admin"])
 async def cleanup_usage_history(
     months: int = Query(default=18, ge=1, le=36, description="Retain data for this many months")
 ):
@@ -291,7 +291,7 @@ async def cleanup_usage_history(
         logger.error(f"Usage history cleanup failed: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
-@router.get("/api/debug/database", dependencies=[Depends(verify_authentication)], tags=["admin"])
+@router.get("/debug/database", dependencies=[Depends(verify_authentication)], tags=["admin"])
 async def debug_database():
     """
     Database diagnostic endpoint - analyze storage usage and data cleanup opportunities.

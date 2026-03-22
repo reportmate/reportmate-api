@@ -20,7 +20,7 @@ from dependencies import (
 
 router = APIRouter(tags=["events"])
 
-@router.get("/api/events", dependencies=[Depends(verify_authentication)], tags=["events"])
+@router.get("/events", dependencies=[Depends(verify_authentication)], tags=["events"])
 async def get_events(
     limit: int = Query(default=100, ge=1, le=1000, description="Maximum number of events to return"),
     offset: int = Query(default=0, ge=0, description="Number of events to skip (for pagination)"),
@@ -134,7 +134,7 @@ async def get_events(
         logger.error(f"Failed to get events: {e}")
         raise HTTPException(status_code=500, detail=f"Failed to retrieve events: {str(e)}")
 
-@router.get("/api/events/{event_id}/payload", dependencies=[Depends(verify_authentication)], tags=["events"])
+@router.get("/events/{event_id}/payload", dependencies=[Depends(verify_authentication)], tags=["events"])
 async def get_event_payload(event_id: int):
     """
     Get the FULL payload for a specific event including related module data.
@@ -227,7 +227,7 @@ async def get_event_payload(event_id: int):
         logger.error(f"Failed to get event payload: {e}")
         raise HTTPException(status_code=500, detail=f"Failed to retrieve event payload: {str(e)}")
 
-@router.post("/api/events", dependencies=[Depends(verify_authentication)], tags=["events"])
+@router.post("/events", dependencies=[Depends(verify_authentication)], tags=["events"])
 @limiter.limit("30/minute")
 async def submit_events(request: Request):
     """
