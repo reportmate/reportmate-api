@@ -97,11 +97,6 @@ app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 for _router_mod in (health, devices, fleet, events, statistics, admin):
     app.include_router(_router_mod.router, prefix="/api/v1")
 
-# Backward-compatible unversioned alias (hidden from docs)
-for _router_mod in (health, devices, fleet, events, statistics, admin):
-    app.include_router(_router_mod.router, prefix="/api", include_in_schema=False)
-
-
 # ── Root endpoint (unversioned) ────────────────────────────────
 @app.get("/", tags=["health"])
 async def root():
@@ -121,9 +116,6 @@ async def root():
             "events_submit": "/api/v1/events (POST)",
             "negotiate": "/api/v1/negotiate",
             "dashboard": "/api/v1/dashboard",
-        },
-        "deprecation": {
-            "unversioned": "/api/* routes remain available but will be removed in v2",
         },
     }
 
