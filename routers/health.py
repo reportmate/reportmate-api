@@ -17,31 +17,10 @@ try:
 except ImportError:
     WebPubSubServiceClient = None
 
-router = APIRouter()
+router = APIRouter(tags=["health"])
 
 
-@router.get("/")
-async def root():
-    """API root endpoint with service information."""
-    return {
-        "name": "ReportMate API",
-        "version": "1.0.0",
-        "status": "running",
-        "platform": "FastAPI on Azure Container Apps",
-        "deviceIdStandard": "serialNumber",
-        "endpoints": {
-            "health": "/api/health",
-            "device": "/api/device/{serial_number}",
-            "devices": "/api/devices",
-            "events": "/api/events",
-            "events_submit": "/api/events (POST)",
-            "signalr": "/api/negotiate",
-            "debug_database": "/api/debug/database (admin)"
-        }
-    }
-
-
-@router.get("/api/health", response_model=HealthResponse, tags=["health"])
+@router.get("/health", response_model=HealthResponse, tags=["health"])
 async def health_check():
     """
     Health check endpoint for monitoring and load balancers.
@@ -79,7 +58,7 @@ async def health_check():
         )
 
 
-@router.get("/api/negotiate", tags=["health"])
+@router.get("/negotiate", tags=["health"])
 async def signalr_negotiate(device: str = Query(default="dashboard")):
     """
     SignalR/WebPubSub negotiate endpoint.
