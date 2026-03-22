@@ -14,7 +14,7 @@ from dependencies import (
 
 router = APIRouter(tags=["statistics"])
 
-@router.get("/api/dashboard", dependencies=[Depends(verify_authentication)], tags=["statistics"])
+@router.get("/dashboard", dependencies=[Depends(verify_authentication)], tags=["statistics"])
 async def get_dashboard_data(
     events_limit: int = Query(default=200, ge=1, le=500, alias="eventsLimit"),
     include_archived: bool = Query(default=False, alias="includeArchived")
@@ -296,7 +296,7 @@ async def get_dashboard_data(
             conn.close()
         raise HTTPException(status_code=500, detail=f"Failed to retrieve dashboard data: {str(e)}")
 
-@router.get("/api/stats/installs", dependencies=[Depends(verify_authentication)], tags=["statistics"])
+@router.get("/stats/installs", dependencies=[Depends(verify_authentication)], tags=["statistics"])
 async def get_install_stats():
     """
     Get aggregated install statistics for dashboard widgets.
