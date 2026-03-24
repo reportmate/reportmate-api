@@ -484,14 +484,8 @@ async def submit_events(request: Request):
                         if event_type not in {'info', 'system'}:
                             event_type = 'warning'  # Default to warning for installs-related events
                 
-                # ENHANCED: For installs-related events, include full module data in details
-                # This ensures that when users expand the event, they see ALL install details
+                # Store only the event's own details — full module data lives in the module tables.
                 enhanced_details = details.copy() if isinstance(details, dict) else {}
-                
-                # If this is an installs event and we have installs module data, include it
-                if has_installs_module and 'installs' in modules_data:
-                    enhanced_details['full_installs_data'] = modules_data['installs']
-                    logger.debug(f"Enhanced event details with full installs module data for device {serial_number}")
                 
                 # Store enhanced details as JSON
                 details_json = json.dumps(enhanced_details)
@@ -549,35 +543,12 @@ async def submit_events(request: Request):
             try:
                 collection_message = f"Data collection: {collection_type} ({len(modules_processed)} modules)"
                 
-                # Sanitize metadata to remove passphrase before storing
-                sanitized_metadata = metadata.copy()
-                if 'additional' in sanitized_metadata and isinstance(sanitized_metadata['additional'], dict):
-                    sanitized_additional = sanitized_metadata['additional'].copy()
-                    # Remove passphrase completely - should NEVER be stored or visible
-                    sanitized_additional.pop('passphrase', None)
-                    sanitized_metadata['additional'] = sanitized_additional
-                
-                # Sanitize full payload to remove passphrase
-                sanitized_payload = payload.copy()
-                if 'metadata' in sanitized_payload and isinstance(sanitized_payload['metadata'], dict):
-                    sanitized_payload_metadata = sanitized_payload['metadata'].copy()
-                    if 'additional' in sanitized_payload_metadata and isinstance(sanitized_payloadMetadata['additional'], dict):
-                        sanitized_payload_additional = sanitized_payloadMetadata['additional'].copy()
-                        sanitized_payload_additional.pop('passphrase', None)
-                        sanitized_payload_metadata['additional'] = sanitized_payload_additional
-                    sanitized_payload['metadata'] = sanitized_payload_metadata
-                
-                # Store COMPLETE original payload in details column for full payload retrieval
-                # Include all metadata, modules, and original request data (with passphrase removed)
+                # Store only summary fields — full module data already lives in the module tables.
                 collection_details = json.dumps({
-                    # Summary fields (for display in list view)
                     'platform': platform,
                     'client_version': client_version,
                     'collection_type': collection_type,
                     'modules_processed': modules_processed,
-                    # FULL PAYLOAD: Store complete original payload for detailed view (SANITIZED)
-                    'full_payload': sanitized_payload,  # Complete request (passphrase removed)
-                    'metadata': sanitized_metadata,      # All metadata from request (passphrase removed)
                     'collected_at': collected_at
                 })
                 
@@ -592,7 +563,7 @@ async def submit_events(request: Request):
                 event_id = event_row[0] if event_row else None
                 
                 events_stored += 1
-                logger.info(f"Created fallback system event with full payload (no events in payload)")
+                logger.info(f"Created fallback system event for device {serial_number}")
                 
                 # Broadcast fallback event to connected WebSocket clients
                 # Include message field for proper display
@@ -615,6 +586,22 @@ async def submit_events(request: Request):
             logger.info(f"Skipped system event creation - {events_stored} events already in payload")
         
         conn.commit()
+
+        # Periodic retention: purge events older than 30 days (runs ~1% of requests to avoid overhead)
+        import random
+        if random.random() < 0.01:
+            try:
+                cursor.execute(
+                    "DELETE FROM events WHERE timestamp < NOW() - INTERVAL '30 days'"
+                )
+                deleted = cursor.rowcount
+                conn.commit()
+                if deleted:
+                    logger.info(f"Retention purge: deleted {deleted} events older than 30 days")
+            except Exception as purge_error:
+                logger.warning(f"Retention purge failed (non-fatal): {purge_error}")
+                conn.rollback()
+
         conn.close()
         invalidate_caches()
         
