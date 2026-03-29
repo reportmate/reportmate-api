@@ -16,6 +16,7 @@ from dependencies import (
     invalidate_caches, limiter, load_sql, logger, paginate,
     verify_authentication, VALID_MODULE_NAMES,
     infer_platform, build_os_summary,
+    EventSubmission,
 )
 
 router = APIRouter(tags=["events"])
