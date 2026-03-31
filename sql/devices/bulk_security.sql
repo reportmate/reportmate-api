@@ -46,6 +46,9 @@ SELECT DISTINCT ON (d.serial_number)
     COALESCE((sec.data->'tpm'->>'isEnabled')::boolean, false) as tpm_enabled,
     -- Tampering: Secure Boot
     COALESCE((sec.data->'secureBoot'->>'isEnabled')::boolean, false) as secure_boot_enabled,
+    -- Secure Boot UEFI certificate counts (DB = trusted signatures, KEK = key exchange keys)
+    COALESCE(jsonb_array_length(sec.data->'secureBoot'->'dbCertificates'), 0) as secure_boot_db_cert_count,
+    COALESCE(jsonb_array_length(sec.data->'secureBoot'->'kekCertificates'), 0) as secure_boot_kek_cert_count,
     -- Tampering: SIP (macOS)
     COALESCE(
         (sec.data->'systemIntegrityProtection'->>'enabled')::boolean,
