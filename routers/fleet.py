@@ -1026,7 +1026,7 @@ async def get_bulk_security(
                  firewall_enabled, encryption_enabled,
                  antivirus_name, antivirus_enabled, antivirus_up_to_date, antivirus_version, antivirus_last_scan,
                  detection_count,
-                 tpm_present, tpm_enabled, secure_boot_enabled, sip_enabled, gatekeeper_enabled,
+                 tpm_present, tpm_enabled, secure_boot_enabled, secure_boot_db_cert_count, secure_boot_kek_cert_count, sip_enabled, gatekeeper_enabled,
                  memory_integrity_enabled, core_isolation_enabled, smart_app_control_state,
                  ssh_status_display, ssh_is_configured, ssh_is_service_running, rdp_enabled,
                  certificate_count, expired_cert_count, expiring_soon_cert_count,
@@ -1061,6 +1061,8 @@ async def get_bulk_security(
                     'tpmPresent': bool(tpm_present),
                     'tpmEnabled': bool(tpm_enabled),
                     'secureBootEnabled': bool(secure_boot_enabled),
+                    'secureBootDbCertCount': int(secure_boot_db_cert_count or 0),
+                    'secureBootKekCertCount': int(secure_boot_kek_cert_count or 0),
                     'sipEnabled': sip_enabled,
                     'gatekeeperEnabled': bool(gatekeeper_enabled),
                     # Protection (Windows)
