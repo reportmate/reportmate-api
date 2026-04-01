@@ -331,12 +331,21 @@ async def submit_events(request: Request):
             else:
                 # Insert new device
                 # NOTE: devices.id is VARCHAR and equals serial_number (per schema design)
-                # Set name to 'Unknown' as placeholder (will be populated from system module data)
+                # Try to get device name from metadata.additional (Mac client sends deviceName there)
+                raw_meta = payload.get('metadata', {})
+                initial_name = 'Unknown'
+                if isinstance(raw_meta, dict):
+                    additional = raw_meta.get('additional', {})
+                    if isinstance(additional, dict):
+                        meta_name = additional.get('deviceName') or additional.get('device_name')
+                        if meta_name and meta_name.strip():
+                            initial_name = meta_name.strip()
+                
                 cursor.execute("""
                     INSERT INTO devices (id, device_id, serial_number, name, status, last_seen, created_at, updated_at, client_version, platform)
                     VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-                """, (serial_number, device_uuid, serial_number, 'Unknown', 'online', collected_at, datetime.now(timezone.utc), datetime.now(timezone.utc), client_version, platform))
-                logger.info(f"Created new device: {serial_number} (client v{client_version}, platform: {platform})")
+                """, (serial_number, device_uuid, serial_number, initial_name, 'online', collected_at, datetime.now(timezone.utc), datetime.now(timezone.utc), client_version, platform))
+                logger.info(f"Created new device: {serial_number} (name: {initial_name}, client v{client_version}, platform: {platform})")
             
             conn.commit()
         except Exception as device_error:
@@ -460,6 +469,56 @@ async def submit_events(request: Request):
                     logger.error(f"Failed to store {module_name} module: {module_error}")
                     conn.rollback()
                     continue
+        
+        # 2b. Update device name from module data or metadata
+        # Priority: inventory.deviceName > inventory.device_name > network.hostname > system.hostname > metadata.additional.deviceName
+        try:
+            device_name = None
+            
+            # Try inventory module first (most authoritative source)
+            inv_data = modules_data.get('inventory')
+            if inv_data:
+                if isinstance(inv_data, list) and inv_data:
+                    inv_data = inv_data[0]
+                if isinstance(inv_data, dict):
+                    device_name = inv_data.get('deviceName') or inv_data.get('device_name') or inv_data.get('computer_name')
+            
+            # Try network module hostname
+            if not device_name:
+                net_data = modules_data.get('network')
+                if net_data:
+                    if isinstance(net_data, list) and net_data:
+                        net_data = net_data[0]
+                    if isinstance(net_data, dict):
+                        device_name = net_data.get('hostname')
+            
+            # Try system module hostname
+            if not device_name:
+                sys_data = modules_data.get('system')
+                if sys_data:
+                    if isinstance(sys_data, list) and sys_data:
+                        sys_data = sys_data[0]
+                    if isinstance(sys_data, dict):
+                        device_name = sys_data.get('hostname')
+            
+            # Try metadata.additional.deviceName (Mac client sends this)
+            if not device_name:
+                raw_meta = payload.get('metadata', {})
+                if isinstance(raw_meta, dict):
+                    additional = raw_meta.get('additional', {})
+                    if isinstance(additional, dict):
+                        device_name = additional.get('deviceName') or additional.get('device_name')
+            
+            # Update device name if we found a real one (not empty/Unknown)
+            if device_name and device_name.strip() and device_name.strip().lower() != 'unknown':
+                cursor.execute("""
+                    UPDATE devices SET name = %s WHERE serial_number = %s AND (name IS NULL OR name = 'Unknown' OR name = %s)
+                """, (device_name.strip(), serial_number, serial_number))
+                conn.commit()
+                if cursor.rowcount > 0:
+                    logger.info(f"Updated device name for {serial_number}: {device_name.strip()}")
+        except Exception as name_error:
+            logger.error(f"Failed to update device name for {serial_number}: {name_error}")
         
         # 3. Store events from payload with validation
         events_stored = 0
