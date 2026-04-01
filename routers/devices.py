@@ -359,12 +359,30 @@ async def get_device_by_serial(serial_number: str):
         
         conn.close()
         
+        # Resolve best device name: inventory.deviceName > network.hostname > stored name > serial
+        display_name = device_name
+        if modules.get("inventory"):
+            inv = modules["inventory"]
+            if isinstance(inv, list) and inv:
+                inv = inv[0]
+            if isinstance(inv, dict):
+                display_name = inv.get("deviceName") or inv.get("device_name") or display_name
+        if (not display_name or display_name == "Unknown" or display_name == serial_num) and modules.get("network"):
+            net = modules["network"]
+            if isinstance(net, list) and net:
+                net = net[0]
+            if isinstance(net, dict):
+                display_name = net.get("hostname") or display_name
+        if not display_name or display_name == "Unknown":
+            display_name = serial_num or device_id
+        
         # Build response with clean schema (no top-level inventory duplication)
         response = {
             "success": True,
             "device": {
                 "serialNumber": serial_num or device_id,
                 "deviceId": device_uuid or device_id,
+                "name": display_name,
                 "platform": platform,
                 "clientVersion": client_version,
                 "lastSeen": last_seen.isoformat() if last_seen else None,
