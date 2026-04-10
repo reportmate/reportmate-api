@@ -150,7 +150,6 @@ def preload_sql_queries():
     sql_files = [
         "devices/bulk_hardware",
         "devices/bulk_installs",
-        "devices/bulk_applications",
         "devices/bulk_network",
         "devices/bulk_security",
         "devices/bulk_profiles",

@@ -132,8 +132,9 @@ async def get_bulk_applications(
     sizeMax: Optional[int] = None,
     loadAll: bool = False,
     include_archived: bool = Query(default=False, alias="includeArchived"),
-    limit: Optional[int] = Query(default=None, ge=1, le=5000, description="Maximum items to return"),
+    limit: int = Query(default=500, ge=1, le=5000, description="Maximum items to return (default 500, max 5000)"),
     offset: int = Query(default=0, ge=0, description="Number of items to skip"),
+    deviceLimit: int = Query(default=2000, ge=1, le=5000, description="Maximum devices to scan (default 2000)"),
 ):
     """
     Bulk applications endpoint with filtering support.
@@ -184,7 +185,8 @@ async def get_bulk_applications(
         
         where_clause = ' AND '.join(where_conditions)
         
-        # Query to get all devices with applications data
+        # Query to get all devices with applications data.
+        # deviceLimit is validated by pydantic (1..5000) so safe to interpolate directly.
         query = f"""
         SELECT DISTINCT ON (d.serial_number)
             d.serial_number,
@@ -206,6 +208,7 @@ async def get_bulk_applications(
         WHERE {where_clause}
             AND a.data IS NOT NULL
         ORDER BY d.serial_number, a.updated_at DESC
+        LIMIT {int(deviceLimit)}
         """
         
         cursor.execute(query, tuple(query_params))
@@ -309,7 +312,7 @@ async def get_bulk_applications(
 @router.get("/devices/hardware", dependencies=[Depends(verify_authentication)], tags=["fleet"])
 async def get_bulk_hardware(
     include_archived: bool = Query(default=False, alias="includeArchived", description="Include archived devices in results"),
-    limit: Optional[int] = Query(default=None, ge=1, le=5000, description="Maximum items to return"),
+    limit: int = Query(default=2000, ge=1, le=5000, description="Maximum devices to return (default 2000, max 5000)"),
     offset: int = Query(default=0, ge=0, description="Number of items to skip"),
 ):
     """
@@ -324,20 +327,20 @@ async def get_bulk_hardware(
     - OS information (name, version, architecture)
     """
     try:
-        _ckey = (include_archived,)
+        _ckey = (include_archived, limit)
         _cached = cache_get("hardware", _ckey)
         if _cached is not None:
             return paginate(_cached, limit, offset)
         _t0 = _time.monotonic()
-        logger.info("Fetching bulk hardware data")
-        
+        logger.info(f"Fetching bulk hardware data (limit={limit}, includeArchived={include_archived})")
+
         conn = get_db_connection()
         cursor = conn.cursor()
-        
+
         # Load SQL from external file - uses parameterized archive filter
         query = load_sql("devices/bulk_hardware")
-        
-        cursor.execute(query, {"include_archived": include_archived})
+
+        cursor.execute(query, {"include_archived": include_archived, "limit": limit})
         rows = cursor.fetchall()
         conn.close()
         
@@ -1099,45 +1102,50 @@ async def get_bulk_security(
         logger.error(f"Failed to get bulk security: {e}")
         raise HTTPException(status_code=500, detail=f"Failed to retrieve bulk security: {str(e)}")
 
+CERT_SEARCH_HARD_LIMIT = 10000
+
 @router.get("/devices/security/certificates", dependencies=[Depends(verify_authentication)], tags=["fleet"])
 async def search_fleet_certificates(
     search: str = Query(default="", description="Search term to match against certificate commonName, issuer, subject, or serialNumber"),
     status: str = Query(default="all", description="Filter by certificate status: all, valid, expired, expiring"),
+    limit: int = Query(default=1000, ge=1, le=CERT_SEARCH_HARD_LIMIT, description=f"Maximum results to return (max {CERT_SEARCH_HARD_LIMIT})"),
     include_archived: bool = Query(default=False, alias="includeArchived", description="Include archived devices in results")
 ):
     """
     Fleet-wide certificate search endpoint.
-    
+
     Searches across all device certificates for matching commonName, issuer, subject, or serialNumber.
     Useful for verifying certificate deployment across the fleet or finding expired certificates.
-    
+
     **Parameters:**
     - search: Text to search for (case-insensitive, partial match)
     - status: Filter by cert status (all, valid, expired, expiring)
+    - limit: Maximum results to return (default 1000, hard cap 10000)
     - includeArchived: Include archived devices
     """
     try:
-        _ckey = (search.strip(), status.strip().lower(), include_archived)
+        _ckey = (search.strip(), status.strip().lower(), include_archived, limit)
         _cached = cache_get("security_certs", _ckey)
         if _cached is not None:
             return _cached
         _t0 = _time.monotonic()
-        logger.info(f"Searching fleet certificates: search='{search}', status='{status}'")
-        
+        logger.info(f"Searching fleet certificates: search='{search}', status='{status}', limit={limit}")
+
         conn = get_db_connection()
         cursor = conn.cursor()
-        
+
         query = load_sql("devices/security_certificates")
-        
+
         cursor.execute(query, {
             "search": search.strip(),
             "status": status.strip().lower(),
-            "include_archived": include_archived
+            "include_archived": include_archived,
+            "max_results": limit,
         })
         rows = cursor.fetchall()
         conn.close()
-        
-        logger.info(f"Certificate search returned {len(rows)} results")
+
+        logger.info(f"Certificate search returned {len(rows)} results (capped at {limit})")
         
         results = []
         for row in rows:
