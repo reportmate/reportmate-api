@@ -45,4 +45,5 @@ WHERE d.serial_number IS NOT NULL
         (%(status)s = 'expiring' AND (cert->>'isExpiringSoon')::boolean = true) OR
         (%(status)s = 'valid' AND COALESCE((cert->>'isExpired')::boolean, false) = false AND COALESCE((cert->>'isExpiringSoon')::boolean, false) = false)
     )
-ORDER BY d.serial_number, cert->>'commonName';
+ORDER BY d.serial_number, cert->>'commonName'
+LIMIT %(max_results)s;
