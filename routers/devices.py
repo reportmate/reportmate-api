@@ -620,11 +620,14 @@ async def get_device_info_fast(serial_number: str):
 async def get_device_module(serial_number: str, module_name: str):
     """
     Get individual module data for progressive/on-demand loading.
-    
-    Supports all module types:
-    - applications, hardware, installs, network, security
-    - inventory, management, system
-    
+
+    Supported modules:
+    - applications, hardware, identity, installs, inventory
+    - management, network, peripherals, security, system
+
+    Note: displays and printers are collected as part of peripherals.
+    Profile data is collected as part of management/security.
+
     Used for:
     1. Background progressive loading (after fast info load)
     2. On-demand loading when user clicks tabs
@@ -632,10 +635,10 @@ async def get_device_module(serial_number: str, module_name: str):
     try:
         # Validate module name
         valid_modules = [
-            "applications", "hardware", "installs", "network", "security",
-            "inventory", "management", "system", "peripherals", "identity"
+            "applications", "hardware", "identity", "installs", "inventory",
+            "management", "network", "peripherals", "security", "system"
         ]
-        
+
         if module_name not in valid_modules:
             raise HTTPException(status_code=400, detail=f"Invalid module: {module_name}")
         

@@ -1,6 +1,6 @@
 -- Bulk hardware endpoint: /api/devices/hardware
 -- Returns flattened list of hardware details across all devices
--- Parameters: include_archived (boolean)
+-- Parameters: include_archived (boolean), limit (integer)
 
 SELECT DISTINCT ON (d.serial_number)
     d.serial_number,
@@ -19,4 +19,5 @@ WHERE d.serial_number IS NOT NULL
     AND d.serial_number NOT LIKE 'TEST-%%'
     AND h.data IS NOT NULL
     AND (%(include_archived)s = TRUE OR d.archived = FALSE)
-ORDER BY d.serial_number, h.updated_at DESC;
+ORDER BY d.serial_number, h.updated_at DESC
+LIMIT %(limit)s;
