@@ -1,7 +1,11 @@
 -- Bulk peripherals endpoint: /api/devices/peripherals
 -- Returns devices with connected peripherals (USB, input devices, audio, Bluetooth, cameras, etc.)
 -- Parameters: include_archived (boolean)
--- Note: Now uses unified peripherals table for comprehensive peripheral data
+--
+-- JOIN note: peripherals.device_id holds the device serial_number (per ingestion in events.py).
+-- Earlier versions of this query joined on d.id = p.device_id, which silently missed every
+-- Mac row because d.id on Mac records is the UUID while p.device_id is the serial. Always
+-- join via d.serial_number so the match is consistent across both platforms.
 
 SELECT DISTINCT ON (d.serial_number)
     d.serial_number,
@@ -21,9 +25,9 @@ SELECT DISTINCT ON (d.serial_number)
         inv.data->>'platform'
     ) as platform
 FROM devices d
-LEFT JOIN peripherals p ON d.id = p.device_id
-LEFT JOIN inventory inv ON d.id = inv.device_id
-LEFT JOIN system sys ON d.id = sys.device_id
+LEFT JOIN peripherals p ON p.device_id = d.serial_number
+LEFT JOIN inventory inv ON inv.device_id = d.serial_number
+LEFT JOIN system sys ON sys.device_id = d.serial_number
 WHERE d.serial_number IS NOT NULL
     AND d.serial_number NOT LIKE 'TEST-%%'
     AND d.serial_number != 'localhost'
