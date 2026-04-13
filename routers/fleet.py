@@ -218,30 +218,31 @@ async def get_bulk_applications(
         
         logger.info(f"Retrieved {len(rows)} devices with applications data")
         
-        # Process and flatten applications - process one device at a time
-        # to limit peak memory (each device's apps_data is released after processing)
-        all_applications = []
-        
+        # Build per-device app lists first, then round-robin flatten. This matters
+        # because the SQL orders by serial_number, and a single device with many apps
+        # (e.g. a dev laptop with 1000+ entries) would otherwise consume the entire
+        # default page and hide every other device's apps from the first response.
+        per_device_apps: list[list[dict]] = []
+
         for row in rows:
             try:
                 serial_number, device_uuid, last_seen, apps_data, collected_at, device_name, computer_name, usage, catalog, location, asset_tag, platform = row
-                
+
                 device_display_name = device_name or computer_name or serial_number
-                
+
                 if not apps_data:
                     continue
-                
-                # Handle different data structures
+
                 installed_apps = []
                 if isinstance(apps_data, dict):
                     installed_apps = apps_data.get('installedApplications') or apps_data.get('InstalledApplications') or apps_data.get('installed_applications') or []
                 elif isinstance(apps_data, list):
                     installed_apps = apps_data
-                
+
                 last_seen_iso = last_seen.isoformat() if last_seen else None
                 collected_at_iso = collected_at.isoformat() if collected_at else None
-                
-                # Flatten each application - only extract needed fields (no raw copy)
+
+                device_bucket: list[dict] = []
                 for idx, app in enumerate(installed_apps):
                     app_name = app.get('name') or app.get('displayName') or 'Unknown Application'
                     app_publisher = app.get('publisher') or app.get('signed_by') or app.get('vendor') or 'Unknown'
@@ -249,8 +250,7 @@ async def get_bulk_applications(
                     app_version = app.get('version') or app.get('bundle_version') or 'Unknown'
                     app_size = app.get('size') or app.get('estimatedSize')
                     app_install_date = app.get('installDate') or app.get('install_date') or app.get('last_modified')
-                    
-                    # Apply application-level filters
+
                     if app_name_list and not any(name.lower() in app_name.lower() for name in app_name_list):
                         continue
                     if publisher_list and not any(pub.lower() in app_publisher.lower() for pub in publisher_list):
@@ -265,8 +265,8 @@ async def get_bulk_applications(
                         continue
                     if sizeMax and app_size and app_size > sizeMax:
                         continue
-                    
-                    all_applications.append({
+
+                    device_bucket.append({
                         'id': f"{device_uuid}_{idx}",
                         'deviceId': device_uuid,
                         'deviceName': device_display_name,
@@ -289,10 +289,23 @@ async def get_bulk_applications(
                         'assetTag': asset_tag,
                         'platform': platform
                     })
-            
+
+                if device_bucket:
+                    per_device_apps.append(device_bucket)
+
             except Exception as e:
                 logger.warning(f"Error processing applications for device {row[0]}: {e}")
                 continue
+
+        # Round-robin flatten so the first `limit` items sample every device at
+        # least once before returning a second app from the busiest device.
+        all_applications: list[dict] = []
+        if per_device_apps:
+            max_len = max(len(bucket) for bucket in per_device_apps)
+            for i in range(max_len):
+                for bucket in per_device_apps:
+                    if i < len(bucket):
+                        all_applications.append(bucket[i])
         
         logger.info(f"Processed {len(all_applications)} applications from {len(rows)} devices")
         cache_set("applications", all_applications, _ckey)
@@ -1687,6 +1700,23 @@ async def get_bulk_peripherals(
             try:
                 serial_number, device_uuid, last_seen, peripherals_data, collected_at, device_name, computer_name, usage, catalog, location, asset_tag, platform = row
                 
+                # Clients emit peripherals data in two shapes:
+                #   Windows: nested -- {"usb": {"usb_devices": [...]}, "bluetooth": {"bluetooth_devices": [...]}, ...}
+                #   Mac:     flat   -- {"usbDevices": [...], "bluetoothDevices": [...], ...}
+                # Extract from whichever is populated; fall back to [].
+                pd = peripherals_data if isinstance(peripherals_data, dict) else {}
+                def _pick(*paths):
+                    for path in paths:
+                        node = pd
+                        for key in path:
+                            if not isinstance(node, dict):
+                                node = None
+                                break
+                            node = node.get(key)
+                        if isinstance(node, list):
+                            return node
+                    return []
+
                 devices.append({
                     'id': serial_number,
                     'deviceId': serial_number,
@@ -1699,15 +1729,16 @@ async def get_bulk_peripherals(
                     'catalog': catalog,
                     'location': location,
                     'platform': platform,
-                    # Pre-extracted peripheral categories (replaces raw blob)
-                    'usbDevices': (peripherals_data or {}).get('usb', {}).get('usb_devices', []) if isinstance(peripherals_data, dict) else [],
-                    'bluetoothDevices': (peripherals_data or {}).get('bluetooth', {}).get('bluetooth_devices', []) if isinstance(peripherals_data, dict) else [],
-                    'printers': (peripherals_data or {}).get('printers', {}).get('print_queues', []) if isinstance(peripherals_data, dict) else [],
-                    'cameras': (peripherals_data or {}).get('cameras', {}).get('camera_devices', []) if isinstance(peripherals_data, dict) else [],
-                    'audioDevices': (peripherals_data or {}).get('audio', {}).get('audio_devices', []) if isinstance(peripherals_data, dict) else [],
-                    'displayDevices': (peripherals_data or {}).get('displays', {}).get('monitors', []) if isinstance(peripherals_data, dict) else [],
-                    'inputDevices': (peripherals_data or {}).get('input', {}).get('input_devices', []) if isinstance(peripherals_data, dict) else [],
-                    'storageDevices': (peripherals_data or {}).get('storage', {}).get('storage_devices', []) if isinstance(peripherals_data, dict) else []
+                    'usbDevices': _pick(('usbDevices',), ('usb', 'usb_devices')),
+                    'bluetoothDevices': _pick(('bluetoothDevices',), ('bluetooth', 'bluetooth_devices')),
+                    'printers': _pick(('printers',), ('printers', 'print_queues')),
+                    'cameras': _pick(('cameras',), ('cameras', 'camera_devices')),
+                    'audioDevices': _pick(('audioDevices',), ('audio', 'audio_devices')),
+                    'displayDevices': _pick(('displayDevices',), ('displays', 'monitors')),
+                    'inputDevices': _pick(('inputDevices',), ('input', 'input_devices')),
+                    'storageDevices': _pick(('externalStorage',), ('storageDevices',), ('storage', 'storage_devices')),
+                    'thunderboltDevices': _pick(('thunderboltDevices',), ('thunderbolt', 'thunderbolt_devices')),
+                    'scanners': _pick(('scanners',), ('scanners', 'scanner_devices')),
                 })
             except Exception as e:
                 logger.warning(f"Error processing peripherals for device {row[0]}: {e}")
