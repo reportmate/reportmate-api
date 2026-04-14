@@ -329,7 +329,10 @@ async def clear_stale_installs_errors(
 
             modified = False
 
-            # Clear Cimian item errors and warnings
+            # Error/failed status values that the frontend flags as "Devices with Install Errors"
+            error_statuses = {"error", "failed", "problem", "needs_reinstall", "install_failed"}
+
+            # Clear Cimian item errors, warnings, and error statuses
             cimian_items = data.get("cimian", {}).get("items", [])
             for item in cimian_items:
                 has_error = bool(item.get("lastError", "").strip())
@@ -337,14 +340,20 @@ async def clear_stale_installs_errors(
                 has_failure = (item.get("failureCount", 0) or 0) > 0
                 has_warn_count = (item.get("warningCount", 0) or 0) > 0
                 has_loop = item.get("installLoopDetected", False) or item.get("hasInstallLoop", False)
+                status = (item.get("currentStatus") or "").lower()
+                has_error_status = status in error_statuses
 
-                if has_error or has_warning or has_failure or has_warn_count or has_loop:
+                if has_error or has_warning or has_failure or has_warn_count or has_loop or has_error_status:
                     item["lastError"] = ""
                     item["lastWarning"] = ""
                     item["failureCount"] = 0
                     item["warningCount"] = 0
                     item["installLoopDetected"] = False
                     item["hasInstallLoop"] = False
+                    if has_error_status:
+                        item["currentStatus"] = "Installed"
+                        if item.get("mappedStatus"):
+                            item["mappedStatus"] = "Installed"
                     modified = True
 
             # Clear Munki errors and warnings
