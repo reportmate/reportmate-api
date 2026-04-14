@@ -77,9 +77,18 @@ async def get_dashboard_data(
         _t3 = _time.monotonic()
         logger.info(f"[DASHBOARD PERF] inventory batch: {_t3-_t2:.3f}s ({len(inv_lookup)} rows)")
 
-        # System OS data is NOT fetched for dashboard — devices table has os_name/os_version
-        # Detailed OS info (build, edition, architecture) loads on device detail pages only
-        _t4 = _t3
+        # === STEP 3: Batch-fetch hardware data for name fallback (devices without inventory) ===
+        hw_lookup = {}
+        try:
+            cursor.execute("SELECT device_id, data->'system'->>'computer_name', data->'system'->>'hostname' FROM hardware")
+            for hw_row in cursor.fetchall():
+                hw_name = hw_row[1] or hw_row[2]
+                if hw_name and hw_name.strip():
+                    hw_lookup[hw_row[0]] = hw_name.strip()
+        except Exception as hw_err:
+            logger.warning(f"Failed to batch-fetch hardware names: {hw_err}")
+        _t4 = _time.monotonic()
+        logger.info(f"[DASHBOARD PERF] hardware name batch: {_t4-_t3:.3f}s ({len(hw_lookup)} rows)")
 
         # === STEP 4: Build device list in Python (fast dict lookups) ===
         now_utc = datetime.now(timezone.utc)
@@ -123,14 +132,22 @@ async def get_dashboard_data(
                 except Exception:
                     pass
 
+            # Fall back to hardware.system.computer_name if name is still Unknown/serial
+            if not inv_device_name or inv_device_name == "Unknown" or inv_device_name == serial_number:
+                hw_name = hw_lookup.get(serial_number)
+                if hw_name:
+                    inv_device_name = hw_name
+
             os_info = {
                 "name": final_os_name,
                 "version": final_os_version
             }
 
             modules_obj = {"system": {"operatingSystem": os_info}}
-            if any([inv_catalog, inv_usage, inv_department, inv_location]):
+            resolved_name = inv_device_name if (inv_device_name and inv_device_name != "Unknown" and inv_device_name != serial_number) else None
+            if any([resolved_name, inv_catalog, inv_usage, inv_department, inv_location]):
                 modules_obj["inventory"] = {
+                    "deviceName": resolved_name,
                     "catalog": inv_catalog, "usage": inv_usage,
                     "department": inv_department, "location": inv_location
                 }

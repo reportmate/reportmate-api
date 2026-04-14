@@ -471,7 +471,7 @@ async def submit_events(request: Request):
                     continue
         
         # 2b. Update device name from module data or metadata
-        # Priority: inventory.deviceName > inventory.device_name > network.hostname > system.hostname > metadata.additional.deviceName
+        # Priority: inventory.deviceName > hardware.system.computer_name > network.hostname > system.hostname > metadata.additional.deviceName
         try:
             device_name = None
             
@@ -483,6 +483,17 @@ async def submit_events(request: Request):
                 if isinstance(inv_data, dict):
                     device_name = inv_data.get('deviceName') or inv_data.get('device_name') or inv_data.get('computer_name')
             
+            # Try hardware.system (Mac clients store computer_name/hostname here)
+            if not device_name:
+                hw_data = modules_data.get('hardware')
+                if hw_data:
+                    if isinstance(hw_data, list) and hw_data:
+                        hw_data = hw_data[0]
+                    if isinstance(hw_data, dict):
+                        hw_sys = hw_data.get('system', {})
+                        if isinstance(hw_sys, dict):
+                            device_name = hw_sys.get('computer_name') or hw_sys.get('hostname')
+
             # Try network module hostname
             if not device_name:
                 net_data = modules_data.get('network')
@@ -491,7 +502,7 @@ async def submit_events(request: Request):
                         net_data = net_data[0]
                     if isinstance(net_data, dict):
                         device_name = net_data.get('hostname')
-            
+
             # Try system module hostname
             if not device_name:
                 sys_data = modules_data.get('system')
