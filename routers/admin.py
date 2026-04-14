@@ -2,7 +2,7 @@
 
 import json
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query
@@ -290,6 +290,107 @@ async def cleanup_usage_history(
     except Exception as e:
         logger.error(f"Usage history cleanup failed: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
+@router.delete("/admin/installs/clear-errors", dependencies=[Depends(verify_authentication)], tags=["admin"])
+async def clear_stale_installs_errors(
+    days: int = Query(default=10, ge=1, le=365, description="Clear errors/warnings from devices that haven't reported in this many days")
+):
+    """
+    Clear error and warning fields from installs data for stale devices.
+
+    Targets devices whose installs data hasn't been updated in the specified
+    number of days. Clears per-item error/warning fields in Cimian data and
+    error/warning strings in Munki data.
+
+    This is a manual maintenance operation - not automated.
+
+    **Authentication Required:**
+    - Windows clients: X-API-PASSPHRASE header
+    - Azure resources: X-MS-CLIENT-PRINCIPAL-ID header (Managed Identity)
+    """
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+
+        cutoff = datetime.now(timezone.utc) - timedelta(days=days)
+
+        # Find stale installs records
+        cursor.execute(
+            "SELECT device_id, data FROM installs WHERE updated_at < %s",
+            (cutoff,)
+        )
+        rows = cursor.fetchall()
+
+        cleared_devices = []
+
+        for device_id, data in rows:
+            if not isinstance(data, dict):
+                continue
+
+            modified = False
+
+            # Clear Cimian item errors and warnings
+            cimian_items = data.get("cimian", {}).get("items", [])
+            for item in cimian_items:
+                has_error = bool(item.get("lastError", "").strip())
+                has_warning = bool(item.get("lastWarning", "").strip())
+                has_failure = (item.get("failureCount", 0) or 0) > 0
+                has_warn_count = (item.get("warningCount", 0) or 0) > 0
+                has_loop = item.get("installLoopDetected", False) or item.get("hasInstallLoop", False)
+
+                if has_error or has_warning or has_failure or has_warn_count or has_loop:
+                    item["lastError"] = ""
+                    item["lastWarning"] = ""
+                    item["failureCount"] = 0
+                    item["warningCount"] = 0
+                    item["installLoopDetected"] = False
+                    item["hasInstallLoop"] = False
+                    modified = True
+
+            # Clear Munki errors and warnings
+            munki = data.get("munki", {})
+            if munki:
+                if munki.get("errors", "").strip():
+                    munki["errors"] = ""
+                    modified = True
+                if munki.get("warnings", "").strip():
+                    munki["warnings"] = ""
+                    modified = True
+                if munki.get("problemInstalls"):
+                    munki["problemInstalls"] = ""
+                    modified = True
+
+            if modified:
+                cursor.execute(
+                    "UPDATE installs SET data = %s::jsonb WHERE device_id = %s",
+                    (json.dumps(data), device_id)
+                )
+                cleared_devices.append(device_id)
+
+        conn.commit()
+        conn.close()
+
+        if cleared_devices:
+            invalidate_caches()
+
+        logger.info(
+            f"Installs error cleanup: cleared {len(cleared_devices)} devices "
+            f"(checked {len(rows)} stale, cutoff {days} days)"
+        )
+
+        return {
+            "success": True,
+            "cleared": len(cleared_devices),
+            "totalStale": len(rows),
+            "days": days,
+            "cutoffDate": cutoff.isoformat(),
+            "clearedDevices": cleared_devices,
+            "timestamp": datetime.now(timezone.utc).isoformat()
+        }
+
+    except Exception as e:
+        logger.error(f"Installs error cleanup failed: {e}")
+        raise HTTPException(status_code=500, detail=f"Installs error cleanup failed: {str(e)}")
 
 @router.get("/debug/database", dependencies=[Depends(verify_authentication)], tags=["admin"])
 async def debug_database():
