@@ -542,7 +542,7 @@ async def get_installs_filters(
             error_count = 0
             warning_count = 0
             removed_count = 0
-            
+
             for item in items:
                 status = (item.get('currentStatus') or item.get('status') or '').lower()
                 if status in ('installed', 'install-of-', 'install_of', 'present'):
@@ -557,6 +557,22 @@ async def get_installs_filters(
                     removed_count += 1
                 else:
                     installed_count += 1  # Default to installed
+
+            # For Munki: count run-level messages that aren't tied to items. Mac client keeps
+            # the raw message in munki.errors/warnings even when it also attaches to an item,
+            # so take max() instead of summing to avoid double-counting matched messages.
+            # This catches preflight failures and other unattributable issues that would
+            # otherwise show as "0 warnings" even when MunkiReport flags the device.
+            if munki_data:
+                munki_err_msgs = [m for m in (munki_data.get('errors') or '').split(';') if m.strip()]
+                munki_warn_msgs = [m for m in (munki_data.get('warnings') or '').split(';') if m.strip()]
+                munki_problem_items = [p for p in (munki_data.get('problemInstalls') or '').split(',') if p.strip()]
+                items_with_last_warning = sum(1 for it in items if (it.get('lastWarning') or '').strip())
+                error_count = max(error_count, len(munki_err_msgs))
+                warning_count = max(
+                    warning_count + items_with_last_warning,
+                    len(munki_warn_msgs) + len(munki_problem_items),
+                )
             
             # Determine config type
             is_cimian = bool(cimian_data)

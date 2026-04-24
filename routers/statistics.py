@@ -369,25 +369,53 @@ async def get_install_stats():
         conn = get_db_connection()
         cursor = conn.cursor()
         
-        # Single-pass aggregate: counts errors, warnings, and device-level stats
+        # Single-pass aggregate: counts errors, warnings, and device-level stats.
+        # Covers both Cimian (Windows) item statuses and Munki (macOS) run-level
+        # messages. For Munki, the Mac client keeps unattributable messages in
+        # munki.errors/warnings strings — if we only read item statuses, Macs with
+        # preflight failures or other run-level issues contribute nothing to the
+        # dashboard (they were silently invisible before this query was extended).
         cursor.execute("""
             SELECT
                 COUNT(DISTINCT CASE WHEN device_errors > 0 THEN i.device_id END) AS devices_with_errors,
-                COUNT(DISTINCT CASE WHEN device_warnings > 0 AND device_errors = 0 THEN i.device_id END) AS devices_with_warnings,
+                COUNT(DISTINCT CASE WHEN device_warnings > 0 THEN i.device_id END) AS devices_with_warnings,
                 COALESCE(SUM(device_errors), 0) AS total_errors,
                 COALESCE(SUM(device_warnings), 0) AS total_warnings
             FROM installs i
             INNER JOIN devices d ON d.serial_number = i.device_id AND d.archived = FALSE
             CROSS JOIN LATERAL (
                 SELECT
-                    (SELECT COUNT(*) FROM jsonb_array_elements(COALESCE(i.data->'cimian'->'items','[]'::jsonb)) item
-                     WHERE LOWER(item->>'currentStatus') IN ('failed','error','needs_reinstall')
-                        OR LOWER(item->>'mappedStatus') IN ('failed','error')
+                    GREATEST(
+                        (SELECT COUNT(*) FROM jsonb_array_elements(COALESCE(i.data->'cimian'->'items','[]'::jsonb)) item
+                         WHERE LOWER(item->>'currentStatus') IN ('failed','error','needs_reinstall')
+                            OR LOWER(item->>'mappedStatus') IN ('failed','error')
+                        ),
+                        (SELECT COUNT(*) FROM jsonb_array_elements(COALESCE(i.data->'munki'->'items','[]'::jsonb)) item
+                         WHERE LOWER(COALESCE(item->>'status', item->>'currentStatus','')) IN ('install_failed','install-failed','failed','error')
+                        ),
+                        (SELECT COUNT(*) FROM regexp_split_to_table(COALESCE(i.data->'munki'->>'errors',''), ';') s
+                         WHERE btrim(s) <> ''
+                        )
                     ) AS device_errors,
-                    (SELECT COUNT(*) FROM jsonb_array_elements(COALESCE(i.data->'cimian'->'items','[]'::jsonb)) item
-                     WHERE LOWER(item->>'currentStatus') LIKE '%%pending%%'
-                        OR LOWER(item->>'currentStatus') LIKE '%%update%%'
-                        OR LOWER(item->>'currentStatus') = 'warning'
+                    (
+                        (SELECT COUNT(*) FROM jsonb_array_elements(COALESCE(i.data->'cimian'->'items','[]'::jsonb)) item
+                         WHERE LOWER(item->>'currentStatus') LIKE '%%pending%%'
+                            OR LOWER(item->>'currentStatus') LIKE '%%update%%'
+                            OR LOWER(item->>'currentStatus') = 'warning'
+                        )
+                        +
+                        GREATEST(
+                            (SELECT COUNT(*) FROM jsonb_array_elements(COALESCE(i.data->'munki'->'items','[]'::jsonb)) item
+                             WHERE LENGTH(COALESCE(item->>'lastWarning','')) > 0
+                            ),
+                            (SELECT COUNT(*) FROM regexp_split_to_table(COALESCE(i.data->'munki'->>'warnings',''), ';') s
+                             WHERE btrim(s) <> ''
+                            )
+                            +
+                            (SELECT COUNT(*) FROM regexp_split_to_table(COALESCE(i.data->'munki'->>'problemInstalls',''), ',') s
+                             WHERE btrim(s) <> ''
+                            )
+                        )
                     ) AS device_warnings
             ) counts
         """)
