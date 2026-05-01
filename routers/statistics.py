@@ -170,9 +170,15 @@ async def get_dashboard_data(
         _t5 = _time.monotonic()
         logger.info(f"[DASHBOARD PERF] device transform: {_t5-_t4:.3f}s")
 
-        # === INSTALL STATS - single-pass correlated subqueries (one scan of installs) ===
+        # === INSTALL STATS - per-device aggregation, one scan of installs ===
+        # Computes both item totals (sum of error/warning items) AND device counts
+        # (number of distinct devices with at least one error/warning), split by
+        # platform. Device counts mirror the /devices/installs page categorization
+        # so the dashboard widgets match what the user sees on that page.
         install_stats = {
             "devicesWithErrors": 0, "devicesWithWarnings": 0,
+            "winDevicesWithErrors": 0, "winDevicesWithWarnings": 0,
+            "macDevicesWithErrors": 0, "macDevicesWithWarnings": 0,
             "totalErrorItems": 0, "totalWarningItems": 0,
             "winErrorItems": 0, "winWarningItems": 0,
             "macErrorItems": 0, "macWarningItems": 0,
@@ -180,54 +186,78 @@ async def get_dashboard_data(
         }
         try:
             cursor.execute("""
+                WITH device_install AS (
+                    SELECT
+                        d.serial_number,
+                        LOWER(COALESCE(d.platform, '')) AS plat,
+                        (SELECT COUNT(*) FROM jsonb_array_elements(COALESCE(i.data->'cimian'->'items','[]'::jsonb)) item
+                         WHERE LOWER(item->>'currentStatus') ~ '(error|failed|problem|install-error)'
+                            OR LOWER(item->>'currentStatus') = 'needs_reinstall'
+                        ) AS cimian_errors,
+                        (SELECT COUNT(*) FROM jsonb_array_elements(COALESCE(i.data->'cimian'->'items','[]'::jsonb)) item
+                         WHERE LOWER(item->>'currentStatus') ~ '(warning|needs-attention)'
+                        ) AS cimian_warnings,
+                        (SELECT COUNT(*) FROM jsonb_array_elements(COALESCE(i.data->'munki'->'items','[]'::jsonb)) item
+                         WHERE LOWER(item->>'status') ~ '(error|failed)'
+                        ) AS munki_errors,
+                        (SELECT COUNT(*) FROM jsonb_array_elements(COALESCE(i.data->'munki'->'items','[]'::jsonb)) item
+                         WHERE LOWER(item->>'status') LIKE '%%warning%%'
+                        ) AS munki_warnings
+                    FROM installs i
+                    INNER JOIN devices d ON d.serial_number = i.device_id
+                    WHERE d.archived = FALSE
+                      AND (
+                          jsonb_typeof(i.data->'cimian'->'items') = 'array'
+                          OR jsonb_typeof(i.data->'munki'->'items') = 'array'
+                      )
+                )
                 SELECT
-                    -- Windows (Cimian) errors
-                    COALESCE(SUM(CASE WHEN LOWER(COALESCE(d.platform,'')) LIKE '%%windows%%'
-                        THEN (SELECT COUNT(*) FROM jsonb_array_elements(COALESCE(i.data->'cimian'->'items','[]'::jsonb)) item
-                              WHERE LOWER(item->>'currentStatus') ~ '(error|failed|problem|install-error)')
-                        ELSE 0 END), 0) AS win_errors,
-                    -- Windows (Cimian) warnings
-                    COALESCE(SUM(CASE WHEN LOWER(COALESCE(d.platform,'')) LIKE '%%windows%%'
-                        THEN (SELECT COUNT(*) FROM jsonb_array_elements(COALESCE(i.data->'cimian'->'items','[]'::jsonb)) item
-                              WHERE LOWER(item->>'currentStatus') ~ '(warning|needs-attention)')
-                        ELSE 0 END), 0) AS win_warnings,
-                    -- macOS (Munki) errors
-                    COALESCE(SUM(CASE WHEN LOWER(COALESCE(d.platform,'')) LIKE '%%mac%%'
-                        THEN (SELECT COUNT(*) FROM jsonb_array_elements(COALESCE(i.data->'munki'->'items','[]'::jsonb)) item
-                              WHERE LOWER(item->>'status') ~ '(error|failed)')
-                        ELSE 0 END), 0) AS mac_errors,
-                    -- macOS (Munki) warnings
-                    COALESCE(SUM(CASE WHEN LOWER(COALESCE(d.platform,'')) LIKE '%%mac%%'
-                        THEN (SELECT COUNT(*) FROM jsonb_array_elements(COALESCE(i.data->'munki'->'items','[]'::jsonb)) item
-                              WHERE LOWER(item->>'status') LIKE '%%warning%%')
-                        ELSE 0 END), 0) AS mac_warnings,
+                    -- Item totals (per platform)
+                    COALESCE(SUM(CASE WHEN plat LIKE '%%windows%%' THEN cimian_errors   ELSE 0 END), 0) AS win_error_items,
+                    COALESCE(SUM(CASE WHEN plat LIKE '%%windows%%' THEN cimian_warnings ELSE 0 END), 0) AS win_warning_items,
+                    COALESCE(SUM(CASE WHEN plat LIKE '%%mac%%'     THEN munki_errors    ELSE 0 END), 0) AS mac_error_items,
+                    COALESCE(SUM(CASE WHEN plat LIKE '%%mac%%'     THEN munki_warnings  ELSE 0 END), 0) AS mac_warning_items,
+                    -- Device counts (per platform)
+                    COUNT(DISTINCT CASE WHEN plat LIKE '%%windows%%' AND cimian_errors   > 0 THEN serial_number END) AS win_devices_errors,
+                    COUNT(DISTINCT CASE WHEN plat LIKE '%%windows%%' AND cimian_warnings > 0 THEN serial_number END) AS win_devices_warnings,
+                    COUNT(DISTINCT CASE WHEN plat LIKE '%%mac%%'     AND munki_errors    > 0 THEN serial_number END) AS mac_devices_errors,
+                    COUNT(DISTINCT CASE WHEN plat LIKE '%%mac%%'     AND munki_warnings  > 0 THEN serial_number END) AS mac_devices_warnings,
+                    -- Device counts (cross-platform)
+                    COUNT(DISTINCT CASE
+                        WHEN (plat LIKE '%%windows%%' AND cimian_errors   > 0)
+                          OR (plat LIKE '%%mac%%'     AND munki_errors    > 0)
+                        THEN serial_number END) AS devices_errors,
+                    COUNT(DISTINCT CASE
+                        WHEN (plat LIKE '%%windows%%' AND cimian_warnings > 0)
+                          OR (plat LIKE '%%mac%%'     AND munki_warnings  > 0)
+                        THEN serial_number END) AS devices_warnings,
                     COUNT(*) > 0 AS has_data
-                FROM installs i
-                INNER JOIN devices d ON d.serial_number = i.device_id
-                WHERE d.archived = FALSE
-                  AND (
-                      jsonb_typeof(i.data->'cimian'->'items') = 'array'
-                      OR jsonb_typeof(i.data->'munki'->'items') = 'array'
-                  )
+                FROM device_install
             """)
             stats_row = cursor.fetchone()
             if stats_row:
-                win_errors   = int(stats_row[0] or 0)
-                win_warnings = int(stats_row[1] or 0)
-                mac_errors   = int(stats_row[2] or 0)
-                mac_warnings = int(stats_row[3] or 0)
-                install_stats["winErrorItems"]    = win_errors
-                install_stats["winWarningItems"]  = win_warnings
-                install_stats["macErrorItems"]    = mac_errors
-                install_stats["macWarningItems"]  = mac_warnings
-                install_stats["totalErrorItems"]  = win_errors + mac_errors
-                install_stats["totalWarningItems"] = win_warnings + mac_warnings
-                install_stats["hasInstallData"]   = bool(stats_row[4])
+                win_err_items   = int(stats_row[0] or 0)
+                win_warn_items  = int(stats_row[1] or 0)
+                mac_err_items   = int(stats_row[2] or 0)
+                mac_warn_items  = int(stats_row[3] or 0)
+                install_stats["winErrorItems"]        = win_err_items
+                install_stats["winWarningItems"]      = win_warn_items
+                install_stats["macErrorItems"]        = mac_err_items
+                install_stats["macWarningItems"]      = mac_warn_items
+                install_stats["totalErrorItems"]      = win_err_items + mac_err_items
+                install_stats["totalWarningItems"]    = win_warn_items + mac_warn_items
+                install_stats["winDevicesWithErrors"]   = int(stats_row[4] or 0)
+                install_stats["winDevicesWithWarnings"] = int(stats_row[5] or 0)
+                install_stats["macDevicesWithErrors"]   = int(stats_row[6] or 0)
+                install_stats["macDevicesWithWarnings"] = int(stats_row[7] or 0)
+                install_stats["devicesWithErrors"]      = int(stats_row[8] or 0)
+                install_stats["devicesWithWarnings"]    = int(stats_row[9] or 0)
+                install_stats["hasInstallData"]         = bool(stats_row[10])
         except Exception as stats_error:
             logger.warning(f"Failed to calculate install stats: {stats_error}")
 
         _t6 = _time.monotonic()
-        logger.info(f"[DASHBOARD PERF] install stats: {_t6-_t5:.3f}s (errors={install_stats['totalErrorItems']}, warnings={install_stats['totalWarningItems']})")
+        logger.info(f"[DASHBOARD PERF] install stats: {_t6-_t5:.3f}s (devices_errors={install_stats['devicesWithErrors']}, devices_warnings={install_stats['devicesWithWarnings']})")
 
         # === EVENTS (per-type diverse fetch via window function) ===
         # A plain ORDER BY timestamp returns 100% info events because every
