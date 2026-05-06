@@ -1844,9 +1844,11 @@ async def get_bulk_identity(
                     admin_count = sum(1 for u in users if isinstance(u, dict) and u.get('isAdmin')) if isinstance(users, list) else 0
                     disabled_count = sum(1 for u in users if isinstance(u, dict) and u.get('disabled')) if isinstance(users, list) else 0
                     
+                    # Mac client emits raw osquery shape ({'user': ...}); Windows client
+                    # emits the C# LoggedInUser model ({'username': ...}). Accept both.
                     unique_logged_in = list(dict.fromkeys(
-                        s.get('user') for s in logged_in_users 
-                        if isinstance(s, dict) and s.get('user')
+                        (s.get('user') or s.get('username')) for s in logged_in_users
+                        if isinstance(s, dict) and (s.get('user') or s.get('username'))
                     )) if isinstance(logged_in_users, list) else []
                     
                     summary = {
