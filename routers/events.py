@@ -410,7 +410,24 @@ async def submit_events(request: Request):
                     modules_processed.append(module_name)
                     logger.info(f"Stored {module_name} module for device {serial_number}")
                     
-                    # Extract daily usage history from applications module and UPSERT
+                    # Extract daily usage history from applications module and UPSERT.
+                    #
+                    # Both clients send WINDOW DELTAS, not cumulative-today totals:
+                    #   - Windows queries the Security Log for the last 4 hours
+                    #     (per ApplicationUsageService.cs lookbackHours=4)
+                    #   - Mac queries SQLite for sessions where transmitted=false
+                    #     then deletes them (per AppUsageWatcher.swift)
+                    # Therefore the second+ POST of the day for the same
+                    # (device, app) contains only the new delta. We accumulate
+                    # so daily totals reflect the full day, not just the last
+                    # collection window.
+                    #
+                    # Idempotency caveat: an HTTP retry that re-sends the same
+                    # payload will double-count. Mitigated by:
+                    #   (a) Mac marks sessions transmitted=true on 200 OK before
+                    #       deleting, so the same session shouldn't be re-sent.
+                    #   (b) /events is rate-limited to 30/min per client.
+                    # Long-term fix: payload-level transmission_id dedup (TODO).
                     if module_name == 'applications' and isinstance(module_data, dict):
                         daily_history = module_data.get('dailyUsageHistory', [])
                         if daily_history:
@@ -420,14 +437,28 @@ async def submit_events(request: Request):
                                     app_name = entry.get('appName')
                                     if not date_val or not app_name:
                                         continue
+                                    # activeSeconds / foregroundSeconds are optional — clients that
+                                    # don't yet implement idle-time tracking will omit them and
+                                    # contribute 0 to those columns. Same accumulate semantics as
+                                    # total_seconds (the existing process-lifetime metric).
                                     cursor.execute("""
-                                        INSERT INTO usage_history (device_id, date, app_name, publisher, launches, total_seconds, users, updated_at)
-                                        VALUES (%s, %s, %s, %s, %s, %s, %s::jsonb, NOW())
+                                        INSERT INTO usage_history (device_id, date, app_name, publisher, launches, total_seconds, active_seconds, foreground_seconds, users, updated_at)
+                                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb, NOW())
                                         ON CONFLICT (device_id, date, app_name) DO UPDATE SET
-                                            publisher = EXCLUDED.publisher,
-                                            launches = EXCLUDED.launches,
-                                            total_seconds = EXCLUDED.total_seconds,
-                                            users = EXCLUDED.users,
+                                            publisher = COALESCE(NULLIF(EXCLUDED.publisher, ''), usage_history.publisher),
+                                            launches = usage_history.launches + EXCLUDED.launches,
+                                            total_seconds = usage_history.total_seconds + EXCLUDED.total_seconds,
+                                            active_seconds = usage_history.active_seconds + EXCLUDED.active_seconds,
+                                            foreground_seconds = usage_history.foreground_seconds + EXCLUDED.foreground_seconds,
+                                            users = COALESCE((
+                                                SELECT jsonb_agg(DISTINCT u)
+                                                FROM (
+                                                    SELECT u FROM jsonb_array_elements_text(COALESCE(usage_history.users, '[]'::jsonb)) AS u
+                                                    UNION
+                                                    SELECT u FROM jsonb_array_elements_text(COALESCE(EXCLUDED.users, '[]'::jsonb)) AS u
+                                                ) merged
+                                                WHERE u IS NOT NULL AND u <> ''
+                                            ), '[]'::jsonb),
                                             updated_at = NOW()
                                     """, (
                                         serial_number,
@@ -436,10 +467,12 @@ async def submit_events(request: Request):
                                         entry.get('publisher', ''),
                                         entry.get('launches', 0),
                                         entry.get('totalSeconds', 0),
+                                        entry.get('activeSeconds', 0),
+                                        entry.get('foregroundSeconds', 0),
                                         json.dumps(entry.get('users', []))
                                     ))
                                 conn.commit()
-                                logger.info(f"Stored {len(daily_history)} daily usage entries for device {serial_number}")
+                                logger.info(f"Accumulated {len(daily_history)} daily usage entries for device {serial_number}")
                             except Exception as usage_err:
                                 logger.error(f"Failed to store daily usage history for {serial_number}: {usage_err}")
                                 conn.rollback()
