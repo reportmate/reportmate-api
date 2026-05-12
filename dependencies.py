@@ -53,6 +53,8 @@ _CACHE_TTL: dict = {
     "applications": 30,
     "applications_filters": 60,
     "applications_usage": 60,
+    "applications_usage_by_device": 60,
+    "applications_collection_health": 120,
     "installs": 30,
     "installs_filters": 60,
     "installs_full": 30,
@@ -555,6 +557,160 @@ def normalize_app_name(app_name: str) -> str:
         return ''
 
     return normalized
+
+
+# Explicit alias map for fleet utilization rollups. Collapses vendor product
+# families (launcher + main app + executable filename + version suffixes)
+# into a single canonical name. Order matters — more specific patterns first.
+# Patterns match case-insensitively against the raw app_name (substring).
+_APP_NAME_ALIAS_RULES: List[tuple] = [
+    # SideFX Houdini family
+    (r'\bhoudini\b', 'Houdini'),
+    (r'\bhindie\b', 'Houdini'),
+    (r'\bhython\b', 'Houdini'),
+
+    # Autodesk
+    (r'\bmaya\b', 'Maya'),
+    (r'\b3ds\s*max\b', '3ds Max'),
+    (r'\bmotionbuilder\b', 'MotionBuilder'),
+    (r'\bmudbox\b', 'Mudbox'),
+    (r'\bautocad\b', 'AutoCAD'),
+    (r'\brevit\b', 'Revit'),
+
+    # Foundry
+    (r'\bnukex\b', 'Nuke'),
+    (r'\bnuke\b', 'Nuke'),
+    (r'\bmari\b', 'Mari'),
+    (r'\bkatana\b', 'Katana'),
+    (r'\bmodo\b', 'Modo'),
+
+    # Maxon / Pixologic
+    (r'\bcinema\s*4d\b', 'Cinema 4D'),
+    (r'\bc4d\b', 'Cinema 4D'),
+    (r'\bredshift\b', 'Redshift'),
+    (r'\bzbrush\b', 'ZBrush'),
+
+    # Adobe Substance (Adobe owns Allegorithmic now)
+    (r'\badobesubstance\b', 'Adobe Substance 3D'),
+    (r'\bsubstance\s*sdl\b', 'Adobe Substance 3D'),
+    (r'\bsubstance\s*3d\s*painter\b', 'Substance 3D Painter'),
+    (r'\bsubstance\s*3d\s*designer\b', 'Substance 3D Designer'),
+    (r'\bsubstance\s*3d\s*sampler\b', 'Substance 3D Sampler'),
+    (r'\bsubstance\s*3d\s*stager\b', 'Substance 3D Stager'),
+    (r'\bsubstance\s*3d\s*modeler\b', 'Substance 3D Modeler'),
+    (r'\bsubstance\s*painter\b', 'Substance 3D Painter'),
+    (r'\bsubstance\s*designer\b', 'Substance 3D Designer'),
+
+    # Adobe Creative Cloud
+    (r'\bphotoshop\b', 'Adobe Photoshop'),
+    (r'\billustrator\b', 'Adobe Illustrator'),
+    (r'\bafter\s*effects\b', 'Adobe After Effects'),
+    (r'\bpremiere\s*pro\b', 'Adobe Premiere Pro'),
+    (r'\bpremiere\b', 'Adobe Premiere Pro'),
+    (r'\bmedia\s*encoder\b', 'Adobe Media Encoder'),
+    (r'\bindesign\b', 'Adobe InDesign'),
+    (r'\baudition\b', 'Adobe Audition'),
+    (r'\badobe\s*animate\b', 'Adobe Animate'),
+    (r'\blightroom\s*classic\b', 'Adobe Lightroom Classic'),
+    (r'\blightroom\b', 'Adobe Lightroom'),
+    (r'\badobe\s*bridge\b', 'Adobe Bridge'),
+    (r'\badobe\s*xd\b', 'Adobe XD'),
+    (r'\badobe\s*dimension\b', 'Adobe Dimension'),
+    (r'\bcharacter\s*animator\b', 'Adobe Character Animator'),
+
+    # Blackmagic
+    (r'\bdavinci\s*resolve\b', 'DaVinci Resolve'),
+    (r'\bfusion\s*studio\b', 'Fusion Studio'),
+
+    # Open-source
+    (r'\bblender\b', 'Blender'),
+    (r'\bkrita\b', 'Krita'),
+
+    # Game engines
+    (r'\bunreal\s*engine\b', 'Unreal Engine'),
+    (r'\bunreal\b', 'Unreal Engine'),
+    (r'\bunity\s*hub\b', 'Unity Hub'),
+    (r'\bunity\b', 'Unity'),
+
+    # Toon Boom
+    (r'\btoon\s*boom\s*harmony\b', 'Toon Boom Harmony'),
+    (r'\btoon\s*boom\s*storyboard\b', 'Toon Boom Storyboard Pro'),
+    (r'\bharmony\s*premium\b', 'Toon Boom Harmony'),
+    (r'\bstoryboard\s*pro\b', 'Toon Boom Storyboard Pro'),
+
+    # 2D animation / painting
+    (r'\btvpaint\b', 'TVPaint Animation'),
+    (r'\bclip\s*studio\s*paint\b', 'Clip Studio Paint'),
+    (r'\bsketchbook\b', 'Autodesk SketchBook'),
+    (r'\bstoryboarder\b', 'Storyboarder'),
+    (r'\bopentoonz\b', 'OpenToonz'),
+
+    # Look-dev / rendering / look-around
+    (r'\bkeyshot\b', 'KeyShot'),
+    (r'\bmarmoset\s*toolbag\b', 'Marmoset Toolbag'),
+    (r'\bspeedtree\b', 'SpeedTree'),
+    (r'\bmarvelous\s*designer\b', 'Marvelous Designer'),
+    (r'\brhinoceros\b', 'Rhinoceros'),
+    (r'\brhino\s*\d', 'Rhinoceros'),
+
+    # Render farm (Thinkbox/AWS Deadline). Specific subtypes first.
+    (r'\bdeadline\s*monitor\b', 'Deadline Monitor'),
+    (r'\bdeadline\s*launcher\b', 'Deadline Launcher'),
+    (r'\bdeadline\s*worker\b', 'Deadline Worker'),
+    (r'\bdeadline\s*slave\b', 'Deadline Worker'),
+    (r'\bdeadline\s*client\b', 'Deadline Client'),
+    (r'\bdeadline\b', 'Deadline'),
+
+    # Review / playback (Autodesk Shotgrid)
+    (r'\bshotgrid\s*rv\b', 'Shotgrid RV'),
+    (r'\bshotgun\s*rv\b', 'Shotgrid RV'),
+
+    # Audio
+    (r'\bpro\s*tools\b', 'Pro Tools'),
+    (r'\blogic\s*pro\b', 'Logic Pro'),
+    (r'\bgarageband\b', 'GarageBand'),
+    (r'\baudacity\b', 'Audacity'),
+    (r'\bobs\s*studio\b', 'OBS Studio'),
+    (r'\breaper\b', 'REAPER'),
+    (r'\bableton\s*live\b', 'Ableton Live'),
+
+    # Apple Pro Apps
+    (r'\bfinal\s*cut\s*pro\b', 'Final Cut Pro'),
+    (r'\bcompressor\b', 'Compressor'),
+]
+
+_APP_NAME_ALIAS_COMPILED = [
+    (re.compile(pat, re.IGNORECASE), canon) for pat, canon in _APP_NAME_ALIAS_RULES
+]
+
+
+def canonicalize_app_name(app_name: str) -> str:
+    """
+    Canonicalize an application name for fleet utilization rollups.
+
+    Strategy:
+      1. Match against the explicit alias map (vendor product families).
+         Collapses variants like "Houdini Launcher", "Houdini FX 21.0.440",
+         "hindie.exe" into a single canonical "Houdini".
+      2. Fall back to normalize_app_name() for generic version/arch stripping.
+      3. If both produce empty, return the raw name unchanged.
+
+    Applied at query time in fleet endpoints so alias rules can be iterated
+    without re-collecting data or running migrations.
+    """
+    if not app_name or not isinstance(app_name, str):
+        return ''
+
+    raw = app_name.strip()
+    if not raw:
+        return ''
+
+    for pattern, canonical in _APP_NAME_ALIAS_COMPILED:
+        if pattern.search(raw):
+            return canonical
+
+    normalized = normalize_app_name(raw)
+    return normalized if normalized else raw
 
 
 # ---------------------------------------------------------------------------
