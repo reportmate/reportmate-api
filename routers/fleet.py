@@ -2,14 +2,14 @@
 
 import json
 import time as _time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 
 from dependencies import (
     cache_get, cache_set, get_db_connection, load_sql, logger,
-    normalize_app_name, paginate, verify_authentication,
+    canonicalize_app_name, normalize_app_name, paginate, verify_authentication,
     build_os_summary, infer_platform,
 )
 
@@ -115,6 +115,640 @@ async def get_applications_filters(
     except Exception as e:
         logger.error(f"Failed to get applications filters: {e}")
         raise HTTPException(status_code=500, detail=f"Failed to retrieve applications filters: {str(e)}")
+
+
+@router.get("/devices/applications/usage", dependencies=[Depends(verify_authentication)], tags=["fleet"])
+async def get_fleet_applications_usage(
+    request: Request,
+    days: int = Query(default=30, ge=1, le=548, description="Lookback window in days"),
+    applicationNames: Optional[str] = Query(default=None, description="Comma-separated app names to include"),
+    usages: Optional[str] = Query(default=None, description="Comma-separated inventory usages"),
+    catalogs: Optional[str] = Query(default=None, description="Comma-separated inventory catalogs"),
+    locations: Optional[str] = Query(default=None, description="Comma-separated inventory locations"),
+    minHours: Optional[float] = Query(default=None, ge=0, description="Minimum total hours to include an app"),
+    minLaunches: Optional[int] = Query(default=None, ge=0, description="Minimum launch count to include an app"),
+    include_archived: bool = Query(default=False, alias="includeArchived"),
+):
+    """
+    Fleet-wide application usage aggregation from `usage_history`.
+
+    Aggregates per-app totals across all devices within the lookback window,
+    with optional inventory-based scoping (usages/catalogs/locations) and
+    per-app filtering. Returns the shape consumed by the Generate Report ->
+    Utilization view on /devices/applications.
+    """
+    conn = None
+    try:
+        _ckey = (str(dict(sorted(request.query_params.items()))),)
+        _cached = cache_get("applications_usage", _ckey)
+        if _cached is not None:
+            return _cached
+
+        _t0 = _time.monotonic()
+
+        app_name_list = [s.strip() for s in applicationNames.split(',')] if applicationNames else []
+        usage_list = [s.strip() for s in usages.split(',')] if usages else []
+        catalog_list = [s.strip() for s in catalogs.split(',')] if catalogs else []
+        location_list = [s.strip() for s in locations.split(',')] if locations else []
+
+        cutoff_date = (datetime.now(timezone.utc) - timedelta(days=days)).date()
+
+        conn = get_db_connection()
+        cursor = conn.cursor()
+
+        where = [
+            "uh.date >= %s",
+            "d.serial_number IS NOT NULL",
+            "d.serial_number NOT LIKE 'TEST-%%'",
+            "d.serial_number != 'localhost'",
+        ]
+        params: List[Any] = [cutoff_date]
+
+        if not include_archived:
+            where.append("d.archived = FALSE")
+
+        if app_name_list:
+            # Substring match (case-insensitive) so a normalized filter value like
+            # "Houdini" matches raw usage_history entries like "Houdini Launcher"
+            # or "Houdini FX 20.5.332.app". Matches the behavior of the bulk
+            # applications endpoint above.
+            patterns = [f"%{name}%" for name in app_name_list]
+            where.append("uh.app_name ILIKE ANY(%s)")
+            params.append(patterns)
+
+        if usage_list:
+            where.append("LOWER(inv.data->>'usage') = ANY(%s)")
+            params.append([s.lower() for s in usage_list])
+
+        if catalog_list:
+            where.append("LOWER(inv.data->>'catalog') = ANY(%s)")
+            params.append([s.lower() for s in catalog_list])
+
+        if location_list:
+            where.append("LOWER(inv.data->>'location') = ANY(%s)")
+            params.append([s.lower() for s in location_list])
+
+        where_clause = " AND ".join(where)
+
+        # Per-app aggregate. Avoid correlated subqueries — they balloon cost
+        # on unfiltered queries. Get per-app totals here; users list comes from
+        # a separate, single-pass jsonb unnest below.
+        app_query = f"""
+            SELECT
+                uh.app_name,
+                SUM(uh.launches)::bigint                                              AS launch_count,
+                SUM(uh.total_seconds)::double precision                               AS total_seconds,
+                SUM(COALESCE(uh.active_seconds, 0))::double precision                 AS active_seconds,
+                SUM(COALESCE(uh.foreground_seconds, 0))::double precision             AS foreground_seconds,
+                COUNT(DISTINCT uh.device_id)::int                                     AS device_count,
+                MIN(uh.date)::text                                                    AS first_used,
+                MAX(uh.date)::text                                                    AS last_used,
+                ARRAY_AGG(DISTINCT uh.device_id)                                      AS devices
+            FROM usage_history uh
+            JOIN devices d ON d.serial_number = uh.device_id
+            LEFT JOIN inventory inv ON inv.device_id = d.id
+            WHERE {where_clause}
+            GROUP BY uh.app_name
+            ORDER BY total_seconds DESC
+        """
+        cursor.execute(app_query, tuple(params))
+        app_rows = cursor.fetchall()
+
+        # Per-app distinct user list. Single unnest pass over the same scope.
+        users_by_app_query = f"""
+            SELECT uh.app_name, ARRAY_AGG(DISTINCT u) AS users
+            FROM usage_history uh
+            JOIN devices d ON d.serial_number = uh.device_id
+            LEFT JOIN inventory inv ON inv.device_id = d.id
+            CROSS JOIN LATERAL jsonb_array_elements_text(COALESCE(uh.users, '[]'::jsonb)) AS u
+            WHERE {where_clause}
+              AND u IS NOT NULL AND u <> ''
+            GROUP BY uh.app_name
+        """
+        cursor.execute(users_by_app_query, tuple(params))
+        users_by_app: Dict[str, List[str]] = {
+            row[0]: list(row[1] or []) for row in cursor.fetchall()
+        }
+
+        # Re-aggregate raw rows by canonical name. SQL groups by raw app_name
+        # (cheap, no JOIN against an alias table); Python folds variants like
+        # "Houdini Launcher" + "Houdini FX 21.0.440" + "hindie.exe" into one
+        # canonical "Houdini" row. minHours/minLaunches apply after rollup so
+        # they reflect the canonical totals, not pre-canonical fragments.
+        canonical_apps: Dict[str, Dict[str, Any]] = {}
+        for app_name, launch_count, total_secs, active_secs, foreground_secs, _device_count, first_used, last_used, devices in app_rows:
+            canonical = canonicalize_app_name(app_name) or app_name
+            entry = canonical_apps.setdefault(canonical, {
+                "totalSeconds": 0.0,
+                "activeSeconds": 0.0,
+                "foregroundSeconds": 0.0,
+                "launchCount": 0,
+                "deviceSet": set(),
+                "userSet": set(),
+                "firstUsed": first_used,
+                "lastUsed": last_used,
+                "aliasedFrom": set(),
+            })
+            entry["totalSeconds"] += float(total_secs or 0)
+            entry["activeSeconds"] += float(active_secs or 0)
+            entry["foregroundSeconds"] += float(foreground_secs or 0)
+            entry["launchCount"] += int(launch_count or 0)
+            entry["deviceSet"].update(devices or [])
+            entry["userSet"].update(u for u in users_by_app.get(app_name, []) if u)
+            if first_used and (not entry["firstUsed"] or first_used < entry["firstUsed"]):
+                entry["firstUsed"] = first_used
+            if last_used and (not entry["lastUsed"] or last_used > entry["lastUsed"]):
+                entry["lastUsed"] = last_used
+            if app_name and app_name != canonical:
+                entry["aliasedFrom"].add(app_name)
+
+        applications: List[Dict[str, Any]] = []
+        total_seconds_sum = 0.0
+        total_launches_sum = 0
+        single_user_apps: List[Dict[str, Any]] = []
+        all_users: set = set()
+        all_devices: set = set()
+
+        for canonical_name, agg in canonical_apps.items():
+            total_secs = agg["totalSeconds"]
+            active_secs = agg["activeSeconds"]
+            foreground_secs = agg["foregroundSeconds"]
+            launch_count = agg["launchCount"]
+            devices = sorted(agg["deviceSet"])
+            users = sorted(agg["userSet"])
+            device_count = len(devices)
+            user_count = len(users)
+            total_hours = round(total_secs / 3600, 2)
+            active_hours = round(active_secs / 3600, 2)
+            foreground_hours = round(foreground_secs / 3600, 2)
+            # Engagement ratio: how much of the "open" time was actually active use.
+            # Null when total is 0 OR no client in the fleet has reported active_seconds yet.
+            active_ratio = round(active_secs / total_secs, 3) if total_secs > 0 and active_secs > 0 else None
+
+            if minHours is not None and total_hours < minHours:
+                continue
+            if minLaunches is not None and launch_count < minLaunches:
+                continue
+
+            is_single_user = user_count == 1
+            applications.append({
+                "name": canonical_name,
+                "totalSeconds": total_secs,
+                "totalHours": total_hours,
+                "activeSeconds": active_secs,
+                "activeHours": active_hours,
+                "foregroundSeconds": foreground_secs,
+                "foregroundHours": foreground_hours,
+                "activeRatio": active_ratio,
+                "launchCount": launch_count,
+                "deviceCount": device_count,
+                "userCount": user_count,
+                "lastUsed": agg["lastUsed"],
+                "firstUsed": agg["firstUsed"],
+                "devices": devices,
+                "users": users,
+                "isSingleUser": is_single_user,
+                "aliasedFrom": sorted(agg["aliasedFrom"]),
+            })
+
+            total_seconds_sum += total_secs
+            total_launches_sum += launch_count
+            all_users.update(users)
+            all_devices.update(devices)
+
+            if is_single_user:
+                single_user_apps.append({"name": canonical_name, "totalHours": total_hours})
+
+        applications.sort(key=lambda a: a["totalSeconds"], reverse=True)
+
+        # Top users: same WHERE scope, unnest users JSONB once.
+        user_query = f"""
+            SELECT
+                u                                       AS username,
+                SUM(uh.total_seconds)::double precision AS total_seconds,
+                SUM(uh.launches)::bigint                AS launch_count,
+                COUNT(DISTINCT uh.app_name)::int        AS apps_used,
+                COUNT(DISTINCT uh.device_id)::int       AS devices_used
+            FROM usage_history uh
+            JOIN devices d ON d.serial_number = uh.device_id
+            LEFT JOIN inventory inv ON inv.device_id = d.id
+            CROSS JOIN LATERAL jsonb_array_elements_text(COALESCE(uh.users, '[]'::jsonb)) AS u
+            WHERE {where_clause}
+              AND u IS NOT NULL AND u <> ''
+            GROUP BY u
+            ORDER BY total_seconds DESC
+            LIMIT 50
+        """
+        cursor.execute(user_query, tuple(params))
+        top_users = []
+        for username, total_secs, launch_count, apps_used, devices_used in cursor.fetchall():
+            total_secs = float(total_secs or 0)
+            top_users.append({
+                "username": username,
+                "totalSeconds": total_secs,
+                "totalHours": round(total_secs / 3600, 2),
+                "launchCount": int(launch_count or 0),
+                "appsUsed": int(apps_used or 0),
+                "devicesUsed": int(devices_used or 0),
+            })
+
+        conn.close()
+        conn = None
+
+        single_user_apps.sort(key=lambda x: x["totalHours"], reverse=True)
+
+        summary = {
+            "totalAppsTracked": len(applications),
+            "totalUsageHours": round(total_seconds_sum / 3600, 2),
+            "totalLaunches": total_launches_sum,
+            "uniqueUsers": len(all_users),
+            "uniqueDevices": len(all_devices),
+            "singleUserAppCount": len(single_user_apps),
+            "unusedAppCount": 0,
+        }
+
+        result = {
+            "status": "ok",
+            "applications": applications,
+            "topUsers": top_users,
+            "singleUserApps": single_user_apps,
+            "unusedApps": [],
+            "summary": summary,
+            "filters": {
+                "days": days,
+                "applicationNames": app_name_list,
+                "usages": usage_list,
+                "catalogs": catalog_list,
+                "locations": location_list,
+                "minHours": minHours,
+                "minLaunches": minLaunches,
+            },
+            "lastUpdated": datetime.now(timezone.utc).isoformat(),
+        }
+
+        cache_set("applications_usage", result, _ckey)
+        logger.info(
+            f"[PERF] /api/devices/applications/usage: {_time.monotonic()-_t0:.3f}s "
+            f"({len(applications)} apps, {len(top_users)} users, days={days})"
+        )
+        return result
+
+    except Exception as e:
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
+        logger.error(f"Failed to get fleet applications usage: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to retrieve fleet usage: {str(e)}")
+
+
+@router.get("/devices/applications/usage/by-device", dependencies=[Depends(verify_authentication)], tags=["fleet"])
+async def get_application_usage_by_device(
+    request: Request,
+    app: str = Query(..., description="Application name pattern (substring, case-insensitive)"),
+    days: int = Query(default=30, ge=1, le=548, description="Lookback window in days"),
+    usages: Optional[str] = Query(default=None, description="Comma-separated inventory usages"),
+    catalogs: Optional[str] = Query(default=None, description="Comma-separated inventory catalogs"),
+    locations: Optional[str] = Query(default=None, description="Comma-separated inventory locations"),
+    include_archived: bool = Query(default=False, alias="includeArchived"),
+):
+    """
+    Per-device usage breakdown for one application (substring match on name).
+
+    Returns one row per device that contributed usage of any app matching the
+    given name pattern within the lookback window. Backs the drill-down view
+    from the fleet usage report.
+    """
+    conn = None
+    try:
+        _ckey = (str(dict(sorted(request.query_params.items()))),)
+        _cached = cache_get("applications_usage_by_device", _ckey)
+        if _cached is not None:
+            return _cached
+
+        _t0 = _time.monotonic()
+
+        usage_list = [s.strip() for s in usages.split(',')] if usages else []
+        catalog_list = [s.strip() for s in catalogs.split(',')] if catalogs else []
+        location_list = [s.strip() for s in locations.split(',')] if locations else []
+
+        cutoff_date = (datetime.now(timezone.utc) - timedelta(days=days)).date()
+
+        conn = get_db_connection()
+        cursor = conn.cursor()
+
+        where = [
+            "uh.date >= %s",
+            "uh.app_name ILIKE %s",
+            "d.serial_number IS NOT NULL",
+            "d.serial_number NOT LIKE 'TEST-%%'",
+            "d.serial_number != 'localhost'",
+        ]
+        params: List[Any] = [cutoff_date, f"%{app}%"]
+
+        if not include_archived:
+            where.append("d.archived = FALSE")
+        if usage_list:
+            where.append("LOWER(inv.data->>'usage') = ANY(%s)")
+            params.append([s.lower() for s in usage_list])
+        if catalog_list:
+            where.append("LOWER(inv.data->>'catalog') = ANY(%s)")
+            params.append([s.lower() for s in catalog_list])
+        if location_list:
+            where.append("LOWER(inv.data->>'location') = ANY(%s)")
+            params.append([s.lower() for s in location_list])
+
+        where_clause = " AND ".join(where)
+
+        device_query = f"""
+            SELECT
+                uh.device_id                                                    AS serial_number,
+                COALESCE(inv.data->>'device_name', inv.data->>'deviceName',
+                         inv.data->>'computer_name', inv.data->>'computerName',
+                         uh.device_id)                                          AS device_name,
+                inv.data->>'usage'                                              AS usage,
+                inv.data->>'catalog'                                            AS catalog,
+                inv.data->>'location'                                           AS location,
+                COALESCE(inv.data->>'asset_tag', inv.data->>'assetTag')         AS asset_tag,
+                SUM(uh.launches)::bigint                                        AS launch_count,
+                SUM(uh.total_seconds)::double precision                         AS total_seconds,
+                COUNT(DISTINCT uh.app_name)::int                                AS app_variant_count,
+                ARRAY_AGG(DISTINCT uh.app_name)                                 AS app_variants,
+                MIN(uh.date)::text                                              AS first_used,
+                MAX(uh.date)::text                                              AS last_used
+            FROM usage_history uh
+            JOIN devices d ON d.serial_number = uh.device_id
+            LEFT JOIN inventory inv ON inv.device_id = d.id
+            WHERE {where_clause}
+            GROUP BY uh.device_id, inv.data
+            ORDER BY total_seconds DESC
+        """
+        cursor.execute(device_query, tuple(params))
+        device_rows = cursor.fetchall()
+
+        # Per-device user lists via a single unnest pass.
+        users_query = f"""
+            SELECT uh.device_id, ARRAY_AGG(DISTINCT u) AS users
+            FROM usage_history uh
+            JOIN devices d ON d.serial_number = uh.device_id
+            LEFT JOIN inventory inv ON inv.device_id = d.id
+            CROSS JOIN LATERAL jsonb_array_elements_text(COALESCE(uh.users, '[]'::jsonb)) AS u
+            WHERE {where_clause}
+              AND u IS NOT NULL AND u <> ''
+            GROUP BY uh.device_id
+        """
+        cursor.execute(users_query, tuple(params))
+        users_by_device: Dict[str, List[str]] = {
+            row[0]: list(row[1] or []) for row in cursor.fetchall()
+        }
+
+        conn.close()
+        conn = None
+
+        devices_out: List[Dict[str, Any]] = []
+        total_seconds_sum = 0.0
+        total_launches_sum = 0
+        all_users: set = set()
+
+        for (serial, device_name, usage, catalog, location, asset_tag,
+             launch_count, total_secs, _variant_count, variants,
+             first_used, last_used) in device_rows:
+            total_secs = float(total_secs or 0)
+            launch_count = int(launch_count or 0)
+            users = [u for u in users_by_device.get(serial, []) if u]
+            raw_variants = [v for v in (variants or []) if v]
+            # Collapse "Houdini Launcher" + "Houdini FX 21.0.440" + "hindie.exe"
+            # to a single canonical entry per device.
+            canonical_variants = sorted({canonicalize_app_name(v) or v for v in raw_variants})
+            total_seconds_sum += total_secs
+            total_launches_sum += launch_count
+            all_users.update(users)
+            devices_out.append({
+                "serialNumber": serial,
+                "deviceName": device_name,
+                "usage": usage,
+                "catalog": catalog,
+                "location": location,
+                "room": location,
+                "assetTag": asset_tag,
+                "totalSeconds": total_secs,
+                "totalHours": round(total_secs / 3600, 2),
+                "launchCount": launch_count,
+                "userCount": len(users),
+                "users": users,
+                "appVariants": canonical_variants,
+                "appVariantCount": len(canonical_variants),
+                "rawAppVariants": sorted(raw_variants),
+                "firstUsed": first_used,
+                "lastUsed": last_used,
+            })
+
+        result = {
+            "status": "ok",
+            "appPattern": app,
+            "days": days,
+            "devices": devices_out,
+            "summary": {
+                "deviceCount": len(devices_out),
+                "totalUsageHours": round(total_seconds_sum / 3600, 2),
+                "totalLaunches": total_launches_sum,
+                "uniqueUsers": len(all_users),
+            },
+            "filters": {
+                "usages": usage_list,
+                "catalogs": catalog_list,
+                "locations": location_list,
+            },
+            "lastUpdated": datetime.now(timezone.utc).isoformat(),
+        }
+
+        cache_set("applications_usage_by_device", result, _ckey)
+        logger.info(
+            f"[PERF] /api/devices/applications/usage/by-device: {_time.monotonic()-_t0:.3f}s "
+            f"(app={app!r}, {len(devices_out)} devices, days={days})"
+        )
+        return result
+
+    except Exception as e:
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
+        logger.error(f"Failed to get per-device usage for app={app!r}: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to retrieve per-device usage: {str(e)}")
+
+
+@router.get("/devices/applications/collection-health", dependencies=[Depends(verify_authentication)], tags=["fleet"])
+async def get_applications_collection_health(
+    request: Request,
+    freshDays: int = Query(default=7, ge=1, le=90, description="Days within which a device is considered healthy"),
+    staleDays: int = Query(default=30, ge=1, le=180, description="Days beyond which a device is considered dark"),
+    include_archived: bool = Query(default=False, alias="includeArchived"),
+):
+    """
+    Per-device application-usage collection health.
+
+    Infers coverage from `usage_history` activity without requiring client
+    audit-state telemetry. Each non-archived device is bucketed into:
+      - healthy: usage_history row dated within freshDays
+      - stale:   usage_history row dated within staleDays but older than freshDays
+      - dark:    has usage_history rows but most recent is older than staleDays
+      - never:   no usage_history rows ever
+
+    Use to spot devices that are silently not collecting (audit policy off
+    on Windows, watcher daemon missing on Mac, etc.) — they appear in the
+    `dark` or `never` buckets.
+    """
+    conn = None
+    try:
+        _ckey = (freshDays, staleDays, include_archived)
+        _cached = cache_get("applications_collection_health", _ckey)
+        if _cached is not None:
+            return _cached
+
+        _t0 = _time.monotonic()
+
+        conn = get_db_connection()
+        cursor = conn.cursor()
+
+        archived_clause = "" if include_archived else " AND d.archived = FALSE"
+
+        # One pass: aggregate usage_history per device, LEFT JOIN with devices
+        # so "never" devices appear. Bucket logic happens in Python so we can
+        # tweak thresholds without touching SQL.
+        cursor.execute(f"""
+            WITH usage_summary AS (
+                SELECT
+                    device_id,
+                    MAX(date)::text       AS last_usage_date,
+                    SUM(total_seconds)    AS total_seconds_all,
+                    COUNT(*)::int         AS row_count
+                FROM usage_history
+                GROUP BY device_id
+            )
+            SELECT
+                d.serial_number,
+                COALESCE(inv.data->>'device_name', inv.data->>'deviceName',
+                         inv.data->>'computer_name', inv.data->>'computerName',
+                         d.name, d.serial_number)               AS device_name,
+                d.platform                                       AS platform,
+                d.os_name                                        AS os_name,
+                d.last_seen::text                                AS last_seen,
+                inv.data->>'usage'                               AS inventory_usage,
+                inv.data->>'catalog'                             AS catalog,
+                inv.data->>'location'                            AS location,
+                us.last_usage_date,
+                COALESCE(us.row_count, 0)                        AS row_count,
+                COALESCE(us.total_seconds_all, 0)::double precision AS total_seconds_all
+            FROM devices d
+            LEFT JOIN usage_summary us ON us.device_id = d.serial_number
+            LEFT JOIN inventory inv    ON inv.device_id = d.id
+            WHERE d.serial_number IS NOT NULL
+              AND d.serial_number NOT LIKE 'TEST-%%'
+              AND d.serial_number != 'localhost'
+              {archived_clause}
+        """)
+        rows = cursor.fetchall()
+
+        conn.close()
+        conn = None
+
+        today = datetime.now(timezone.utc).date()
+        fresh_cutoff = today - timedelta(days=freshDays)
+        stale_cutoff = today - timedelta(days=staleDays)
+
+        bucket_counts = {"healthy": 0, "stale": 0, "dark": 0, "never": 0}
+        bucket_counts_by_platform: Dict[str, Dict[str, int]] = {}
+        dark_devices: List[Dict[str, Any]] = []
+
+        for (serial, device_name, platform, os_name, last_seen,
+             inv_usage, catalog, location, last_usage_date,
+             row_count, total_secs) in rows:
+
+            # Normalize platform label for grouping.
+            plat = infer_platform(platform or os_name) or (platform or 'Unknown')
+
+            if last_usage_date is None:
+                bucket = "never"
+                days_since = None
+            else:
+                try:
+                    last_date = datetime.strptime(last_usage_date, "%Y-%m-%d").date()
+                    days_since = (today - last_date).days
+                except (ValueError, TypeError):
+                    last_date = None
+                    days_since = None
+
+                if last_date is None:
+                    bucket = "never"
+                elif last_date >= fresh_cutoff:
+                    bucket = "healthy"
+                elif last_date >= stale_cutoff:
+                    bucket = "stale"
+                else:
+                    bucket = "dark"
+
+            bucket_counts[bucket] += 1
+            plat_counts = bucket_counts_by_platform.setdefault(
+                plat, {"healthy": 0, "stale": 0, "dark": 0, "never": 0, "total": 0}
+            )
+            plat_counts[bucket] += 1
+            plat_counts["total"] += 1
+
+            if bucket in ("dark", "never"):
+                dark_devices.append({
+                    "serialNumber": serial,
+                    "deviceName": device_name,
+                    "platform": plat,
+                    "osName": os_name,
+                    "lastSeen": last_seen,
+                    "usage": inv_usage,
+                    "catalog": catalog,
+                    "location": location,
+                    "lastUsageDate": last_usage_date,
+                    "daysSinceUsage": days_since,
+                    "totalHoursEver": round(float(total_secs or 0) / 3600, 2),
+                    "rowCount": int(row_count),
+                    "bucket": bucket,
+                })
+
+        # Sort dark/never devices: never first (most concerning), then
+        # by daysSinceUsage descending (longest-gone first).
+        dark_devices.sort(
+            key=lambda d: (0 if d["bucket"] == "never" else 1, -(d["daysSinceUsage"] or 0))
+        )
+
+        total = sum(bucket_counts.values())
+        result = {
+            "status": "ok",
+            "summary": {
+                "totalDevices": total,
+                **bucket_counts,
+                "freshDays": freshDays,
+                "staleDays": staleDays,
+            },
+            "byPlatform": bucket_counts_by_platform,
+            "darkDevices": dark_devices,
+            "lastUpdated": datetime.now(timezone.utc).isoformat(),
+        }
+
+        cache_set("applications_collection_health", result, _ckey)
+        logger.info(
+            f"[PERF] /api/devices/applications/collection-health: {_time.monotonic()-_t0:.3f}s "
+            f"({total} devices, {bucket_counts['dark']} dark, {bucket_counts['never']} never)"
+        )
+        return result
+
+    except Exception as e:
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
+        logger.error(f"Failed to get collection health: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to retrieve collection health: {str(e)}")
 
 
 @router.get("/devices/applications", dependencies=[Depends(verify_authentication)], tags=["fleet"])
