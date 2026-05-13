@@ -276,8 +276,41 @@ async def submit_events(request: Request):
         collection_type = meta.collection_type or meta.collectionType or 'Full'
         enabled_modules = meta.enabled_modules or meta.enabledModules or []
         
-        # VALIDATION: Reject serial numbers that look like hostnames
-        # This prevents database pollution from client bugs where hostname is sent as serial
+        # VALIDATION: Reject empty / sentinel / hostname-shaped serial numbers
+        # This prevents database pollution from client bugs and crafted payloads.
+        # A real `-1` device in prod is what motivated the sentinel block below.
+        if not serial_number or not serial_number.strip():
+            raise HTTPException(
+                status_code=400,
+                detail="Invalid serial number: empty or whitespace-only."
+            )
+
+        normalized = serial_number.strip().lower()
+        SENTINEL_SERIALS = {
+            "-1", "0", "1",
+            "unknown", "none", "null", "n/a", "na",
+            "(empty)", "empty",
+            "default string", "system serial number",
+            "to be filled by o.e.m.", "to be filled by o.e.m",
+            "00000000", "000000000",
+        }
+        if normalized in SENTINEL_SERIALS:
+            logger.error(f"Rejected device registration: serial_number '{serial_number}' is a known sentinel value")
+            raise HTTPException(
+                status_code=400,
+                detail=f"Invalid serial number: '{serial_number}' is a sentinel/placeholder value. Device must provide a real hardware serial number."
+            )
+
+        # Real hardware serials are typically 6+ chars. Reject pure-numeric serials
+        # shorter than 4 chars (catches "-1", "0", "12", etc. even if not in the set above).
+        bare = serial_number.lstrip('-')
+        if bare.isdigit() and len(bare) < 4:
+            logger.error(f"Rejected device registration: serial_number '{serial_number}' is too short / numeric-only")
+            raise HTTPException(
+                status_code=400,
+                detail=f"Invalid serial number: '{serial_number}' is too short to be a real hardware serial."
+            )
+
         hostname_patterns = [
             r'^[A-Z]+-[A-Z]+$',  # All caps with hyphens (e.g., TOLUWANI-AGBI, AWI-JUMP)
             r'^[A-Z]+\-[A-Z0-9]+\-[A-Z0-9]+$',  # Pattern like DESKTOP-ABC123
@@ -286,7 +319,7 @@ async def submit_events(request: Request):
             r'^[A-Z]{4,}-[0-9]{4}$',
             r'^[A-Z]{2,}\d{2,}$',
         ]
-        
+
         for pattern in hostname_patterns:
             if re.match(pattern, serial_number, re.IGNORECASE):
                 logger.error(f"Rejected device registration: serial_number '{serial_number}' matches hostname pattern '{pattern}'")
@@ -294,7 +327,7 @@ async def submit_events(request: Request):
                     status_code=400,
                     detail=f"Invalid serial number: '{serial_number}' appears to be a hostname. Device must provide hardware serial number (BIOS/chassis serial)."
                 )
-        
+
         # Additional validation: Serial numbers should not contain only letters and hyphens
         # Real serials usually have numbers
         if serial_number.replace('-', '').isalpha():

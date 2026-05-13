@@ -226,15 +226,20 @@ async def delete_device(serial_number: str, confirm: bool = Query(False)):
         cursor.execute("SELECT COUNT(*) FROM events WHERE device_id = %s", (device_id,))
         event_count_result = cursor.fetchone()
         event_count = event_count_result[0] if event_count_result else 0
-        
+
+        # usage_history has no FK to devices, so it must be cleaned up explicitly
+        # to avoid orphan rows after a hard delete.
+        cursor.execute("DELETE FROM usage_history WHERE device_id = %s", (device_id,))
+        usage_history_deleted = cursor.rowcount
+
         # Delete the device (CASCADE will delete all related module data and events)
         cursor.execute("""
-            DELETE FROM devices 
+            DELETE FROM devices
             WHERE serial_number = %s OR id = %s
         """, (serial_number, serial_number))
-        
+
         deleted_count = cursor.rowcount
-        
+
         conn.commit()
         conn.close()
         invalidate_caches()
@@ -245,8 +250,9 @@ async def delete_device(serial_number: str, confirm: bool = Query(False)):
         logger.warning(f"🗑️ DELETED device: {serial_number} (UUID: {device_uuid}, Name: {device_name})")
         logger.warning(f"   - Archived status: {is_archived}")
         logger.warning(f"   - Events deleted: {event_count}")
+        logger.warning(f"   - Usage history rows deleted: {usage_history_deleted}")
         logger.warning(f"   - Modules deleted: {sum(module_counts.values())} records across {len([k for k, v in module_counts.items() if v > 0])} tables")
-        
+
         return {
             "success": True,
             "message": f"Device {serial_number} and all associated data has been permanently deleted",
@@ -256,6 +262,7 @@ async def delete_device(serial_number: str, confirm: bool = Query(False)):
             "wasArchived": is_archived,
             "deletedData": {
                 "events": event_count,
+                "usageHistory": usage_history_deleted,
                 "modules": module_counts,
                 "totalModuleRecords": sum(module_counts.values())
             },
