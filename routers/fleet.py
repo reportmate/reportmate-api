@@ -2451,7 +2451,9 @@ async def get_bulk_peripherals(
         devices = []
         for row in rows:
             try:
-                serial_number, device_uuid, last_seen, peripherals_data, collected_at, device_name, computer_name, usage, catalog, location, asset_tag, platform = row
+                (serial_number, device_uuid, last_seen, peripherals_data, collected_at,
+                 device_name, computer_name, usage, catalog, location, asset_tag,
+                 department, fleet, platform) = row
                 
                 # Clients emit peripherals data in two shapes:
                 #   Windows: nested -- {"usb": {"usb_devices": [...]}, "bluetooth": {"bluetooth_devices": [...]}, ...}
@@ -2481,6 +2483,9 @@ async def get_bulk_peripherals(
                     'usage': usage,
                     'catalog': catalog,
                     'location': location,
+                    'department': department,
+                    'area': department,
+                    'fleet': fleet,
                     'platform': platform,
                     'usbDevices': _pick(('usbDevices',), ('usb', 'usb_devices')),
                     'bluetoothDevices': _pick(('bluetoothDevices',), ('bluetooth', 'bluetooth_devices')),
@@ -2552,7 +2557,9 @@ async def get_bulk_identity(
         devices = []
         for row in rows:
             try:
-                serial_number, device_uuid, last_seen, platform, identity_data, collected_at, device_name, computer_name, usage, catalog, location, asset_tag, department = row
+                (serial_number, device_uuid, last_seen, platform, identity_data, collected_at,
+                 device_name, computer_name, usage, catalog, location, asset_tag,
+                 department, fleet) = row
                 
                 # Extract only the summary fields needed by the fleet page
                 # Do NOT return the full raw identity blob (~50KB per device)
@@ -2623,6 +2630,8 @@ async def get_bulk_identity(
                     'catalog': catalog,
                     'location': location,
                     'department': department,
+                    'area': department,
+                    'fleet': fleet,
                     'summary': summary,
                     'users': users_preview,
                     'loggedInUsernames': logged_in_usernames,
