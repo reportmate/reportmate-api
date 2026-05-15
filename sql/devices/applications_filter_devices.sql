@@ -7,7 +7,9 @@ SELECT DISTINCT ON (d.serial_number)
     COALESCE(inv.data->>'device_name', inv.data->>'deviceName', d.serial_number) as device_name,
     inv.data->>'usage' as usage,
     inv.data->>'catalog' as catalog,
-    inv.data->>'location' as location
+    inv.data->>'location' as location,
+    inv.data->>'department' as department,
+    inv.data->>'fleet' as fleet
 FROM devices d
 LEFT JOIN inventory inv ON d.id = inv.device_id
 JOIN applications a ON d.id = a.device_id

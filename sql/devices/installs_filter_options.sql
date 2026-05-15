@@ -13,6 +13,7 @@ SELECT DISTINCT ON (d.serial_number)
     inv.data->>'catalog' as catalog,
     inv.data->>'location' as location,
     COALESCE(inv.data->>'asset_tag', inv.data->>'assetTag') as asset_tag,
+    inv.data->>'department' as department,
     inv.data->>'fleet' as fleet,
     COALESCE(sys.data->'operatingSystem'->>'platform', inv.data->>'platform') as platform,
     i.data as installs_data,
