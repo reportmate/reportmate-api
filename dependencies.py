@@ -375,6 +375,7 @@ class InventorySummary(BaseModel):
     usage: Optional[str] = None
     catalog: Optional[str] = None
     owner: Optional[str] = None
+    fleet: Optional[str] = None
 
 
 class DeviceModules(BaseModel):
