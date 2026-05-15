@@ -2057,8 +2057,8 @@ async def get_bulk_inventory(
         devices = []
         for row in rows:
             try:
-                serial_number, device_uuid, last_seen, inventory_data, collected_at, device_name, computer_name, usage, catalog, location, asset_tag, department = row
-                
+                serial_number, device_uuid, last_seen, inventory_data, collected_at, device_name, computer_name, usage, catalog, location, asset_tag, department, fleet = row
+
                 devices.append({
                     'id': serial_number,
                     'deviceId': serial_number,
@@ -2070,7 +2070,8 @@ async def get_bulk_inventory(
                     'usage': usage,
                     'catalog': catalog,
                     'location': location,
-                    'department': department
+                    'department': department,
+                    'fleet': fleet
                 })
             except Exception as e:
                 logger.warning(f"Error processing inventory for device {row[0]}: {e}")
