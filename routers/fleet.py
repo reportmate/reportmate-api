@@ -352,6 +352,49 @@ async def get_fleet_applications_usage(
                 "devicesUsed": int(devices_used or 0),
             })
 
+        # Per-device rollup across the selected app scope. Each device contributes
+        # one row carrying its inventory dimensions (location/catalog/usage/area/
+        # fleet) so the frontend can compute Hours-by-X widgets that match the
+        # single-app view. Each device's hours flow once into its dimension
+        # bucket regardless of how many of the selected apps it touched.
+        device_agg_query = f"""
+            SELECT
+                uh.device_id                                                    AS serial_number,
+                COALESCE(inv.data->>'device_name', inv.data->>'deviceName',
+                         inv.data->>'computer_name', inv.data->>'computerName',
+                         uh.device_id)                                          AS device_name,
+                inv.data->>'usage'                                              AS usage,
+                inv.data->>'catalog'                                            AS catalog,
+                inv.data->>'location'                                           AS location,
+                inv.data->>'department'                                         AS department,
+                inv.data->>'fleet'                                              AS fleet,
+                SUM(uh.total_seconds)::double precision                         AS total_seconds,
+                SUM(uh.launches)::bigint                                        AS launch_count
+            FROM usage_history uh
+            JOIN devices d ON d.serial_number = uh.device_id
+            LEFT JOIN inventory inv ON inv.device_id = d.id
+            WHERE {where_clause}
+            GROUP BY uh.device_id, inv.data
+            ORDER BY total_seconds DESC
+        """
+        cursor.execute(device_agg_query, tuple(params))
+        devices_aggregate: List[Dict[str, Any]] = []
+        for (d_serial, d_name, d_usage, d_catalog, d_location,
+             d_department, d_fleet, d_total_secs, d_launches) in cursor.fetchall():
+            d_total_secs = float(d_total_secs or 0)
+            devices_aggregate.append({
+                "serialNumber": d_serial,
+                "deviceName": d_name,
+                "usage": d_usage,
+                "catalog": d_catalog,
+                "location": d_location,
+                "department": d_department,
+                "fleet": d_fleet,
+                "totalSeconds": d_total_secs,
+                "totalHours": round(d_total_secs / 3600, 2),
+                "launchCount": int(d_launches or 0),
+            })
+
         conn.close()
         conn = None
 
@@ -373,6 +416,7 @@ async def get_fleet_applications_usage(
             "topUsers": top_users,
             "singleUserApps": single_user_apps,
             "unusedApps": [],
+            "devicesAggregate": devices_aggregate,
             "summary": summary,
             "filters": {
                 "days": days,
@@ -470,6 +514,8 @@ async def get_application_usage_by_device(
                 inv.data->>'usage'                                              AS usage,
                 inv.data->>'catalog'                                            AS catalog,
                 inv.data->>'location'                                           AS location,
+                inv.data->>'department'                                         AS department,
+                inv.data->>'fleet'                                              AS fleet,
                 COALESCE(inv.data->>'asset_tag', inv.data->>'assetTag')         AS asset_tag,
                 SUM(uh.launches)::bigint                                        AS launch_count,
                 SUM(uh.total_seconds)::double precision                         AS total_seconds,
@@ -511,7 +557,7 @@ async def get_application_usage_by_device(
         total_launches_sum = 0
         all_users: set = set()
 
-        for (serial, device_name, usage, catalog, location, asset_tag,
+        for (serial, device_name, usage, catalog, location, department, fleet, asset_tag,
              launch_count, total_secs, _variant_count, variants,
              first_used, last_used) in device_rows:
             total_secs = float(total_secs or 0)
@@ -531,6 +577,8 @@ async def get_application_usage_by_device(
                 "catalog": catalog,
                 "location": location,
                 "room": location,
+                "department": department,
+                "fleet": fleet,
                 "assetTag": asset_tag,
                 "totalSeconds": total_secs,
                 "totalHours": round(total_secs / 3600, 2),
