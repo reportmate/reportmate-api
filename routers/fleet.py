@@ -217,7 +217,10 @@ async def get_fleet_applications_usage(
             params.append([s.lower() for s in fleet_list])
 
         if room_list:
-            where.append("LOWER(inv.data->>'room') = ANY(%s)")
+            # Filter-options endpoint exposes "rooms" populated from
+            # inv.data->>'location', so match against the same field with
+            # 'room' as a fallback for clients that send both keys.
+            where.append("LOWER(COALESCE(inv.data->>'location', inv.data->>'room')) = ANY(%s)")
             params.append([s.lower() for s in room_list])
 
         if platform_list:
@@ -291,10 +294,20 @@ async def get_fleet_applications_usage(
         # minHours / minLaunches apply after rollup so they reflect bucket
         # totals, not pre-rollup fragments — but only when there's no explicit
         # pick list (an explicit pick should always show, even with zero data).
+        # For explicit picks: build a lookup from lowercase -> the caller's
+        # exact-cased pick. SQL matched case-insensitively, so different
+        # clients can report the same app with different casing ("Logic Pro"
+        # vs "logic pro") — fold them into one bucket keyed by the caller's
+        # canonical casing so the chip cloud and the report row stay 1:1.
+        picked_by_lower: Dict[str, str] = {}
+        if app_name_list:
+            for picked in app_name_list:
+                picked_by_lower.setdefault(picked.lower(), picked)
+
         canonical_apps: Dict[str, Dict[str, Any]] = {}
         for app_name, launch_count, total_secs, active_secs, foreground_secs, _device_count, first_used, last_used, devices in app_rows:
             if app_name_list:
-                bucket_key = app_name
+                bucket_key = picked_by_lower.get((app_name or '').lower(), app_name)
             else:
                 bucket_key = canonicalize_app_name(app_name) or app_name
             entry = canonical_apps.setdefault(bucket_key, {
@@ -347,6 +360,11 @@ async def get_fleet_applications_usage(
         single_user_apps: List[Dict[str, Any]] = []
         all_users: set = set()
         all_devices: set = set()
+        # Devices that survived the minHours / minLaunches cutoff. Used below
+        # to narrow devicesAggregate so the widget device count matches the
+        # per-app table count exactly (otherwise apps dropped here would still
+        # contribute their devices to the widget aggregate).
+        kept_device_set: set = set()
 
         for canonical_name, agg in canonical_apps.items():
             total_secs = agg["totalSeconds"]
@@ -373,6 +391,7 @@ async def get_fleet_applications_usage(
                 if minLaunches is not None and launch_count < minLaunches:
                     continue
 
+            kept_device_set.update(devices)
             is_single_user = user_count == 1
             applications.append({
                 "name": canonical_name,
@@ -471,24 +490,28 @@ async def get_fleet_applications_usage(
                 "usage": d_usage,
                 "catalog": d_catalog,
                 "location": d_location,
+                # Alias for callers that bucket by the global area/room dims
+                # — consistent with the bulk applications endpoint and frontend
+                # filter wiring that uses `area` interchangeably with
+                # `department` and `room` interchangeably with `location`.
+                "room": d_location,
                 "department": d_department,
+                "area": d_department,
                 "fleet": d_fleet,
                 "totalSeconds": d_total_secs,
                 "totalHours": round(d_total_secs / 3600, 2),
                 "launchCount": int(d_launches or 0),
             })
 
-        # If we filtered canonical_apps above, mirror the trim on devicesAggregate:
-        # only keep devices that contributed to one of the kept canonicals. The
-        # per-device totals still come from the SQL (which used the loose ILIKE
-        # filter), but at least the device *set* matches what the user asked for.
-        if app_name_list:
-            allowed_devices: set = set()
-            for agg in canonical_apps.values():
-                allowed_devices.update(agg["deviceSet"])
+        # Narrow devicesAggregate to the devices behind the apps actually in
+        # the `applications` list — covers both explicit-pick mode and the
+        # fleet-wide case where minHours/minLaunches dropped some apps. The
+        # device count badge on the Widgets accordion now matches the row
+        # count behind the data table.
+        if app_name_list or minHours is not None or minLaunches is not None:
             devices_aggregate = [
                 d for d in devices_aggregate
-                if d["serialNumber"] in allowed_devices
+                if d["serialNumber"] in kept_device_set
             ]
 
         conn.close()
@@ -578,14 +601,18 @@ async def get_application_usage_by_device(
         conn = get_db_connection()
         cursor = conn.cursor()
 
+        # Exact (case-insensitive) match on app name. Substring + alias was
+        # conflating distinct inventory products in the multi-app endpoint
+        # and the same risk applies here -- a drill-down on "Motion" should
+        # not silently include MotionBuilder per-device rows.
         where = [
             "uh.date >= %s",
-            "uh.app_name ILIKE %s",
+            "LOWER(uh.app_name) = %s",
             "d.serial_number IS NOT NULL",
             "d.serial_number NOT LIKE 'TEST-%%'",
             "d.serial_number != 'localhost'",
         ]
-        params: List[Any] = [cutoff_date, f"%{app}%"]
+        params: List[Any] = [cutoff_date, app.lower()]
 
         if not include_archived:
             where.append("d.archived = FALSE")
@@ -967,13 +994,18 @@ async def get_bulk_applications(
             where_conditions.append("d.archived = FALSE")
 
         query_params: List[Any] = []
-        param_index = 1
 
         if device_name_list:
-            placeholders = ', '.join([f'${i}' for i in range(param_index, param_index + len(device_name_list) * 3)])
-            where_conditions.append(f"(COALESCE(inv.data->>'device_name', inv.data->>'deviceName') IN ({placeholders}) OR COALESCE(inv.data->>'computer_name', inv.data->>'computerName') IN ({placeholders}) OR d.serial_number IN ({placeholders}))")
+            # Use %s placeholders to match the rest of this query — the new
+            # inventory-dimension filters below also use %s, and mixing
+            # paramstyles in a single SQL string can fail binding in pg8000.
+            placeholders = ', '.join(['%s'] * len(device_name_list))
+            where_conditions.append(
+                f"(COALESCE(inv.data->>'device_name', inv.data->>'deviceName') IN ({placeholders}) "
+                f"OR COALESCE(inv.data->>'computer_name', inv.data->>'computerName') IN ({placeholders}) "
+                f"OR d.serial_number IN ({placeholders}))"
+            )
             query_params.extend(device_name_list * 3)
-            param_index += len(device_name_list) * 3
 
         if usage_list:
             where_conditions.append("LOWER(inv.data->>'usage') = ANY(%s)")
@@ -992,7 +1024,10 @@ async def get_bulk_applications(
             query_params.append([s.lower() for s in fleet_list])
 
         if room_list:
-            where_conditions.append("LOWER(inv.data->>'room') = ANY(%s)")
+            # Filter-options endpoint exposes "rooms" populated from
+            # inv.data->>'location' so match the same field with 'room' as a
+            # fallback for clients that send both keys.
+            where_conditions.append("LOWER(COALESCE(inv.data->>'location', inv.data->>'room')) = ANY(%s)")
             query_params.append([s.lower() for s in room_list])
 
         if location_list:
@@ -1033,7 +1068,10 @@ async def get_bulk_applications(
             COALESCE(sys.data->'operatingSystem'->>'name', d.platform) as platform,
             inv.data->>'department' as department,
             inv.data->>'fleet' as fleet,
-            inv.data->>'room' as room
+            -- Filter-options endpoint exposes "rooms" populated from
+            -- inv.data->>'location'; mirror that here so client-side room
+            -- filtering on these rows matches the same set of devices.
+            COALESCE(inv.data->>'location', inv.data->>'room') as room
         FROM devices d
         LEFT JOIN applications a ON d.id = a.device_id
         LEFT JOIN inventory inv ON d.id = inv.device_id
