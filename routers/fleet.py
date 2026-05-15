@@ -701,6 +701,9 @@ async def get_application_usage_by_device(
                 "location": location,
                 "room": location,
                 "department": department,
+                # Mirror of department, matching the alias the other fleet
+                # endpoints use so consumers don't need endpoint-specific casing.
+                "area": department,
                 "fleet": fleet,
                 "assetTag": asset_tag,
                 "totalSeconds": total_secs,
