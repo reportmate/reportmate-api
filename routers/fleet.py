@@ -74,16 +74,21 @@ async def get_applications_filters(
         usages = set()
         catalogs = set()
         locations = set()
+        areas = set()
+        fleets = set()
         devices = []
-        
-        for serial, device_name, usage, catalog, location in device_rows:
+
+        for serial, device_name, usage, catalog, location, department, fleet in device_rows:
             devices.append({
                 'serialNumber': serial,
                 'name': device_name or serial,
                 'usage': usage or '',
                 'catalog': catalog or '',
                 'location': location or '',
-                'room': location or ''
+                'room': location or '',
+                'department': department or '',
+                'area': department or '',
+                'fleet': fleet or ''
             })
             if usage:
                 usages.add(usage)
@@ -91,9 +96,13 @@ async def get_applications_filters(
                 catalogs.add(catalog)
             if location:
                 locations.add(location)
-        
+            if department:
+                areas.add(department)
+            if fleet:
+                fleets.add(fleet)
+
         logger.info(f"Applications filters: {len(app_names)} unique apps, {len(publishers)} publishers, {len(devices)} devices")
-        
+
         _result = {
             'applicationNames': sorted(app_names),
             'windowsApplicationNames': sorted(windows_app_names),
@@ -104,7 +113,8 @@ async def get_applications_filters(
             'catalogs': sorted(catalogs),
             'locations': sorted(locations),
             'rooms': sorted(locations),
-            'fleets': [],
+            'areas': sorted(areas),
+            'fleets': sorted(fleets),
             'devices': devices,
             'devicesWithData': len(devices)
         }
@@ -1046,8 +1056,9 @@ async def get_bulk_hardware(
         
         for row in rows:
             try:
-                serial_number, device_uuid, last_seen, hardware_data, collected_at, system_data, device_name, computer_name = row
-                
+                (serial_number, device_uuid, last_seen, hardware_data, collected_at, system_data,
+                 device_name, computer_name, usage, catalog, location, asset_tag, department, fleet) = row
+
                 device_display_name = device_name or computer_name or serial_number
                 
                 # Extract OS info from system data
@@ -1108,8 +1119,23 @@ async def get_bulk_hardware(
                     'osName': os_info.get('name'),
                     'osVersion': os_info.get('version') or os_info.get('displayVersion'),
                     'architecture': os_info.get('architecture'),
-                    'inventory': hw_details.get('inventory', {}),
-                    'assetTag': (hw_details.get('inventory') or {}).get('assetTag') or (hw_details.get('inventory') or {}).get('asset_tag'),
+                    'inventory': {
+                        **(hw_details.get('inventory') or {}),
+                        'usage': usage,
+                        'catalog': catalog,
+                        'location': location,
+                        'assetTag': asset_tag or (hw_details.get('inventory') or {}).get('assetTag') or (hw_details.get('inventory') or {}).get('asset_tag'),
+                        'department': department,
+                        'area': department,
+                        'fleet': fleet,
+                    },
+                    'assetTag': asset_tag or (hw_details.get('inventory') or {}).get('assetTag') or (hw_details.get('inventory') or {}).get('asset_tag'),
+                    'usage': usage,
+                    'catalog': catalog,
+                    'location': location,
+                    'department': department,
+                    'area': department,
+                    'fleet': fleet,
                 })
             
             except Exception as e:
@@ -1161,21 +1187,24 @@ async def get_installs_filters(
         usages = set()
         catalogs = set()
         rooms = set()
+        areas = set()
         fleets = set()
         platforms = set()
         software_repos = set()
         manifests = set()
         devices = []
-        
+
         for row in rows:
-            serial, device_name, usage, catalog, location, asset_tag, fleet, platform, installs_data, last_seen = row
-            
+            serial, device_name, usage, catalog, location, asset_tag, department, fleet, platform, installs_data, last_seen = row
+
             if usage:
                 usages.add(usage)
             if catalog:
                 catalogs.add(catalog)
             if location:
                 rooms.add(location)
+            if department:
+                areas.add(department)
             if fleet:
                 fleets.add(fleet)
             if platform:
@@ -1336,11 +1365,13 @@ async def get_installs_filters(
                         'catalog': catalog,
                         'location': location,
                         'assetTag': asset_tag,
+                        'department': department,
+                        'area': department,
                         'fleet': fleet,
                     }
                 }
             })
-        
+
         logger.info(f"Installs filters: {len(managed_installs)} unique installs, {len(devices)} devices")
         
         _result = {
@@ -1352,6 +1383,7 @@ async def get_installs_filters(
             'usages': sorted(usages),
             'catalogs': sorted(catalogs),
             'rooms': sorted(rooms),
+            'areas': sorted(areas),
             'fleets': sorted(fleets),
             'platforms': sorted(platforms),
             'softwareRepos': sorted(software_repos),
@@ -1660,8 +1692,11 @@ async def get_bulk_network(
         
         for row in rows:
             try:
-                serial_number, device_uuid, last_seen, network_data, collected_at, device_name, computer_name, usage, catalog, location, asset_tag, os_name, os_version, build_number, uptime, boot_time = row
-                
+                (serial_number, device_uuid, last_seen, network_data, collected_at,
+                 device_name, computer_name, usage, catalog, location, asset_tag,
+                 department, fleet,
+                 os_name, os_version, build_number, uptime, boot_time) = row
+
                 device_obj = {
                     'id': serial_number,
                     'deviceId': serial_number,
@@ -1670,6 +1705,12 @@ async def get_bulk_network(
                     'assetTag': asset_tag,
                     'lastSeen': last_seen.isoformat() if last_seen else None,
                     'collectedAt': collected_at.isoformat() if collected_at else None,
+                    'usage': usage,
+                    'catalog': catalog,
+                    'location': location,
+                    'department': department,
+                    'area': department,
+                    'fleet': fleet,
                     'operatingSystem': os_name,
                     'osVersion': os_version,
                     'buildNumber': build_number,
@@ -1737,6 +1778,7 @@ async def get_bulk_security(
             try:
                 (serial_number, device_uuid, last_seen, platform, collected_at,
                  device_name, computer_name, usage, catalog, location, asset_tag,
+                 department, fleet,
                  firewall_enabled, encryption_enabled,
                  antivirus_name, antivirus_enabled, antivirus_up_to_date, antivirus_version, antivirus_last_scan,
                  detection_count,
@@ -1759,6 +1801,9 @@ async def get_bulk_security(
                     'usage': usage,
                     'catalog': catalog,
                     'location': location,
+                    'department': department,
+                    'area': department,
+                    'fleet': fleet,
                     # Firewall
                     'firewallEnabled': bool(firewall_enabled),
                     # Encryption
@@ -1941,7 +1986,9 @@ async def get_bulk_management(
         devices = []
         for row in rows:
             try:
-                serial_number, device_uuid, last_seen, management_data, collected_at, device_name, computer_name, usage, catalog, location, asset_tag, department = row
+                (serial_number, device_uuid, last_seen, management_data, collected_at,
+                 device_name, computer_name, usage, catalog, location, asset_tag,
+                 department, fleet) = row
                 
                 # Extract key management fields from the raw data for easy frontend access
                 # Support both Windows (camelCase) and Mac (snake_case) field names
@@ -2030,6 +2077,8 @@ async def get_bulk_management(
                     'catalog': catalog,
                     'location': location,
                     'department': department,
+                    'area': department,
+                    'fleet': fleet,
                     # Extract flattened MDM fields for table display (using actual field names from data)
                     'provider': provider,
                     'enrollmentStatus': enrollment_status,
@@ -2178,7 +2227,9 @@ async def get_bulk_system(
         devices = []
         for row in rows:
             try:
-                serial_number, device_uuid, last_seen, system_data, collected_at, device_name, computer_name, usage, catalog, location, asset_tag = row
+                (serial_number, device_uuid, last_seen, system_data, collected_at,
+                 device_name, computer_name, usage, catalog, location, asset_tag,
+                 department, fleet) = row
                 
                 # Extract system data (handle array format)
                 if isinstance(system_data, list) and len(system_data) > 0:
@@ -2306,6 +2357,9 @@ async def get_bulk_system(
                     'usage': usage,
                     'catalog': catalog,
                     'location': location,
+                    'department': department,
+                    'area': department,
+                    'fleet': fleet,
                     'operatingSystem': operating_system.strip() or None,
                     'osVersion': os_info.get('version'),
                     'buildNumber': os_info.get('build'),
