@@ -14,6 +14,8 @@ SELECT DISTINCT ON (d.serial_number)
     inv.data->>'catalog' as catalog,
     inv.data->>'location' as location,
     COALESCE(inv.data->>'asset_tag', inv.data->>'assetTag') as asset_tag,
+    inv.data->>'department' as department,
+    inv.data->>'fleet' as fleet,
     COALESCE(sys.data->'operating_system'->>'name', sys.data->'operatingSystem'->>'name') as os_name,
     COALESCE(sys.data->'operating_system'->>'version', sys.data->'operatingSystem'->>'version') as os_version,
     COALESCE(sys.data->'operating_system'->>'build_number', sys.data->'operatingSystem'->>'buildNumber') as build_number,

@@ -74,16 +74,21 @@ async def get_applications_filters(
         usages = set()
         catalogs = set()
         locations = set()
+        areas = set()
+        fleets = set()
         devices = []
-        
-        for serial, device_name, usage, catalog, location in device_rows:
+
+        for serial, device_name, usage, catalog, location, department, fleet in device_rows:
             devices.append({
                 'serialNumber': serial,
                 'name': device_name or serial,
                 'usage': usage or '',
                 'catalog': catalog or '',
                 'location': location or '',
-                'room': location or ''
+                'room': location or '',
+                'department': department or '',
+                'area': department or '',
+                'fleet': fleet or ''
             })
             if usage:
                 usages.add(usage)
@@ -91,9 +96,13 @@ async def get_applications_filters(
                 catalogs.add(catalog)
             if location:
                 locations.add(location)
-        
+            if department:
+                areas.add(department)
+            if fleet:
+                fleets.add(fleet)
+
         logger.info(f"Applications filters: {len(app_names)} unique apps, {len(publishers)} publishers, {len(devices)} devices")
-        
+
         _result = {
             'applicationNames': sorted(app_names),
             'windowsApplicationNames': sorted(windows_app_names),
@@ -104,7 +113,8 @@ async def get_applications_filters(
             'catalogs': sorted(catalogs),
             'locations': sorted(locations),
             'rooms': sorted(locations),
-            'fleets': [],
+            'areas': sorted(areas),
+            'fleets': sorted(fleets),
             'devices': devices,
             'devicesWithData': len(devices)
         }
@@ -125,6 +135,10 @@ async def get_fleet_applications_usage(
     usages: Optional[str] = Query(default=None, description="Comma-separated inventory usages"),
     catalogs: Optional[str] = Query(default=None, description="Comma-separated inventory catalogs"),
     locations: Optional[str] = Query(default=None, description="Comma-separated inventory locations"),
+    areas: Optional[str] = Query(default=None, description="Comma-separated inventory areas (department)"),
+    fleets: Optional[str] = Query(default=None, description="Comma-separated inventory fleets"),
+    rooms: Optional[str] = Query(default=None, description="Comma-separated inventory rooms"),
+    platforms: Optional[str] = Query(default=None, description="Comma-separated platforms (windows/macos)"),
     minHours: Optional[float] = Query(default=None, ge=0, description="Minimum total hours to include an app"),
     minLaunches: Optional[int] = Query(default=None, ge=0, description="Minimum launch count to include an app"),
     include_archived: bool = Query(default=False, alias="includeArchived"),
@@ -150,6 +164,10 @@ async def get_fleet_applications_usage(
         usage_list = [s.strip() for s in usages.split(',')] if usages else []
         catalog_list = [s.strip() for s in catalogs.split(',')] if catalogs else []
         location_list = [s.strip() for s in locations.split(',')] if locations else []
+        area_list = [s.strip() for s in areas.split(',')] if areas else []
+        fleet_list = [s.strip() for s in fleets.split(',')] if fleets else []
+        room_list = [s.strip() for s in rooms.split(',')] if rooms else []
+        platform_list = [s.strip().lower() for s in platforms.split(',')] if platforms else []
 
         cutoff_date = (datetime.now(timezone.utc) - timedelta(days=days)).date()
 
@@ -168,13 +186,15 @@ async def get_fleet_applications_usage(
             where.append("d.archived = FALSE")
 
         if app_name_list:
-            # Substring match (case-insensitive) so a normalized filter value like
-            # "Houdini" matches raw usage_history entries like "Houdini Launcher"
-            # or "Houdini FX 20.5.332.app". Matches the behavior of the bulk
-            # applications endpoint above.
-            patterns = [f"%{name}%" for name in app_name_list]
-            where.append("uh.app_name ILIKE ANY(%s)")
-            params.append(patterns)
+            # Exact (case-insensitive) match. The user picked specific apps from
+            # the report-builder chip cloud and expects the report to show
+            # *exactly* those apps — not also Maya plugins that happen to
+            # contain "motion", or "Final Cut Pro Creator Studio" rolled into
+            # "Final Cut Pro" via aliasing. Substring + alias rules conflate
+            # distinct inventory products; exact match keeps a 1:1 mapping
+            # between picker chips and report rows.
+            where.append("LOWER(uh.app_name) = ANY(%s)")
+            params.append([n.lower() for n in app_name_list])
 
         if usage_list:
             where.append("LOWER(inv.data->>'usage') = ANY(%s)")
@@ -187,6 +207,37 @@ async def get_fleet_applications_usage(
         if location_list:
             where.append("LOWER(inv.data->>'location') = ANY(%s)")
             params.append([s.lower() for s in location_list])
+
+        if area_list:
+            where.append("LOWER(inv.data->>'department') = ANY(%s)")
+            params.append([s.lower() for s in area_list])
+
+        if fleet_list:
+            where.append("LOWER(inv.data->>'fleet') = ANY(%s)")
+            params.append([s.lower() for s in fleet_list])
+
+        if room_list:
+            # Filter-options endpoint exposes "rooms" populated from
+            # inv.data->>'location', so match against the same field with
+            # 'room' as a fallback for clients that send both keys.
+            where.append("LOWER(COALESCE(inv.data->>'location', inv.data->>'room')) = ANY(%s)")
+            params.append([s.lower() for s in room_list])
+
+        if platform_list:
+            # Expand user-facing labels into the raw platform tokens we store
+            # (Darwin for macOS clients, "Windows" / "Windows NT" / "Microsoft Windows ..." for Windows).
+            def _expand_platform(p: str) -> list[str]:
+                p = p.strip().lower()
+                if p in ('mac', 'macos', 'darwin'):
+                    return ['%macos%', '%darwin%', '%os x%']
+                if p in ('win', 'windows'):
+                    return ['%windows%']
+                return [f'%{p}%']
+            patterns: list[str] = []
+            for p in platform_list:
+                patterns.extend(_expand_platform(p))
+            where.append("LOWER(COALESCE(d.platform, '')) ILIKE ANY(%s)")
+            params.append(patterns)
 
         where_clause = " AND ".join(where)
 
@@ -230,15 +281,36 @@ async def get_fleet_applications_usage(
             row[0]: list(row[1] or []) for row in cursor.fetchall()
         }
 
-        # Re-aggregate raw rows by canonical name. SQL groups by raw app_name
-        # (cheap, no JOIN against an alias table); Python folds variants like
-        # "Houdini Launcher" + "Houdini FX 21.0.440" + "hindie.exe" into one
-        # canonical "Houdini" row. minHours/minLaunches apply after rollup so
-        # they reflect the canonical totals, not pre-canonical fragments.
+        # Group rows into report buckets. Behavior depends on whether the
+        # caller asked for specific apps:
+        #
+        #  - Explicit list (chip-cloud pick): keep raw app names distinct so
+        #    each chip → exactly one row, no aliasing surprises like
+        #    "Final Cut Pro Creator Studio" being silently merged into
+        #    "Final Cut Pro" via the canonical alias map.
+        #  - No list (fleet-wide view): canonicalize and fold variants like
+        #    "Houdini Launcher" + "hindie.exe" into one "Houdini" row.
+        #
+        # minHours / minLaunches apply after rollup so they reflect bucket
+        # totals, not pre-rollup fragments — but only when there's no explicit
+        # pick list (an explicit pick should always show, even with zero data).
+        # For explicit picks: build a lookup from lowercase -> the caller's
+        # exact-cased pick. SQL matched case-insensitively, so different
+        # clients can report the same app with different casing ("Logic Pro"
+        # vs "logic pro") — fold them into one bucket keyed by the caller's
+        # canonical casing so the chip cloud and the report row stay 1:1.
+        picked_by_lower: Dict[str, str] = {}
+        if app_name_list:
+            for picked in app_name_list:
+                picked_by_lower.setdefault(picked.lower(), picked)
+
         canonical_apps: Dict[str, Dict[str, Any]] = {}
         for app_name, launch_count, total_secs, active_secs, foreground_secs, _device_count, first_used, last_used, devices in app_rows:
-            canonical = canonicalize_app_name(app_name) or app_name
-            entry = canonical_apps.setdefault(canonical, {
+            if app_name_list:
+                bucket_key = picked_by_lower.get((app_name or '').lower(), app_name)
+            else:
+                bucket_key = canonicalize_app_name(app_name) or app_name
+            entry = canonical_apps.setdefault(bucket_key, {
                 "totalSeconds": 0.0,
                 "activeSeconds": 0.0,
                 "foregroundSeconds": 0.0,
@@ -259,8 +331,28 @@ async def get_fleet_applications_usage(
                 entry["firstUsed"] = first_used
             if last_used and (not entry["lastUsed"] or last_used > entry["lastUsed"]):
                 entry["lastUsed"] = last_used
-            if app_name and app_name != canonical:
+            if app_name and app_name != bucket_key:
                 entry["aliasedFrom"].add(app_name)
+
+        # For explicit picks, ensure every chip the user selected appears in
+        # the report — even with zero data. Without this, an app with no
+        # usage_history rows in the lookback window is silently dropped, which
+        # is confusing when the chip is right there in the picker.
+        if app_name_list:
+            existing_lower = {k.lower() for k in canonical_apps.keys()}
+            for picked in app_name_list:
+                if picked.lower() not in existing_lower:
+                    canonical_apps[picked] = {
+                        "totalSeconds": 0.0,
+                        "activeSeconds": 0.0,
+                        "foregroundSeconds": 0.0,
+                        "launchCount": 0,
+                        "deviceSet": set(),
+                        "userSet": set(),
+                        "firstUsed": None,
+                        "lastUsed": None,
+                        "aliasedFrom": set(),
+                    }
 
         applications: List[Dict[str, Any]] = []
         total_seconds_sum = 0.0
@@ -268,6 +360,11 @@ async def get_fleet_applications_usage(
         single_user_apps: List[Dict[str, Any]] = []
         all_users: set = set()
         all_devices: set = set()
+        # Devices that survived the minHours / minLaunches cutoff. Used below
+        # to narrow devicesAggregate so the widget device count matches the
+        # per-app table count exactly (otherwise apps dropped here would still
+        # contribute their devices to the widget aggregate).
+        kept_device_set: set = set()
 
         for canonical_name, agg in canonical_apps.items():
             total_secs = agg["totalSeconds"]
@@ -285,11 +382,16 @@ async def get_fleet_applications_usage(
             # Null when total is 0 OR no client in the fleet has reported active_seconds yet.
             active_ratio = round(active_secs / total_secs, 3) if total_secs > 0 and active_secs > 0 else None
 
-            if minHours is not None and total_hours < minHours:
-                continue
-            if minLaunches is not None and launch_count < minLaunches:
-                continue
+            # minHours / minLaunches only apply in fleet-wide mode. When the
+            # caller picked specific apps, we always include them even with
+            # zero data so the report mirrors the chip-cloud selection.
+            if not app_name_list:
+                if minHours is not None and total_hours < minHours:
+                    continue
+                if minLaunches is not None and launch_count < minLaunches:
+                    continue
 
+            kept_device_set.update(devices)
             is_single_user = user_count == 1
             applications.append({
                 "name": canonical_name,
@@ -352,6 +454,66 @@ async def get_fleet_applications_usage(
                 "devicesUsed": int(devices_used or 0),
             })
 
+        # Per-device rollup across the selected app scope. Each device contributes
+        # one row carrying its inventory dimensions (location/catalog/usage/area/
+        # fleet) so the frontend can compute Hours-by-X widgets that match the
+        # single-app view. Each device's hours flow once into its dimension
+        # bucket regardless of how many of the selected apps it touched.
+        device_agg_query = f"""
+            SELECT
+                uh.device_id                                                    AS serial_number,
+                COALESCE(inv.data->>'device_name', inv.data->>'deviceName',
+                         inv.data->>'computer_name', inv.data->>'computerName',
+                         uh.device_id)                                          AS device_name,
+                inv.data->>'usage'                                              AS usage,
+                inv.data->>'catalog'                                            AS catalog,
+                inv.data->>'location'                                           AS location,
+                inv.data->>'department'                                         AS department,
+                inv.data->>'fleet'                                              AS fleet,
+                SUM(uh.total_seconds)::double precision                         AS total_seconds,
+                SUM(uh.launches)::bigint                                        AS launch_count
+            FROM usage_history uh
+            JOIN devices d ON d.serial_number = uh.device_id
+            LEFT JOIN inventory inv ON inv.device_id = d.id
+            WHERE {where_clause}
+            GROUP BY uh.device_id, inv.data
+            ORDER BY total_seconds DESC
+        """
+        cursor.execute(device_agg_query, tuple(params))
+        devices_aggregate: List[Dict[str, Any]] = []
+        for (d_serial, d_name, d_usage, d_catalog, d_location,
+             d_department, d_fleet, d_total_secs, d_launches) in cursor.fetchall():
+            d_total_secs = float(d_total_secs or 0)
+            devices_aggregate.append({
+                "serialNumber": d_serial,
+                "deviceName": d_name,
+                "usage": d_usage,
+                "catalog": d_catalog,
+                "location": d_location,
+                # Alias for callers that bucket by the global area/room dims
+                # — consistent with the bulk applications endpoint and frontend
+                # filter wiring that uses `area` interchangeably with
+                # `department` and `room` interchangeably with `location`.
+                "room": d_location,
+                "department": d_department,
+                "area": d_department,
+                "fleet": d_fleet,
+                "totalSeconds": d_total_secs,
+                "totalHours": round(d_total_secs / 3600, 2),
+                "launchCount": int(d_launches or 0),
+            })
+
+        # Narrow devicesAggregate to the devices behind the apps actually in
+        # the `applications` list — covers both explicit-pick mode and the
+        # fleet-wide case where minHours/minLaunches dropped some apps. The
+        # device count badge on the Widgets accordion now matches the row
+        # count behind the data table.
+        if app_name_list or minHours is not None or minLaunches is not None:
+            devices_aggregate = [
+                d for d in devices_aggregate
+                if d["serialNumber"] in kept_device_set
+            ]
+
         conn.close()
         conn = None
 
@@ -373,6 +535,7 @@ async def get_fleet_applications_usage(
             "topUsers": top_users,
             "singleUserApps": single_user_apps,
             "unusedApps": [],
+            "devicesAggregate": devices_aggregate,
             "summary": summary,
             "filters": {
                 "days": days,
@@ -438,14 +601,18 @@ async def get_application_usage_by_device(
         conn = get_db_connection()
         cursor = conn.cursor()
 
+        # Exact (case-insensitive) match on app name. Substring + alias was
+        # conflating distinct inventory products in the multi-app endpoint
+        # and the same risk applies here -- a drill-down on "Motion" should
+        # not silently include MotionBuilder per-device rows.
         where = [
             "uh.date >= %s",
-            "uh.app_name ILIKE %s",
+            "LOWER(uh.app_name) = %s",
             "d.serial_number IS NOT NULL",
             "d.serial_number NOT LIKE 'TEST-%%'",
             "d.serial_number != 'localhost'",
         ]
-        params: List[Any] = [cutoff_date, f"%{app}%"]
+        params: List[Any] = [cutoff_date, app.lower()]
 
         if not include_archived:
             where.append("d.archived = FALSE")
@@ -470,6 +637,8 @@ async def get_application_usage_by_device(
                 inv.data->>'usage'                                              AS usage,
                 inv.data->>'catalog'                                            AS catalog,
                 inv.data->>'location'                                           AS location,
+                inv.data->>'department'                                         AS department,
+                inv.data->>'fleet'                                              AS fleet,
                 COALESCE(inv.data->>'asset_tag', inv.data->>'assetTag')         AS asset_tag,
                 SUM(uh.launches)::bigint                                        AS launch_count,
                 SUM(uh.total_seconds)::double precision                         AS total_seconds,
@@ -511,7 +680,7 @@ async def get_application_usage_by_device(
         total_launches_sum = 0
         all_users: set = set()
 
-        for (serial, device_name, usage, catalog, location, asset_tag,
+        for (serial, device_name, usage, catalog, location, department, fleet, asset_tag,
              launch_count, total_secs, _variant_count, variants,
              first_used, last_used) in device_rows:
             total_secs = float(total_secs or 0)
@@ -531,6 +700,11 @@ async def get_application_usage_by_device(
                 "catalog": catalog,
                 "location": location,
                 "room": location,
+                "department": department,
+                # Mirror of department, matching the alias the other fleet
+                # endpoints use so consumers don't need endpoint-specific casing.
+                "area": department,
+                "fleet": fleet,
                 "assetTag": asset_tag,
                 "totalSeconds": total_secs,
                 "totalHours": round(total_secs / 3600, 2),
@@ -764,6 +938,13 @@ async def get_bulk_applications(
     installDateTo: Optional[str] = None,
     sizeMin: Optional[int] = None,
     sizeMax: Optional[int] = None,
+    usages: Optional[str] = Query(default=None, description="Comma-separated inventory usages"),
+    catalogs: Optional[str] = Query(default=None, description="Comma-separated inventory catalogs"),
+    areas: Optional[str] = Query(default=None, description="Comma-separated inventory areas (department)"),
+    fleets: Optional[str] = Query(default=None, description="Comma-separated inventory fleets"),
+    rooms: Optional[str] = Query(default=None, description="Comma-separated inventory rooms"),
+    locations: Optional[str] = Query(default=None, description="Comma-separated inventory locations"),
+    platforms: Optional[str] = Query(default=None, description="Comma-separated platforms (windows/macos)"),
     loadAll: bool = False,
     include_archived: bool = Query(default=False, alias="includeArchived"),
     limit: int = Query(default=500, ge=1, le=5000, description="Maximum items to return (default 500, max 5000)"),
@@ -796,27 +977,80 @@ async def get_bulk_applications(
         publisher_list = publishers.split(',') if publishers else []
         category_list = categories.split(',') if categories else []
         version_list = versions.split(',') if versions else []
-        
+        usage_list = [s.strip() for s in usages.split(',')] if usages else []
+        catalog_list = [s.strip() for s in catalogs.split(',')] if catalogs else []
+        area_list = [s.strip() for s in areas.split(',')] if areas else []
+        fleet_list = [s.strip() for s in fleets.split(',')] if fleets else []
+        room_list = [s.strip() for s in rooms.split(',')] if rooms else []
+        location_list = [s.strip() for s in locations.split(',')] if locations else []
+        platform_list = [s.strip().lower() for s in platforms.split(',')] if platforms else []
+
         # Build WHERE clause for device filtering (including archive filter)
         where_conditions = [
-            "d.serial_number IS NOT NULL", 
-            "d.serial_number NOT LIKE 'TEST-%'", 
+            "d.serial_number IS NOT NULL",
+            "d.serial_number NOT LIKE 'TEST-%'",
             "d.serial_number != 'localhost'"
         ]
-        
+
         # Add archive filter
         if not include_archived:
             where_conditions.append("d.archived = FALSE")
-        
-        query_params = []
-        param_index = 1
-        
+
+        query_params: List[Any] = []
+
         if device_name_list:
-            placeholders = ', '.join([f'${i}' for i in range(param_index, param_index + len(device_name_list) * 3)])
-            where_conditions.append(f"(COALESCE(inv.data->>'device_name', inv.data->>'deviceName') IN ({placeholders}) OR COALESCE(inv.data->>'computer_name', inv.data->>'computerName') IN ({placeholders}) OR d.serial_number IN ({placeholders}))")
+            # Use %s placeholders to match the rest of this query — the new
+            # inventory-dimension filters below also use %s, and mixing
+            # paramstyles in a single SQL string can fail binding in pg8000.
+            placeholders = ', '.join(['%s'] * len(device_name_list))
+            where_conditions.append(
+                f"(COALESCE(inv.data->>'device_name', inv.data->>'deviceName') IN ({placeholders}) "
+                f"OR COALESCE(inv.data->>'computer_name', inv.data->>'computerName') IN ({placeholders}) "
+                f"OR d.serial_number IN ({placeholders}))"
+            )
             query_params.extend(device_name_list * 3)
-            param_index += len(device_name_list) * 3
-        
+
+        if usage_list:
+            where_conditions.append("LOWER(inv.data->>'usage') = ANY(%s)")
+            query_params.append([s.lower() for s in usage_list])
+
+        if catalog_list:
+            where_conditions.append("LOWER(inv.data->>'catalog') = ANY(%s)")
+            query_params.append([s.lower() for s in catalog_list])
+
+        if area_list:
+            where_conditions.append("LOWER(inv.data->>'department') = ANY(%s)")
+            query_params.append([s.lower() for s in area_list])
+
+        if fleet_list:
+            where_conditions.append("LOWER(inv.data->>'fleet') = ANY(%s)")
+            query_params.append([s.lower() for s in fleet_list])
+
+        if room_list:
+            # Filter-options endpoint exposes "rooms" populated from
+            # inv.data->>'location' so match the same field with 'room' as a
+            # fallback for clients that send both keys.
+            where_conditions.append("LOWER(COALESCE(inv.data->>'location', inv.data->>'room')) = ANY(%s)")
+            query_params.append([s.lower() for s in room_list])
+
+        if location_list:
+            where_conditions.append("LOWER(inv.data->>'location') = ANY(%s)")
+            query_params.append([s.lower() for s in location_list])
+
+        if platform_list:
+            def _expand_platform2(p: str) -> list[str]:
+                p = p.strip().lower()
+                if p in ('mac', 'macos', 'darwin'):
+                    return ['%macos%', '%darwin%', '%os x%']
+                if p in ('win', 'windows'):
+                    return ['%windows%']
+                return [f'%{p}%']
+            patterns2: list[str] = []
+            for p in platform_list:
+                patterns2.extend(_expand_platform2(p))
+            where_conditions.append("LOWER(COALESCE(sys.data->'operatingSystem'->>'name', d.platform, '')) ILIKE ANY(%s)")
+            query_params.append(patterns2)
+
         where_clause = ' AND '.join(where_conditions)
         
         # Query to get all devices with applications data.
@@ -834,7 +1068,13 @@ async def get_bulk_applications(
             inv.data->>'catalog' as catalog,
             inv.data->>'location' as location,
             COALESCE(inv.data->>'asset_tag', inv.data->>'assetTag') as asset_tag,
-            COALESCE(sys.data->'operatingSystem'->>'name', d.platform) as platform
+            COALESCE(sys.data->'operatingSystem'->>'name', d.platform) as platform,
+            inv.data->>'department' as department,
+            inv.data->>'fleet' as fleet,
+            -- Filter-options endpoint exposes "rooms" populated from
+            -- inv.data->>'location'; mirror that here so client-side room
+            -- filtering on these rows matches the same set of devices.
+            COALESCE(inv.data->>'location', inv.data->>'room') as room
         FROM devices d
         LEFT JOIN applications a ON d.id = a.device_id
         LEFT JOIN inventory inv ON d.id = inv.device_id
@@ -860,7 +1100,7 @@ async def get_bulk_applications(
 
         for row in rows:
             try:
-                serial_number, device_uuid, last_seen, apps_data, collected_at, device_name, computer_name, usage, catalog, location, asset_tag, platform = row
+                serial_number, device_uuid, last_seen, apps_data, collected_at, device_name, computer_name, usage, catalog, location, asset_tag, platform, department, fleet, room = row
 
                 device_display_name = device_name or computer_name or serial_number
 
@@ -920,6 +1160,10 @@ async def get_bulk_applications(
                         'usage': usage,
                         'catalog': catalog,
                         'location': location,
+                        'room': room,
+                        'department': department,
+                        'area': department,
+                        'fleet': fleet,
                         'assetTag': asset_tag,
                         'platform': platform
                     })
@@ -998,8 +1242,9 @@ async def get_bulk_hardware(
         
         for row in rows:
             try:
-                serial_number, device_uuid, last_seen, hardware_data, collected_at, system_data, device_name, computer_name = row
-                
+                (serial_number, device_uuid, last_seen, hardware_data, collected_at, system_data,
+                 device_name, computer_name, usage, catalog, location, asset_tag, department, fleet) = row
+
                 device_display_name = device_name or computer_name or serial_number
                 
                 # Extract OS info from system data
@@ -1060,8 +1305,23 @@ async def get_bulk_hardware(
                     'osName': os_info.get('name'),
                     'osVersion': os_info.get('version') or os_info.get('displayVersion'),
                     'architecture': os_info.get('architecture'),
-                    'inventory': hw_details.get('inventory', {}),
-                    'assetTag': (hw_details.get('inventory') or {}).get('assetTag') or (hw_details.get('inventory') or {}).get('asset_tag'),
+                    'inventory': {
+                        **(hw_details.get('inventory') or {}),
+                        'usage': usage,
+                        'catalog': catalog,
+                        'location': location,
+                        'assetTag': asset_tag or (hw_details.get('inventory') or {}).get('assetTag') or (hw_details.get('inventory') or {}).get('asset_tag'),
+                        'department': department,
+                        'area': department,
+                        'fleet': fleet,
+                    },
+                    'assetTag': asset_tag or (hw_details.get('inventory') or {}).get('assetTag') or (hw_details.get('inventory') or {}).get('asset_tag'),
+                    'usage': usage,
+                    'catalog': catalog,
+                    'location': location,
+                    'department': department,
+                    'area': department,
+                    'fleet': fleet,
                 })
             
             except Exception as e:
@@ -1113,21 +1373,24 @@ async def get_installs_filters(
         usages = set()
         catalogs = set()
         rooms = set()
+        areas = set()
         fleets = set()
         platforms = set()
         software_repos = set()
         manifests = set()
         devices = []
-        
+
         for row in rows:
-            serial, device_name, usage, catalog, location, asset_tag, fleet, platform, installs_data, last_seen = row
-            
+            serial, device_name, usage, catalog, location, asset_tag, department, fleet, platform, installs_data, last_seen = row
+
             if usage:
                 usages.add(usage)
             if catalog:
                 catalogs.add(catalog)
             if location:
                 rooms.add(location)
+            if department:
+                areas.add(department)
             if fleet:
                 fleets.add(fleet)
             if platform:
@@ -1288,11 +1551,13 @@ async def get_installs_filters(
                         'catalog': catalog,
                         'location': location,
                         'assetTag': asset_tag,
+                        'department': department,
+                        'area': department,
                         'fleet': fleet,
                     }
                 }
             })
-        
+
         logger.info(f"Installs filters: {len(managed_installs)} unique installs, {len(devices)} devices")
         
         _result = {
@@ -1304,6 +1569,7 @@ async def get_installs_filters(
             'usages': sorted(usages),
             'catalogs': sorted(catalogs),
             'rooms': sorted(rooms),
+            'areas': sorted(areas),
             'fleets': sorted(fleets),
             'platforms': sorted(platforms),
             'softwareRepos': sorted(software_repos),
@@ -1612,8 +1878,11 @@ async def get_bulk_network(
         
         for row in rows:
             try:
-                serial_number, device_uuid, last_seen, network_data, collected_at, device_name, computer_name, usage, catalog, location, asset_tag, os_name, os_version, build_number, uptime, boot_time = row
-                
+                (serial_number, device_uuid, last_seen, network_data, collected_at,
+                 device_name, computer_name, usage, catalog, location, asset_tag,
+                 department, fleet,
+                 os_name, os_version, build_number, uptime, boot_time) = row
+
                 device_obj = {
                     'id': serial_number,
                     'deviceId': serial_number,
@@ -1622,6 +1891,12 @@ async def get_bulk_network(
                     'assetTag': asset_tag,
                     'lastSeen': last_seen.isoformat() if last_seen else None,
                     'collectedAt': collected_at.isoformat() if collected_at else None,
+                    'usage': usage,
+                    'catalog': catalog,
+                    'location': location,
+                    'department': department,
+                    'area': department,
+                    'fleet': fleet,
                     'operatingSystem': os_name,
                     'osVersion': os_version,
                     'buildNumber': build_number,
@@ -1689,6 +1964,7 @@ async def get_bulk_security(
             try:
                 (serial_number, device_uuid, last_seen, platform, collected_at,
                  device_name, computer_name, usage, catalog, location, asset_tag,
+                 department, fleet,
                  firewall_enabled, encryption_enabled,
                  antivirus_name, antivirus_enabled, antivirus_up_to_date, antivirus_version, antivirus_last_scan,
                  detection_count,
@@ -1711,6 +1987,9 @@ async def get_bulk_security(
                     'usage': usage,
                     'catalog': catalog,
                     'location': location,
+                    'department': department,
+                    'area': department,
+                    'fleet': fleet,
                     # Firewall
                     'firewallEnabled': bool(firewall_enabled),
                     # Encryption
@@ -1893,7 +2172,9 @@ async def get_bulk_management(
         devices = []
         for row in rows:
             try:
-                serial_number, device_uuid, last_seen, management_data, collected_at, device_name, computer_name, usage, catalog, location, asset_tag, department = row
+                (serial_number, device_uuid, last_seen, management_data, collected_at,
+                 device_name, computer_name, usage, catalog, location, asset_tag,
+                 department, fleet) = row
                 
                 # Extract key management fields from the raw data for easy frontend access
                 # Support both Windows (camelCase) and Mac (snake_case) field names
@@ -1982,6 +2263,8 @@ async def get_bulk_management(
                     'catalog': catalog,
                     'location': location,
                     'department': department,
+                    'area': department,
+                    'fleet': fleet,
                     # Extract flattened MDM fields for table display (using actual field names from data)
                     'provider': provider,
                     'enrollmentStatus': enrollment_status,
@@ -2130,7 +2413,9 @@ async def get_bulk_system(
         devices = []
         for row in rows:
             try:
-                serial_number, device_uuid, last_seen, system_data, collected_at, device_name, computer_name, usage, catalog, location, asset_tag = row
+                (serial_number, device_uuid, last_seen, system_data, collected_at,
+                 device_name, computer_name, usage, catalog, location, asset_tag,
+                 department, fleet) = row
                 
                 # Extract system data (handle array format)
                 if isinstance(system_data, list) and len(system_data) > 0:
@@ -2258,6 +2543,9 @@ async def get_bulk_system(
                     'usage': usage,
                     'catalog': catalog,
                     'location': location,
+                    'department': department,
+                    'area': department,
+                    'fleet': fleet,
                     'operatingSystem': operating_system.strip() or None,
                     'osVersion': os_info.get('version'),
                     'buildNumber': os_info.get('build'),
@@ -2349,7 +2637,9 @@ async def get_bulk_peripherals(
         devices = []
         for row in rows:
             try:
-                serial_number, device_uuid, last_seen, peripherals_data, collected_at, device_name, computer_name, usage, catalog, location, asset_tag, platform = row
+                (serial_number, device_uuid, last_seen, peripherals_data, collected_at,
+                 device_name, computer_name, usage, catalog, location, asset_tag,
+                 department, fleet, platform) = row
                 
                 # Clients emit peripherals data in two shapes:
                 #   Windows: nested -- {"usb": {"usb_devices": [...]}, "bluetooth": {"bluetooth_devices": [...]}, ...}
@@ -2379,6 +2669,9 @@ async def get_bulk_peripherals(
                     'usage': usage,
                     'catalog': catalog,
                     'location': location,
+                    'department': department,
+                    'area': department,
+                    'fleet': fleet,
                     'platform': platform,
                     'usbDevices': _pick(('usbDevices',), ('usb', 'usb_devices')),
                     'bluetoothDevices': _pick(('bluetoothDevices',), ('bluetooth', 'bluetooth_devices')),
@@ -2450,7 +2743,9 @@ async def get_bulk_identity(
         devices = []
         for row in rows:
             try:
-                serial_number, device_uuid, last_seen, platform, identity_data, collected_at, device_name, computer_name, usage, catalog, location, asset_tag, department = row
+                (serial_number, device_uuid, last_seen, platform, identity_data, collected_at,
+                 device_name, computer_name, usage, catalog, location, asset_tag,
+                 department, fleet) = row
                 
                 # Extract only the summary fields needed by the fleet page
                 # Do NOT return the full raw identity blob (~50KB per device)
@@ -2521,6 +2816,8 @@ async def get_bulk_identity(
                     'catalog': catalog,
                     'location': location,
                     'department': department,
+                    'area': department,
+                    'fleet': fleet,
                     'summary': summary,
                     'users': users_preview,
                     'loggedInUsernames': logged_in_usernames,

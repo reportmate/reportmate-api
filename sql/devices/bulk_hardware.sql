@@ -10,7 +10,13 @@ SELECT DISTINCT ON (d.serial_number)
     h.collected_at,
     s.data as system_data,
     COALESCE(inv.data->>'device_name', inv.data->>'deviceName') as device_name,
-    COALESCE(inv.data->>'computer_name', inv.data->>'computerName') as computer_name
+    COALESCE(inv.data->>'computer_name', inv.data->>'computerName') as computer_name,
+    inv.data->>'usage' as usage,
+    inv.data->>'catalog' as catalog,
+    inv.data->>'location' as location,
+    COALESCE(inv.data->>'asset_tag', inv.data->>'assetTag') as asset_tag,
+    inv.data->>'department' as department,
+    inv.data->>'fleet' as fleet
 FROM devices d
 LEFT JOIN hardware h ON d.id = h.device_id
 LEFT JOIN system s ON d.id = s.device_id
