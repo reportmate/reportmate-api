@@ -1980,6 +1980,20 @@ async def get_bulk_management(
                         else:
                             provider = cert_issuer  # Use issuer as provider
                 if not provider:
+                    # A device whose management module carries Intune-specific
+                    # data is Intune-managed even when mdm_enrollment omits an
+                    # explicit provider field. The Windows client collects these
+                    # structures only under Intune, so their presence is a
+                    # reliable signal.
+                    intune_keys = ('intunePolicies', 'recentIntuneLogs',
+                                   'mdmConfigurations', 'mdmDiagnostics')
+                    has_intune_data = bool(management_data) and any(
+                        management_data.get(k) for k in intune_keys)
+                    enrollment_type_raw = (mdm_enrollment.get('enrollmentType')
+                                           or mdm_enrollment.get('enrollment_type') or '')
+                    if has_intune_data or 'entra' in enrollment_type_raw.lower():
+                        provider = 'Microsoft Intune'
+                if not provider:
                     # Device reports an MDM enrollment but no provider could be
                     # identified from any source - surface it as Unmanaged.
                     provider = 'Unmanaged'
