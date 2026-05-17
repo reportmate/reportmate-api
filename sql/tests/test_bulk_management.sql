@@ -15,7 +15,9 @@ SELECT DISTINCT ON (d.serial_number)
     inv.data->>'catalog' as catalog,
     inv.data->>'location' as location,
     inv.data->>'assetTag' as asset_tag,
-    inv.data->>'department' as department
+    inv.data->>'department' as department,
+    d.platform as device_platform,
+    d.os_name as os_name
 FROM devices d
 LEFT JOIN management m ON d.id = m.device_id
 LEFT JOIN inventory inv ON d.id = inv.device_id
