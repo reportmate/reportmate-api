@@ -1955,7 +1955,7 @@ async def get_bulk_management(
                 # Provider detection - the active MDM server/check-in URL is
                 # authoritative; the MDM identity certificate is only a fallback
                 # because it goes stale after a device migrates between MDMs.
-                # Priority: explicit provider > enrollment URL > certificate > "Unknown"
+                # Priority: explicit provider > enrollment URL > certificate > "Unmanaged"
                 provider = mdm_enrollment.get('provider')
                 if not provider:
                     server_url = mdm_enrollment.get('server_url') or mdm_enrollment.get('serverUrl') or ''
@@ -1980,7 +1980,9 @@ async def get_bulk_management(
                         else:
                             provider = cert_issuer  # Use issuer as provider
                 if not provider:
-                    provider = 'Unknown'
+                    # Device reports an MDM enrollment but no provider could be
+                    # identified from any source - surface it as Unmanaged.
+                    provider = 'Unmanaged'
                 
                 # Enrollment type - support Mac and Windows patterns
                 enrollment_type = mdm_enrollment.get('enrollmentType') or mdm_enrollment.get('enrollment_type')
