@@ -2130,6 +2130,36 @@ async def search_fleet_certificates(
         logger.error(f"Failed to search fleet certificates: {e}")
         raise HTTPException(status_code=500, detail=f"Failed to search certificates: {str(e)}")
 
+def _detect_mdm_provider_from_url(url: str) -> str:
+    """Detect the MDM provider from the active enrollment server/check-in URL.
+
+    The enrollment URL reflects the MDM the device currently talks to. The MDM
+    identity certificate is unreliable for this because it lingers in the
+    System keychain after a device migrates between MDMs. Returns "" when the
+    URL matches no known provider.
+    """
+    u = (url or '').lower()
+    if not u.strip():
+        return ''
+    if 'manage.microsoft.com' in u or 'intune' in u:
+        return 'Microsoft Intune'
+    if 'jamfcloud' in u or 'jamf' in u:
+        return 'Jamf Pro'
+    if 'mosyle' in u:
+        return 'Mosyle'
+    if 'kandji' in u:
+        return 'Kandji'
+    if 'addigy' in u:
+        return 'Addigy'
+    if 'simplemdm' in u:
+        return 'SimpleMDM'
+    if 'micromdm' in u:
+        return 'MicroMDM'
+    if 'nanomdm' in u:
+        return 'NanoMDM'
+    return ''
+
+
 @router.get("/devices/management", dependencies=[Depends(verify_authentication)], tags=["fleet"])
 async def get_bulk_management(
     include_archived: bool = Query(default=False, alias="includeArchived", description="Include archived devices in results"),
@@ -2174,7 +2204,7 @@ async def get_bulk_management(
             try:
                 (serial_number, device_uuid, last_seen, management_data, collected_at,
                  device_name, computer_name, usage, catalog, location, asset_tag,
-                 department, fleet) = row
+                 department, fleet, db_platform, db_os_name) = row
                 
                 # Extract key management fields from the raw data for easy frontend access
                 # Support both Windows (camelCase) and Mac (snake_case) field names
@@ -2203,11 +2233,17 @@ async def get_bulk_management(
                 is_enrolled = is_enrolled_raw in (True, 'true', '1', 'yes', 'True')
                 enrollment_status = 'Enrolled' if is_enrolled else 'Not Enrolled'
                 
-                # Provider detection - support multiple sources
-                # Priority: explicit provider field > certificate issuer > "Unknown"
+                # Provider detection - the active MDM server/check-in URL is
+                # authoritative; the MDM identity certificate is only a fallback
+                # because it goes stale after a device migrates between MDMs.
+                # Priority: explicit provider > enrollment URL > certificate > "Unmanaged"
                 provider = mdm_enrollment.get('provider')
                 if not provider:
-                    # Try to get from certificate data (Mac)
+                    server_url = mdm_enrollment.get('server_url') or mdm_enrollment.get('serverUrl') or ''
+                    checkin_url = mdm_enrollment.get('checkin_url') or mdm_enrollment.get('checkinUrl') or ''
+                    provider = _detect_mdm_provider_from_url(f"{server_url} {checkin_url}")
+                if not provider:
+                    # Fall back to certificate data (Mac) - may be stale after migration
                     cert_issuer = mdm_certificate.get('certificate_issuer') or mdm_certificate.get('certificateIssuer')
                     cert_provider = mdm_certificate.get('mdm_provider') or mdm_certificate.get('mdmProvider')
                     if cert_provider:
@@ -2225,7 +2261,23 @@ async def get_bulk_management(
                         else:
                             provider = cert_issuer  # Use issuer as provider
                 if not provider:
-                    provider = 'Unknown'
+                    # A device whose management module carries Intune-specific
+                    # data is Intune-managed even when mdm_enrollment omits an
+                    # explicit provider field. The Windows client collects these
+                    # structures only under Intune, so their presence is a
+                    # reliable signal.
+                    intune_keys = ('intunePolicies', 'recentIntuneLogs',
+                                   'mdmConfigurations', 'mdmDiagnostics')
+                    has_intune_data = bool(management_data) and any(
+                        management_data.get(k) for k in intune_keys)
+                    enrollment_type_raw = (mdm_enrollment.get('enrollmentType')
+                                           or mdm_enrollment.get('enrollment_type') or '')
+                    if has_intune_data or 'entra' in enrollment_type_raw.lower():
+                        provider = 'Microsoft Intune'
+                if not provider:
+                    # Device reports an MDM enrollment but no provider could be
+                    # identified from any source - surface it as Unmanaged.
+                    provider = 'Unmanaged'
                 
                 # Enrollment type - support Mac and Windows patterns
                 enrollment_type = mdm_enrollment.get('enrollmentType') or mdm_enrollment.get('enrollment_type')
@@ -2242,14 +2294,21 @@ async def get_bulk_management(
                 if not enrollment_type:
                     enrollment_type = 'N/A'
                 
-                # Determine platform from provider
-                provider_lower = (provider or '').lower()
-                if provider in ('MicroMDM', 'NanoMDM', 'Apple', 'Mosyle', 'Kandji') or 'jamf' in provider_lower:
-                    device_platform = 'macOS'
-                elif provider == 'Microsoft Intune':
-                    device_platform = 'Windows'
-                else:
-                    device_platform = None
+                # Platform comes from the devices table (the real OS), not the
+                # MDM provider: Intune manages both Macs and Windows, so the
+                # provider cannot distinguish them.
+                device_platform = None
+                if db_platform:
+                    pl = str(db_platform).strip().lower()
+                    if pl in ('macos', 'mac', 'darwin', 'macintosh'):
+                        device_platform = 'macOS'
+                    elif pl.startswith('win'):
+                        device_platform = 'Windows'
+                if not device_platform:
+                    # Fall back to provider only for unambiguously macOS-only MDMs
+                    provider_lower = (provider or '').lower()
+                    if provider in ('MicroMDM', 'NanoMDM', 'Apple', 'Mosyle', 'Kandji') or 'jamf' in provider_lower:
+                        device_platform = 'macOS'
                 
                 devices.append({
                     'id': serial_number,
@@ -2275,12 +2334,12 @@ async def get_bulk_management(
                     'isEnrolled': is_enrolled,
                     # Pre-extracted fields (replaces raw blob)
                     'autopilotConfig': management_data.get('autopilot_config') or management_data.get('autopilotConfig') if management_data else None,
-                    'osName': None  # populated below from system data if available
+                    'osName': db_os_name  # real OS name from the devices table
                 })
-                
-                # Try to populate osName from system data via a separate query if needed
-                # For now, set from management_data if system info is embedded
-                if management_data:
+
+                # Fall back to embedded system data only when the devices table
+                # has no os_name recorded.
+                if not devices[-1]['osName'] and management_data:
                     sys_data = management_data.get('system', {})
                     if sys_data:
                         os_obj = sys_data.get('operatingSystem', {}) or sys_data.get('operating_system', {})
