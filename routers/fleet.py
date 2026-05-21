@@ -2885,9 +2885,24 @@ async def get_bulk_identity(
                         'sizeMB': btmdb.get('sizeMB') or btmdb.get('size_mb'),
                     } if btmdb else None,
                     'secureTokenUsers': {
-                        'tokenGrantedCount': len(secure_token.get('users', [])) if isinstance(secure_token, dict) and secure_token.get('users') else 0,
-                        'tokenMissingCount': secure_token.get('tokenMissingCount', 0) if isinstance(secure_token, dict) else 0,
-                    } if secure_token else None,
+                        'tokenGrantedCount': (
+                            secure_token.get('tokenGrantedCount')
+                            if isinstance(secure_token.get('tokenGrantedCount'), int)
+                            else len(secure_token.get('usersWithToken') or secure_token.get('users_with_token') or [])
+                        ),
+                        'tokenMissingCount': (
+                            secure_token.get('tokenMissingCount')
+                            if isinstance(secure_token.get('tokenMissingCount'), int)
+                            else len(secure_token.get('usersWithoutToken') or secure_token.get('users_without_token') or [])
+                        ),
+                        'totalUsersChecked': (
+                            secure_token.get('totalUsersChecked')
+                            if isinstance(secure_token.get('totalUsersChecked'), int)
+                            else len(secure_token.get('usersWithToken') or []) + len(secure_token.get('usersWithoutToken') or [])
+                        ),
+                        'usersWithToken': secure_token.get('usersWithToken') or secure_token.get('users_with_token') or [],
+                        'usersWithoutToken': secure_token.get('usersWithoutToken') or secure_token.get('users_without_token') or [],
+                    } if isinstance(secure_token, dict) and secure_token else None,
                     'platformSSOUsers': {
                         'deviceRegistered': platform_sso.get('deviceRegistered') or platform_sso.get('device_registered') or False,
                         'registeredUserCount': platform_sso.get('registeredUserCount', 0),
