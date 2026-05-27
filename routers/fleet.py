@@ -925,6 +925,226 @@ async def get_applications_collection_health(
         raise HTTPException(status_code=500, detail=f"Failed to retrieve collection health: {str(e)}")
 
 
+@router.get("/devices/applications/distribution", dependencies=[Depends(verify_authentication)], tags=["fleet"])
+async def get_applications_distribution(
+    request: Request,
+    applicationNames: str = Query(..., description="Comma-separated app names to aggregate (required)"),
+    usages: Optional[str] = Query(default=None, description="Comma-separated inventory usages"),
+    catalogs: Optional[str] = Query(default=None, description="Comma-separated inventory catalogs"),
+    areas: Optional[str] = Query(default=None, description="Comma-separated inventory areas (department)"),
+    fleets: Optional[str] = Query(default=None, description="Comma-separated inventory fleets"),
+    rooms: Optional[str] = Query(default=None, description="Comma-separated inventory rooms"),
+    locations: Optional[str] = Query(default=None, description="Comma-separated inventory locations"),
+    platforms: Optional[str] = Query(default=None, description="Comma-separated platforms (windows/macos)"),
+    include_archived: bool = Query(default=False, alias="includeArchived"),
+):
+    """
+    Server-side version distribution for selected applications.
+
+    Aggregates installed-app counts per (app bucket, version) directly in SQL
+    so the response size is bounded by `distinct versions`, not fleet size.
+    Each requested app name acts as a case-insensitive substring bucket,
+    mirroring the matching used by the bulk applications endpoint, so chips
+    selected in the filter UI map 1:1 to chart cards.
+
+    A device is counted at most once per (bucket, version) — duplicate app
+    entries on a single device (32/64-bit, MSI + Squirrel installers) collapse
+    into one tally so the chart matches "devices with vX" rather than
+    "installer rows for vX".
+
+    Returns:
+        {
+          "<requested app name>": {
+            "totalDevices": <int>,            # devices with at least one matching install
+            "versions": { "<version>": <int>, ... }
+          },
+          ...
+        }
+    """
+    conn = None
+    try:
+        _ckey = (str(dict(sorted(request.query_params.items()))),)
+        _cached = cache_get("applications_distribution", _ckey)
+        if _cached is not None:
+            return _cached
+        _t0 = _time.monotonic()
+
+        # Dedupe app names case-insensitively while preserving first-seen casing
+        # for the response keys. Two buckets that differ only in case would
+        # otherwise produce two SQL rows but overwrite each other in the
+        # response dict, silently dropping one bucket's counts.
+        raw_names = [s.strip() for s in applicationNames.split(',') if s.strip()]
+        if not raw_names:
+            raise HTTPException(status_code=400, detail="applicationNames must contain at least one non-empty value")
+        app_name_list: List[str] = []
+        _seen_lower: set = set()
+        for name in raw_names:
+            key = name.lower()
+            if key in _seen_lower:
+                continue
+            _seen_lower.add(key)
+            app_name_list.append(name)
+
+        usage_list = [s.strip() for s in usages.split(',')] if usages else []
+        catalog_list = [s.strip() for s in catalogs.split(',')] if catalogs else []
+        area_list = [s.strip() for s in areas.split(',')] if areas else []
+        fleet_list = [s.strip() for s in fleets.split(',')] if fleets else []
+        room_list = [s.strip() for s in rooms.split(',')] if rooms else []
+        location_list = [s.strip() for s in locations.split(',')] if locations else []
+        platform_list = [s.strip().lower() for s in platforms.split(',')] if platforms else []
+
+        logger.info(f"Fetching applications distribution (apps={len(app_name_list)}, filters={dict(request.query_params)})")
+
+        where_conditions = [
+            "d.serial_number IS NOT NULL",
+            "d.serial_number NOT LIKE 'TEST-%'",
+            "d.serial_number != 'localhost'",
+            "a.data IS NOT NULL",
+        ]
+        if not include_archived:
+            where_conditions.append("d.archived = FALSE")
+
+        query_params: List[Any] = []
+
+        if usage_list:
+            where_conditions.append("LOWER(inv.data->>'usage') = ANY(%s)")
+            query_params.append([s.lower() for s in usage_list])
+        if catalog_list:
+            where_conditions.append("LOWER(inv.data->>'catalog') = ANY(%s)")
+            query_params.append([s.lower() for s in catalog_list])
+        if area_list:
+            where_conditions.append("LOWER(inv.data->>'department') = ANY(%s)")
+            query_params.append([s.lower() for s in area_list])
+        if fleet_list:
+            where_conditions.append("LOWER(inv.data->>'fleet') = ANY(%s)")
+            query_params.append([s.lower() for s in fleet_list])
+        if room_list:
+            where_conditions.append("LOWER(COALESCE(inv.data->>'location', inv.data->>'room')) = ANY(%s)")
+            query_params.append([s.lower() for s in room_list])
+        if location_list:
+            where_conditions.append("LOWER(inv.data->>'location') = ANY(%s)")
+            query_params.append([s.lower() for s in location_list])
+
+        if platform_list:
+            def _expand_platform(p: str) -> list[str]:
+                p = p.strip().lower()
+                if p in ('mac', 'macos', 'darwin'):
+                    return ['%macos%', '%darwin%', '%os x%']
+                if p in ('win', 'windows'):
+                    return ['%windows%']
+                return [f'%{p}%']
+            patterns: list[str] = []
+            for p in platform_list:
+                patterns.extend(_expand_platform(p))
+            where_conditions.append("LOWER(COALESCE(sys.data->'operatingSystem'->>'name', d.platform, '')) ILIKE ANY(%s)")
+            query_params.append(patterns)
+
+        # One bucket per requested app name; each device's apps are matched
+        # against every bucket so a device with both Chrome and Edge counts
+        # once in each. Lowercased for case-insensitive LIKE matching.
+        bucket_patterns = [name.lower() for name in app_name_list]
+        bucket_originals = list(app_name_list)  # preserve user-provided casing for response keys
+
+        where_clause = ' AND '.join(where_conditions)
+
+        # DISTINCT collapses duplicate installer rows so a device with two
+        # Chrome entries at the same version contributes 1, not 2.
+        #
+        # strpos() rather than LIKE: LIKE would treat `%` / `_` in user-supplied
+        # bucket patterns as wildcards, diverging from the bulk endpoint's
+        # Python `in`-style substring check and turning `applicationNames=%`
+        # into a fleet-wide match. strpos() always compares literals.
+        #
+        # NULLIF(BTRIM(...), '') normalizes empty/whitespace version strings
+        # to NULL so they collapse into the 'Unknown' bucket here rather than
+        # producing a separate '' group that would silently overwrite the
+        # 'Unknown' count in the Python aggregation below.
+        query = f"""
+        WITH device_base AS (
+            SELECT DISTINCT ON (d.serial_number)
+                d.id AS device_pk,
+                CASE
+                    WHEN a.data ? 'installedApplications' THEN a.data->'installedApplications'
+                    WHEN a.data ? 'InstalledApplications' THEN a.data->'InstalledApplications'
+                    WHEN a.data ? 'installed_applications' THEN a.data->'installed_applications'
+                    WHEN jsonb_typeof(a.data) = 'array' THEN a.data
+                    ELSE '[]'::jsonb
+                END AS apps_array
+            FROM devices d
+            JOIN applications a ON d.id = a.device_id
+            LEFT JOIN inventory inv ON d.id = inv.device_id
+            LEFT JOIN system sys ON d.id = sys.device_id
+            WHERE {where_clause}
+            ORDER BY d.serial_number, a.updated_at DESC
+        ),
+        matched AS (
+            SELECT DISTINCT
+                db.device_pk,
+                bucket.idx AS bucket_idx,
+                COALESCE(
+                    NULLIF(BTRIM(elem->>'version'), ''),
+                    NULLIF(BTRIM(elem->>'bundle_version'), ''),
+                    'Unknown'
+                ) AS version
+            FROM device_base db
+            CROSS JOIN LATERAL jsonb_array_elements(db.apps_array) AS elem
+            CROSS JOIN LATERAL unnest(%s::text[]) WITH ORDINALITY AS bucket(pattern, idx)
+            WHERE strpos(LOWER(COALESCE(elem->>'name', elem->>'displayName', '')), bucket.pattern) > 0
+        ),
+        version_counts AS (
+            SELECT bucket_idx, version, COUNT(*) AS device_count
+            FROM matched
+            GROUP BY bucket_idx, version
+        ),
+        bucket_totals AS (
+            SELECT bucket_idx, COUNT(DISTINCT device_pk) AS device_count
+            FROM matched
+            GROUP BY bucket_idx
+        )
+        SELECT 'v' AS kind, bucket_idx, version, device_count FROM version_counts
+        UNION ALL
+        SELECT 't' AS kind, bucket_idx, NULL AS version, device_count FROM bucket_totals
+        """
+        query_params.append(bucket_patterns)
+
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute(query, tuple(query_params))
+        rows = cursor.fetchall()
+        conn.close()
+        conn = None
+
+        result: Dict[str, Dict[str, Any]] = {}
+        for name in bucket_originals:
+            result[name] = {"totalDevices": 0, "versions": {}}
+
+        for kind, bucket_idx, version, device_count in rows:
+            # bucket_idx is 1-based from WITH ORDINALITY
+            key = bucket_originals[bucket_idx - 1]
+            if kind == 'v':
+                result[key]["versions"][version or "Unknown"] = int(device_count)
+            else:
+                result[key]["totalDevices"] = int(device_count)
+
+        cache_set("applications_distribution", result, _ckey)
+        logger.info(
+            f"[PERF] /api/devices/applications/distribution: {_time.monotonic()-_t0:.3f}s "
+            f"({sum(b['totalDevices'] for b in result.values())} device matches across {len(result)} buckets)"
+        )
+        return result
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
+        logger.error(f"Failed to get applications distribution: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to retrieve applications distribution: {str(e)}")
+
+
 @router.get("/devices/applications", dependencies=[Depends(verify_authentication)], tags=["fleet"])
 async def get_bulk_applications(
     request: Request,

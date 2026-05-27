@@ -51,6 +51,7 @@ _CACHE_TTL: dict = {
     "devices": 30,
     "stats_installs": 30,
     "applications": 30,
+    "applications_distribution": 60,
     "applications_filters": 60,
     "applications_usage": 60,
     "applications_usage_by_device": 60,
