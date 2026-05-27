@@ -17,10 +17,14 @@ SELECT DISTINCT ON (d.serial_number)
     inv.data->>'location' as location,
     COALESCE(inv.data->>'asset_tag', inv.data->>'assetTag') as asset_tag,
     inv.data->>'department' as department,
-    inv.data->>'fleet' as fleet
+    inv.data->>'fleet' as fleet,
+    -- macOS Bootstrap Token lives in the security module, not identity.
+    -- Surface it here so /devices/identity can render it alongside SecureToken.
+    sec.data->'bootstrapToken' as bootstrap_token
 FROM devices d
 LEFT JOIN identity ident ON d.serial_number = ident.device_id
 LEFT JOIN inventory inv ON d.serial_number = inv.device_id
+LEFT JOIN security sec ON d.serial_number = sec.device_id
 WHERE d.serial_number IS NOT NULL
     AND d.serial_number NOT LIKE 'TEST-%%'
     AND d.serial_number != 'localhost'
