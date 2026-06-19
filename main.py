@@ -62,16 +62,30 @@ API requests are subject to rate limiting. Contact support for increased limits.
     },
     openapi_tags=[
         {"name": "health", "description": "Health checks and status endpoints"},
-        {"name": "devices", "description": "Device management operations - list, get, archive, delete devices"},
-        {"name": "fleet", "description": "Fleet-wide bulk data endpoints for analytics dashboards"},
-        {"name": "events", "description": "Event logging, retrieval, and real-time notifications"},
-        {"name": "statistics", "description": "Fleet analytics, usage statistics, and reporting"},
+        {
+            "name": "devices",
+            "description": "Device management operations - list, get, archive, delete devices",
+        },
+        {
+            "name": "fleet",
+            "description": "Fleet-wide bulk data endpoints for analytics dashboards",
+        },
+        {
+            "name": "events",
+            "description": "Event logging, retrieval, and real-time notifications",
+        },
+        {
+            "name": "statistics",
+            "description": "Fleet analytics, usage statistics, and reporting",
+        },
         {"name": "admin", "description": "Administrative operations and diagnostics"},
     ],
 )
 
 # ── Middleware ──────────────────────────────────────────────────
-CORS_ORIGINS = os.getenv("CORS_ORIGINS", "").split(",") if os.getenv("CORS_ORIGINS") else []
+CORS_ORIGINS = (
+    os.getenv("CORS_ORIGINS", "").split(",") if os.getenv("CORS_ORIGINS") else []
+)
 CORS_ORIGINS = [o.strip() for o in CORS_ORIGINS if o.strip()]
 
 app.add_middleware(
@@ -119,6 +133,7 @@ async def root():
         },
     }
 
+
 # ── Startup: ensure performance indexes ────────────────────────
 _indexes_ensured = False
 
@@ -155,6 +170,11 @@ async def ensure_performance_indexes():
                 updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
                 UNIQUE(device_id, date, app_name)
             )""",
+            # usage_history active/foreground split (migration 010) — idempotent so
+            # tables first created by this startup self-heal (e.g. the AWS demo RDS)
+            # also gain the columns the fleet usage query selects.
+            "ALTER TABLE usage_history ADD COLUMN IF NOT EXISTS active_seconds DOUBLE PRECISION NOT NULL DEFAULT 0",
+            "ALTER TABLE usage_history ADD COLUMN IF NOT EXISTS foreground_seconds DOUBLE PRECISION NOT NULL DEFAULT 0",
             "CREATE INDEX IF NOT EXISTS idx_usage_history_device_date ON usage_history(device_id, date DESC)",
             "CREATE INDEX IF NOT EXISTS idx_usage_history_app_date ON usage_history(app_name, date DESC)",
             "CREATE INDEX IF NOT EXISTS idx_usage_history_date ON usage_history(date)",
@@ -210,7 +230,11 @@ async def http_exception_handler(request: Request, exc: HTTPException):
     label = _HTTP_ERROR_LABELS.get(exc.status_code, "Error")
     return JSONResponse(
         status_code=exc.status_code,
-        content={"error": label, "detail": exc.detail or label, "status_code": exc.status_code},
+        content={
+            "error": label,
+            "detail": exc.detail or label,
+            "status_code": exc.status_code,
+        },
     )
 
 
@@ -218,10 +242,15 @@ async def http_exception_handler(request: Request, exc: HTTPException):
 async def internal_error_handler(request: Request, exc: Exception):
     return JSONResponse(
         status_code=500,
-        content={"error": "Internal server error", "detail": str(exc), "status_code": 500},
+        content={
+            "error": "Internal server error",
+            "detail": str(exc),
+            "status_code": 500,
+        },
     )
 
 
 if __name__ == "__main__":
     import uvicorn
+
     uvicorn.run(app, host="0.0.0.0", port=8000)
