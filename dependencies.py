@@ -70,6 +70,7 @@ _CACHE_TTL: dict = {
     "system": 30,
     "inventory": 30,
     "events": 15,
+    "settings": 30,
 }
 
 
@@ -183,6 +184,9 @@ def preload_sql_queries():
         "admin/check_orphaned",
         "admin/events_stats",
         "admin/table_sizes",
+        "settings/get",
+        "settings/upsert",
+        "settings/inventory_discover",
     ]
 
     loaded = 0
@@ -223,6 +227,14 @@ REPORTMATE_PASSPHRASE = os.getenv('REPORTMATE_PASSPHRASE')
 API_INTERNAL_SECRET = os.getenv('API_INTERNAL_SECRET')
 AZURE_MANAGED_IDENTITY_HEADER = "X-MS-CLIENT-PRINCIPAL-ID"
 DISABLE_AUTH = os.getenv('DISABLE_AUTH', 'false').lower() in ('true', '1', 'yes')
+
+if DISABLE_AUTH:
+    # Surface this prominently — a deployment that ships with auth disabled is a
+    # security hole, and the per-request bypass otherwise only logs at debug.
+    logger.warning(
+        "[SECURITY] DISABLE_AUTH is enabled: ALL API requests bypass authentication. "
+        "This must never be set in production."
+    )
 
 
 async def verify_authentication(
@@ -320,14 +332,17 @@ def get_db_connection():
                 host = host_and_port
                 port = 5432
 
-            logger.info(f"Connecting to database: {host}:{port}/{database}")
+            # SSL is required by Azure Postgres (default). Self-hosted/local
+            # Postgres often has no TLS, so allow opting out via DB_SSL=false.
+            db_ssl = os.getenv('DB_SSL', 'true').lower() not in ('false', '0', 'no', 'disable')
+            logger.info(f"Connecting to database: {host}:{port}/{database} (ssl={db_ssl})")
             conn = pg8000.connect(
                 host=host,
                 port=port,
                 database=database,
                 user=username,
                 password=password,
-                ssl_context=True,
+                ssl_context=True if db_ssl else None,
                 timeout=30
             )
             cursor = conn.cursor()
