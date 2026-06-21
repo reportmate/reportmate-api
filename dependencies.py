@@ -27,7 +27,7 @@ import pg8000
 pg8000.paramstyle = "pyformat"
 from fastapi import HTTPException, Query, Request, Header, Depends
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 from slowapi import Limiter
 from slowapi.util import get_remote_address
 
@@ -561,8 +561,7 @@ class EventMetadata(BaseModel):
     collectionType: Optional[str] = Field(default="Full", pattern=r"^(Full|Single)$")
     enabledModules: Optional[List[str]] = None
 
-    class Config:
-        populate_by_name = True
+    model_config = ConfigDict(populate_by_name=True)
 
     device_id: Optional[str] = Field(None, alias="device_id", exclude=True)
     serial_number: Optional[str] = Field(None, alias="serial_number", exclude=True)
@@ -581,8 +580,7 @@ class EventSubmission(BaseModel):
     events: Optional[List[Dict[str, Any]]] = None
     modules: Optional[Dict[str, Any]] = None
 
-    class Config:
-        extra = "allow"
+    model_config = ConfigDict(extra="allow")
 
 
 # ---------------------------------------------------------------------------
