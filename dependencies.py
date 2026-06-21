@@ -257,6 +257,12 @@ API_INTERNAL_SECRET = os.getenv("API_INTERNAL_SECRET")
 AZURE_MANAGED_IDENTITY_HEADER = "X-MS-CLIENT-PRINCIPAL-ID"
 DISABLE_AUTH = os.getenv("DISABLE_AUTH", "false").lower() in ("true", "1", "yes")
 
+# Deployment environment marker (optional). Used only to gate the DISABLE_AUTH
+# safety check below; absence is treated as "unknown", not "non-prod".
+APP_ENV = os.getenv("APP_ENV", os.getenv("ENVIRONMENT", "")).strip().lower()
+_NONPROD_ENVS = {"development", "dev", "local", "test", "testing"}
+_PROD_ENVS = {"production", "prod", "staging", "stage"}
+
 if DISABLE_AUTH:
     # Surface this prominently — a deployment that ships with auth disabled is a
     # security hole, and the per-request bypass otherwise only logs at debug.
@@ -264,6 +270,34 @@ if DISABLE_AUTH:
         "[SECURITY] DISABLE_AUTH is enabled: ALL API requests bypass authentication. "
         "This must never be set in production."
     )
+
+
+def assert_auth_enabled_for_prod() -> None:
+    """Fail fast if authentication is disabled in a production-like deployment.
+
+    Called from application startup. ``DISABLE_AUTH`` is a development-only
+    escape hatch; refusing to boot with it set in production turns a silent,
+    fleet-wide security hole into a loud, unmissable deploy failure.
+
+    A deployment is treated as production-like when EITHER ``APP_ENV`` names a
+    prod/staging environment OR real auth secrets (``REPORTMATE_PASSPHRASE`` /
+    ``API_INTERNAL_SECRET``) are configured -- so no new infrastructure marker
+    is required. An explicit non-prod ``APP_ENV`` (development/local/test) is
+    the deliberate escape hatch and is always allowed.
+    """
+    if not DISABLE_AUTH:
+        return
+    if APP_ENV in _NONPROD_ENVS:
+        return  # explicit dev/test opt-in
+    secrets_configured = bool(REPORTMATE_PASSPHRASE or API_INTERNAL_SECRET)
+    if APP_ENV in _PROD_ENVS or secrets_configured:
+        raise RuntimeError(
+            "Refusing to start: DISABLE_AUTH=true with a production-like "
+            f"configuration (APP_ENV={APP_ENV or 'unset'}, "
+            f"secrets_configured={secrets_configured}). Authentication must not "
+            "be disabled in production. Set APP_ENV=development to use "
+            "DISABLE_AUTH locally, or unset DISABLE_AUTH."
+        )
 
 
 async def verify_authentication(
