@@ -26,7 +26,16 @@ from dependencies import (
     preload_sql_queries,
     request_id_var,
 )
-from routers import admin, devices, events, fleet, health, settings, statistics
+from routers import (
+    admin,
+    api_keys,
+    devices,
+    events,
+    fleet,
+    health,
+    settings,
+    statistics,
+)
 
 # ── Pre-load SQL queries into memory ────────────────────────────
 preload_sql_queries()
@@ -154,7 +163,16 @@ app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
 # ── Routers ────────────────────────────────────────────────────
 # Canonical versioned prefix (appears in OpenAPI schema)
-for _router_mod in (health, devices, fleet, events, statistics, admin, settings):
+for _router_mod in (
+    health,
+    devices,
+    fleet,
+    events,
+    statistics,
+    admin,
+    settings,
+    api_keys,
+):
     app.include_router(_router_mod.router, prefix="/api/v1")
 
 # ── Root endpoint (unversioned) ────────────────────────────────
@@ -230,6 +248,29 @@ def _ensure_performance_indexes():
                 updated_by TEXT,
                 UNIQUE(scope, principal)
             )""",
+            # api_keys table (migration 012) — per-client scoped credentials.
+            # Only the sha256 hash of the secret is stored, never the secret.
+            """CREATE TABLE IF NOT EXISTS api_keys (
+                id TEXT PRIMARY KEY,
+                client_id TEXT NOT NULL,
+                key_hash TEXT NOT NULL,
+                scopes JSONB NOT NULL DEFAULT '[]'::jsonb,
+                active BOOLEAN NOT NULL DEFAULT TRUE,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                created_by TEXT,
+                last_used TIMESTAMPTZ
+            )""",
+            "CREATE INDEX IF NOT EXISTS idx_api_keys_active ON api_keys(active)",
+            # api_key_audit table — append-only log of key mgmt + auth events.
+            """CREATE TABLE IF NOT EXISTS api_key_audit (
+                id BIGSERIAL PRIMARY KEY,
+                key_id TEXT,
+                action TEXT NOT NULL,
+                actor TEXT,
+                detail JSONB NOT NULL DEFAULT '{}'::jsonb,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            )""",
+            "CREATE INDEX IF NOT EXISTS idx_api_key_audit_key ON api_key_audit(key_id, created_at DESC)",
             "CREATE INDEX IF NOT EXISTS idx_usage_history_device_date ON usage_history(device_id, date DESC)",
             "CREATE INDEX IF NOT EXISTS idx_usage_history_app_date ON usage_history(app_name, date DESC)",
             "CREATE INDEX IF NOT EXISTS idx_usage_history_date ON usage_history(date)",
