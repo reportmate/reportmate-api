@@ -8,8 +8,12 @@ from fastapi import APIRouter, Query
 from fastapi.responses import JSONResponse
 
 from dependencies import (
-    logger, get_db_connection, HealthResponse,
-    WEBPUBSUB_AVAILABLE, EVENTS_CONNECTION, WEB_PUBSUB_HUB,
+    logger,
+    get_db_connection,
+    HealthResponse,
+    WEBPUBSUB_AVAILABLE,
+    EVENTS_CONNECTION,
+    WEB_PUBSUB_HUB,
 )
 
 try:
@@ -44,7 +48,7 @@ async def health_check():
             "timestamp": datetime.now(timezone.utc).isoformat(),
             "database": "connected",
             "version": "1.0.0",
-            "deviceIdStandard": "serialNumber"
+            "deviceIdStandard": "serialNumber",
         }
     except Exception as e:
         logger.error(f"Health check failed: {e}")
@@ -53,9 +57,54 @@ async def health_check():
             content={
                 "status": "unhealthy",
                 "timestamp": datetime.now(timezone.utc).isoformat(),
-                "error": str(e)
-            }
+                "database": "unavailable",
+            },
         )
+
+
+@router.get("/health/live", tags=["health"])
+async def liveness():
+    """
+    Liveness probe -- the process is up and serving.
+
+    **No authentication required. No dependencies checked.** Use this as the
+    load-balancer/orchestrator liveness target so a transient database outage
+    does not cause healthy replicas to be killed.
+    """
+    return {"status": "ok"}
+
+
+@router.get("/health/ready", tags=["health"])
+async def readiness():
+    """
+    Readiness probe -- verifies the API can reach its database.
+
+    **No authentication required.** Returns 503 when the database is
+    unreachable so orchestrators stop routing traffic to this replica until it
+    recovers. No internal error detail is exposed.
+    """
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute("SELECT 1")
+        cursor.fetchone()
+        conn.close()
+    except Exception as e:
+        logger.error(f"Readiness check failed: {e}")
+        return JSONResponse(
+            status_code=503,
+            content={
+                "status": "not_ready",
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "database": "unavailable",
+            },
+        )
+
+    return {
+        "status": "ready",
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "database": "connected",
+    }
 
 
 @router.get("/negotiate", tags=["health"])
@@ -71,7 +120,7 @@ async def signalr_negotiate(device: str = Query(default="dashboard")):
         return {
             "url": "wss://reportmate-signalr.webpubsub.azure.com/client/hubs/events",
             "accessToken": None,
-            "error": "WebPubSub SDK not installed"
+            "error": "WebPubSub SDK not installed",
         }
 
     if not EVENTS_CONNECTION:
@@ -79,19 +128,18 @@ async def signalr_negotiate(device: str = Query(default="dashboard")):
         return {
             "url": None,
             "accessToken": None,
-            "error": "EVENTS_CONNECTION not configured"
+            "error": "EVENTS_CONNECTION not configured",
         }
 
     try:
         service = WebPubSubServiceClient.from_connection_string(
-            connection_string=EVENTS_CONNECTION,
-            hub=WEB_PUBSUB_HUB
+            connection_string=EVENTS_CONNECTION, hub=WEB_PUBSUB_HUB
         )
 
         token_response = service.get_client_access_token(
             user_id=device,
             minutes_to_expire=60,
-            roles=["webpubsub.joinLeaveGroup.events"]
+            roles=["webpubsub.joinLeaveGroup.events"],
         )
 
         logger.info(f"Generated WebPubSub token for client: {device}")
@@ -99,7 +147,9 @@ async def signalr_negotiate(device: str = Query(default="dashboard")):
         return {
             "url": token_response.get("url"),
             "accessToken": token_response.get("token"),
-            "expiresOn": (datetime.now(timezone.utc) + timedelta(minutes=60)).isoformat()
+            "expiresOn": (
+                datetime.now(timezone.utc) + timedelta(minutes=60)
+            ).isoformat(),
         }
 
     except Exception as e:
@@ -107,5 +157,5 @@ async def signalr_negotiate(device: str = Query(default="dashboard")):
         return {
             "url": None,
             "accessToken": None,
-            "error": f"Token generation failed: {str(e)}"
+            "error": f"Token generation failed: {str(e)}",
         }

@@ -22,6 +22,7 @@ from dependencies import (
     limiter,
     logger,
     preload_sql_queries,
+    request_id_var,
 )
 from routers import admin, devices, events, fleet, health, settings, statistics
 
@@ -102,10 +103,33 @@ app.add_middleware(
         "X-Client-Passphrase",
         "X-Internal-Secret",
         "X-API-PASSPHRASE",
+        "X-Request-ID",
         "Content-Type",
         "Authorization",
     ],
+    expose_headers=["X-Request-ID"],
 )
+
+
+@app.middleware("http")
+async def request_id_middleware(request: Request, call_next):
+    """Assign or propagate a correlation id for every request.
+
+    Honours an inbound ``X-Request-ID`` (so a caller/proxy trace flows through)
+    and otherwise mints one. The id is bound to a contextvar for structured
+    logging, stashed on request.state for the error handlers, and echoed back
+    on the response.
+    """
+    rid = request.headers.get("X-Request-ID") or uuid.uuid4().hex[:12]
+    request.state.request_id = rid
+    token = request_id_var.set(rid)
+    try:
+        response = await call_next(request)
+        response.headers["X-Request-ID"] = rid
+        return response
+    finally:
+        request_id_var.reset(token)
+
 
 # Rate limiting
 app.state.limiter = limiter
@@ -237,9 +261,14 @@ _HTTP_ERROR_LABELS = {
 }
 
 
-def _error_reference() -> str:
-    """Short correlation id tying a client-visible error to a server log line."""
-    return uuid.uuid4().hex[:12]
+def _error_reference(request: Request) -> str:
+    """Correlation id tying a client-visible error to a server log line.
+
+    Reuses the request's correlation id (from the request-id middleware) so the
+    masked error body, the ``X-Request-ID`` response header, and the server log
+    all share one id; falls back to a fresh id if the middleware did not run.
+    """
+    return getattr(request.state, "request_id", None) or uuid.uuid4().hex[:12]
 
 
 @app.exception_handler(HTTPException)
@@ -251,9 +280,9 @@ async def http_exception_handler(request: Request, exc: HTTPException):
     # log it server-side against a reference and respond with a generic body.
     # Client-error (<500) detail is intended for the caller and is preserved.
     if exc.status_code >= 500:
-        ref = _error_reference()
+        ref = _error_reference(request)
         logger.error(
-            f"[{ref}] {request.method} {request.url.path} -> {exc.status_code}: {exc.detail}"
+            f"{request.method} {request.url.path} -> {exc.status_code}: {exc.detail}"
         )
         return JSONResponse(
             status_code=exc.status_code,
@@ -263,6 +292,7 @@ async def http_exception_handler(request: Request, exc: HTTPException):
                 "reference": ref,
                 "status_code": exc.status_code,
             },
+            headers={"X-Request-ID": ref},
         )
 
     return JSONResponse(
@@ -279,9 +309,9 @@ async def http_exception_handler(request: Request, exc: HTTPException):
 async def unhandled_exception_handler(request: Request, exc: Exception):
     # Catch-all for anything not raised as an HTTPException. Log the full
     # traceback server-side; return a masked body with a reference id.
-    ref = _error_reference()
+    ref = _error_reference(request)
     logger.exception(
-        f"[{ref}] Unhandled exception on {request.method} {request.url.path}: {exc}"
+        f"Unhandled exception on {request.method} {request.url.path}: {exc}"
     )
     return JSONResponse(
         status_code=500,
@@ -291,6 +321,7 @@ async def unhandled_exception_handler(request: Request, exc: Exception):
             "reference": ref,
             "status_code": 500,
         },
+        headers={"X-Request-ID": ref},
     )
 
 
