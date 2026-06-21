@@ -8,6 +8,7 @@ models, and database access live in ``dependencies.py``.
 
 import logging
 import os
+import uuid
 
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -236,9 +237,34 @@ _HTTP_ERROR_LABELS = {
 }
 
 
+def _error_reference() -> str:
+    """Short correlation id tying a client-visible error to a server log line."""
+    return uuid.uuid4().hex[:12]
+
+
 @app.exception_handler(HTTPException)
 async def http_exception_handler(request: Request, exc: HTTPException):
     label = _HTTP_ERROR_LABELS.get(exc.status_code, "Error")
+
+    # Server-error (>=500) detail may carry internal state -- exception text,
+    # SQL, connection strings, stack fragments. Never return it to the caller:
+    # log it server-side against a reference and respond with a generic body.
+    # Client-error (<500) detail is intended for the caller and is preserved.
+    if exc.status_code >= 500:
+        ref = _error_reference()
+        logger.error(
+            f"[{ref}] {request.method} {request.url.path} -> {exc.status_code}: {exc.detail}"
+        )
+        return JSONResponse(
+            status_code=exc.status_code,
+            content={
+                "error": label,
+                "detail": f"{label}. Reference: {ref}",
+                "reference": ref,
+                "status_code": exc.status_code,
+            },
+        )
+
     return JSONResponse(
         status_code=exc.status_code,
         content={
@@ -249,13 +275,20 @@ async def http_exception_handler(request: Request, exc: HTTPException):
     )
 
 
-@app.exception_handler(500)
-async def internal_error_handler(request: Request, exc: Exception):
+@app.exception_handler(Exception)
+async def unhandled_exception_handler(request: Request, exc: Exception):
+    # Catch-all for anything not raised as an HTTPException. Log the full
+    # traceback server-side; return a masked body with a reference id.
+    ref = _error_reference()
+    logger.exception(
+        f"[{ref}] Unhandled exception on {request.method} {request.url.path}: {exc}"
+    )
     return JSONResponse(
         status_code=500,
         content={
             "error": "Internal server error",
-            "detail": str(exc),
+            "detail": f"Internal server error. Reference: {ref}",
+            "reference": ref,
             "status_code": 500,
         },
     )
