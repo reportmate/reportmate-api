@@ -13,10 +13,13 @@ This module contains all code shared across router modules:
 """
 
 import contextvars
+import hashlib
+import hmac
 import json
 import logging
 import os
 import re
+import secrets
 import time as _time
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
@@ -300,33 +303,202 @@ def assert_auth_enabled_for_prod() -> None:
         )
 
 
+# ---------------------------------------------------------------------------
+# Authorization scopes and per-client API keys
+# ---------------------------------------------------------------------------
+#
+# Scopes are least-privilege buckets enforced per request:
+#   read   -- fleet/device GETs
+#   ingest -- POST telemetry (events, device upsert)
+#   admin  -- mutations, deletes, and admin endpoints
+#
+# Legacy credentials (shared passphrase, internal secret, managed identity)
+# are granted ALL scopes for backward compatibility, so nothing in the fleet
+# breaks. Only per-client API keys are scope-limited; migrate callers onto
+# scoped keys over time, then retire the shared passphrase.
+
+ALL_SCOPES = ("read", "ingest", "admin")
+API_KEY_PREFIX = "rm"
+
+
+def _required_scope(method: str, path: str) -> str:
+    """Map an HTTP request to the scope it requires."""
+    if "/admin" in path:
+        return "admin"
+    if method in ("GET", "HEAD", "OPTIONS"):
+        return "read"
+    if method == "POST":
+        return "ingest"
+    return "admin"  # PUT, PATCH, DELETE
+
+
+def _enforce_scope(request: Request, scopes) -> None:
+    """Raise 403 if the authenticated principal lacks the required scope."""
+    required = _required_scope(request.method, request.url.path)
+    if required not in (scopes or []):
+        raise HTTPException(
+            status_code=403,
+            detail=f"This credential lacks the required '{required}' scope.",
+        )
+
+
+def _hash_secret(secret: str) -> str:
+    """sha256 hex of an API key secret (only the hash is ever stored)."""
+    return hashlib.sha256(secret.encode("utf-8")).hexdigest()
+
+
+def generate_api_key():
+    """Mint a new key. Returns (key_id, secret, full_key).
+
+    Format: ``rm_<id>_<secret>`` -- ``id`` is the public lookup handle,
+    ``secret`` is shown to the operator exactly once and never stored in clear.
+    """
+    key_id = secrets.token_hex(6)  # 12 hex chars, public
+    secret = secrets.token_hex(24)  # 48 hex chars
+    return key_id, secret, f"{API_KEY_PREFIX}_{key_id}_{secret}"
+
+
+def parse_api_key(presented: str):
+    """Split ``rm_<id>_<secret>``. Returns (key_id, secret) or None if malformed."""
+    if not presented or not isinstance(presented, str):
+        return None
+    parts = presented.split("_", 2)
+    if len(parts) != 3 or parts[0] != API_KEY_PREFIX:
+        return None
+    _, key_id, secret = parts
+    if not key_id or not secret:
+        return None
+    return key_id, secret
+
+
+def get_api_key_record(key_id: str):
+    """Look up an api_keys row by public id.
+
+    Returns ``{client_id, key_hash, scopes:list, active:bool}`` or None.
+    Isolated so tests can monkeypatch the lookup without a database.
+    """
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT client_id, key_hash, scopes, active FROM api_keys WHERE id = %s",
+            (key_id,),
+        )
+        row = cursor.fetchone()
+        conn.close()
+    except Exception as e:
+        logger.error(f"API key lookup failed: {e}")
+        return None
+    if not row:
+        return None
+    client_id, key_hash, scopes, active = row
+    if isinstance(scopes, str):
+        try:
+            scopes = json.loads(scopes)
+        except Exception:
+            scopes = []
+    return {
+        "client_id": client_id,
+        "key_hash": key_hash,
+        "scopes": list(scopes or []),
+        "active": bool(active),
+    }
+
+
+def _touch_api_key_last_used(key_id: str) -> None:
+    """Best-effort last_used stamp; failures must not break authentication."""
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute("UPDATE api_keys SET last_used = NOW() WHERE id = %s", (key_id,))
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        logger.debug(f"Could not update api_keys.last_used for {key_id}: {e}")
+
+
+def verify_api_key(presented: str, client_host=None):
+    """Validate an ``X-API-Key`` value. Returns an auth dict or None.
+
+    Constant-time hash comparison; rejects malformed, unknown, inactive, or
+    mismatched keys. The auth dict carries the key's scopes for enforcement.
+    """
+    parsed = parse_api_key(presented)
+    if not parsed:
+        return None
+    key_id, secret = parsed
+    record = get_api_key_record(key_id)
+    if not record or not record["active"]:
+        return None
+    if not hmac.compare_digest(_hash_secret(secret), record["key_hash"] or ""):
+        return None
+    _touch_api_key_last_used(key_id)
+    return {
+        "method": "api_key",
+        "key_id": key_id,
+        "client_id": record["client_id"],
+        "scopes": record["scopes"],
+        "client_ip": client_host,
+    }
+
+
+def audit_api_key(key_id, action: str, actor=None, detail=None) -> None:
+    """Append an api_key_audit row. Best-effort; never blocks the operation."""
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute(
+            "INSERT INTO api_key_audit (key_id, action, actor, detail) "
+            "VALUES (%s, %s, %s, %s)",
+            (key_id, action, actor, json.dumps(detail or {})),
+        )
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        logger.error(f"API key audit write failed ({action} {key_id}): {e}")
+
+
 async def verify_authentication(
     request: Request,
     x_api_passphrase: str = Header(None, alias="X-API-PASSPHRASE"),
     x_client_passphrase: str = Header(None, alias="X-Client-Passphrase"),
     x_internal_secret: str = Header(None, alias="X-Internal-Secret"),
     x_ms_client_principal_id: str = Header(None, alias="X-MS-CLIENT-PRINCIPAL-ID"),
+    x_api_key: str = Header(None, alias="X-API-Key"),
     x_forwarded_for: str = Header(None, alias="X-Forwarded-For"),
     user_agent: str = Header(None, alias="User-Agent"),
 ):
     """
-    Verify authentication for API endpoints.
+    Verify authentication and authorize the request against required scopes.
 
-    Authentication methods supported (checked in order):
-    0. Disabled: If DISABLE_AUTH=true, all requests are allowed (development only!)
-    1. Internal Secret: X-Internal-Secret header (container-to-container auth from frontend)
-    2. Azure Managed Identity: X-MS-CLIENT-PRINCIPAL-ID header (Easy Auth)
-    3. Passphrase: X-API-PASSPHRASE or X-Client-Passphrase header (Windows/macOS clients)
+    Each branch resolves an ``auth`` principal carrying a ``scopes`` list; a
+    single ``_enforce_scope`` gate at the end authorizes the request. Methods
+    are checked in order:
+    0. Disabled: DISABLE_AUTH=true bypasses auth (development only; guarded
+       against production by ``assert_auth_enabled_for_prod`` at startup).
+    1. Internal Secret: X-Internal-Secret (BFF/container-to-container) -- legacy, full access.
+    2. Managed Identity: X-MS-CLIENT-PRINCIPAL-ID (Azure Easy Auth) -- legacy, full access.
+    3. API Key: X-API-Key (per-client, scope-limited) -- the only scoped credential.
+    4. Passphrase: X-API-PASSPHRASE / X-Client-Passphrase (clients, functions) -- legacy, full access.
+
+    Legacy credentials receive ALL scopes for backward compatibility; per-client
+    API keys carry only their granted scopes. This keeps the deployed fleet
+    working while callers migrate onto scoped keys.
     """
     if DISABLE_AUTH:
         logger.debug(
             f"[SUCCESS] Authentication disabled via DISABLE_AUTH env var (User-Agent: {user_agent})"
         )
-        return {"method": "auth_disabled", "user_agent": user_agent}
+        return {
+            "method": "auth_disabled",
+            "user_agent": user_agent,
+            "scopes": list(ALL_SCOPES),
+        }
 
     client_host = request.client.host if request.client else None
+    auth = None
 
-    # Method 1: Internal Secret (container-to-container)
+    # Method 1: Internal Secret (BFF / container-to-container) -- full access.
     if x_internal_secret:
         if not API_INTERNAL_SECRET:
             logger.error(
@@ -335,34 +507,50 @@ async def verify_authentication(
             raise HTTPException(
                 status_code=500, detail="Server internal authentication not configured"
             )
-
-        if x_internal_secret != API_INTERNAL_SECRET:
+        if not hmac.compare_digest(x_internal_secret, API_INTERNAL_SECRET):
             logger.warning(
                 f"[ERR] Invalid internal secret attempt from {user_agent} (IP: {client_host})"
             )
             raise HTTPException(
                 status_code=401, detail="Invalid internal authentication credentials"
             )
-
-        logger.info(
-            f"[SUCCESS] Authenticated via internal secret from {user_agent} (IP: {client_host})"
-        )
-        return {
+        auth = {
             "method": "internal_secret",
             "user_agent": user_agent,
             "client_ip": client_host,
+            "scopes": list(ALL_SCOPES),
         }
 
-    # Method 2: Azure Managed Identity
-    if x_ms_client_principal_id:
-        logger.info(
-            f"[SUCCESS] Authenticated via Azure Managed Identity: {x_ms_client_principal_id}"
-        )
-        return {"method": "managed_identity", "principal_id": x_ms_client_principal_id}
+    # Method 2: Azure Managed Identity (Easy Auth) -- legacy IdP integration, full access.
+    elif x_ms_client_principal_id:
+        auth = {
+            "method": "managed_identity",
+            "principal_id": x_ms_client_principal_id,
+            "scopes": list(ALL_SCOPES),
+        }
 
-    # Method 3: Passphrase (Windows/macOS clients)
-    passphrase_header = x_api_passphrase or x_client_passphrase
-    if passphrase_header:
+    # Method 3: Per-client API key (scope-limited).
+    elif x_api_key:
+        auth = verify_api_key(x_api_key, client_host=client_host)
+        if auth is None:
+            logger.warning(
+                f"[ERR] Invalid API key attempt from {user_agent} (IP: {client_host})"
+            )
+            raise HTTPException(status_code=401, detail="Invalid API key")
+
+    # ---- Extension point: federated identity (provider-agnostic OIDC) -------
+    # A future bearer-token verifier slots in here, e.g.:
+    #     elif authorization and authorization.lower().startswith("bearer "):
+    #         auth = verify_oidc_bearer(authorization)
+    # It MUST be IdP-agnostic: validate against configurable issuer(s)/audience/
+    # JWKS (env OIDC_ISSUERS / OIDC_AUDIENCE / OIDC_JWKS_URI), supporting any
+    # OIDC provider (Entra, Okta, Auth0, Keycloak, Google) and multiple issuers
+    # at once -- never hard-coded to one vendor. Map IdP claims/groups -> scopes
+    # so it flows through the same _enforce_scope gate below.
+    # -------------------------------------------------------------------------
+
+    # Method 4: Passphrase (Windows/macOS clients, alert functions) -- legacy, full access.
+    elif x_api_passphrase or x_client_passphrase:
         if not REPORTMATE_PASSPHRASE:
             logger.error(
                 "[ERR] REPORTMATE_PASSPHRASE not configured but client attempted passphrase auth"
@@ -370,33 +558,33 @@ async def verify_authentication(
             raise HTTPException(
                 status_code=500, detail="Server authentication not configured"
             )
-
-        if passphrase_header != REPORTMATE_PASSPHRASE:
+        presented = x_api_passphrase or x_client_passphrase
+        if not hmac.compare_digest(presented, REPORTMATE_PASSPHRASE):
             logger.warning(
                 f"[ERR] Invalid passphrase attempt from {user_agent} (IP: {client_host})"
             )
             raise HTTPException(
                 status_code=401, detail="Invalid authentication credentials"
             )
-
-        header_type = "X-API-PASSPHRASE" if x_api_passphrase else "X-Client-Passphrase"
-        logger.info(
-            f"[SUCCESS] Authenticated via passphrase ({header_type}) from {user_agent} (IP: {client_host})"
-        )
-        return {
+        auth = {
             "method": "passphrase",
             "user_agent": user_agent,
             "client_ip": client_host,
+            "scopes": list(ALL_SCOPES),
         }
 
-    # No valid authentication
-    logger.warning(
-        f"[ERR] Unauthenticated access attempt from {user_agent} (IP: {client_host}, X-Forwarded-For: {x_forwarded_for})"
-    )
-    raise HTTPException(
-        status_code=401,
-        detail="Authentication required. X-Internal-Secret (internal), X-Client-Passphrase (clients), or internal network access required.",
-    )
+    if auth is None:
+        logger.warning(
+            f"[ERR] Unauthenticated access attempt from {user_agent} (IP: {client_host}, X-Forwarded-For: {x_forwarded_for})"
+        )
+        raise HTTPException(
+            status_code=401,
+            detail="Authentication required. Supply X-API-Key (per-client), "
+            "X-Client-Passphrase (clients), or X-Internal-Secret (internal).",
+        )
+
+    _enforce_scope(request, auth.get("scopes", []))
+    return auth
 
 
 # ---------------------------------------------------------------------------
