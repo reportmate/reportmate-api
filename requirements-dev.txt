@@ -1,0 +1,4 @@
+# Test/CI dependencies (not installed into the runtime image)
+-r requirements.txt
+pytest>=8.0
+httpx>=0.27
