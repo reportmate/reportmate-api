@@ -19,6 +19,7 @@ from slowapi.errors import RateLimitExceeded
 from starlette.exceptions import HTTPException
 
 from dependencies import (
+    assert_auth_enabled_for_prod,
     get_db_connection,
     limiter,
     logger,
@@ -38,6 +39,8 @@ async def lifespan(app: FastAPI):
     ``_ensure_performance_indexes`` is defined further down in this module and
     is resolved at call time (startup), so it does not need to precede the app.
     """
+    # Refuse to boot with authentication disabled in a production deployment.
+    assert_auth_enabled_for_prod()
     _ensure_performance_indexes()
     yield
 
