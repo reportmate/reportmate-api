@@ -9,6 +9,7 @@ models, and database access live in ``dependencies.py``.
 import logging
 import os
 import uuid
+from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -29,8 +30,21 @@ from routers import admin, devices, events, fleet, health, settings, statistics
 # ── Pre-load SQL queries into memory ────────────────────────────
 preload_sql_queries()
 
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Application lifespan: ensure performance indexes on startup.
+
+    ``_ensure_performance_indexes`` is defined further down in this module and
+    is resolved at call time (startup), so it does not need to precede the app.
+    """
+    _ensure_performance_indexes()
+    yield
+
+
 # ── FastAPI app ─────────────────────────────────────────────────
 app = FastAPI(
+    lifespan=lifespan,
     title="ReportMate API",
     version="1.0.0",
     description="""
@@ -168,9 +182,11 @@ async def root():
 _indexes_ensured = False
 
 
-@app.on_event("startup")
-async def ensure_performance_indexes():
-    """Create indexes needed for fast dashboard queries (idempotent)."""
+def _ensure_performance_indexes():
+    """Create indexes needed for fast dashboard queries (idempotent).
+
+    Invoked from the lifespan handler on startup.
+    """
     global _indexes_ensured
     if _indexes_ensured:
         return
