@@ -247,7 +247,7 @@ async def delete_device(serial_number: str, confirm: bool = Query(False)):
         if deleted_count == 0:
             raise HTTPException(status_code=404, detail=f"Device {serial_number} not found")
         
-        logger.warning(f"🗑️ DELETED device: {serial_number} (UUID: {device_uuid}, Name: {device_name})")
+        logger.warning(f"DELETED device: {serial_number} (UUID: {device_uuid}, Name: {device_name})")
         logger.warning(f"   - Archived status: {is_archived}")
         logger.warning(f"   - Events deleted: {event_count}")
         logger.warning(f"   - Usage history rows deleted: {usage_history_deleted}")
