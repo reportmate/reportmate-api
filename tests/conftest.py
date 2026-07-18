@@ -20,3 +20,18 @@ os.environ.setdefault(
 )
 os.environ["REPORTMATE_PASSPHRASE"] = "test-passphrase"
 os.environ["API_INTERNAL_SECRET"] = "test-internal-secret"
+
+
+import pytest
+
+
+@pytest.fixture(autouse=True)
+def _reset_rate_limiter():
+    """Isolate the global rate-limit bucket between tests.
+
+    TestClient requests all share one remote address, so without a reset the
+    mounted default limit would leak 429s across unrelated tests.
+    """
+    from rate_limit import GlobalRateLimitMiddleware
+
+    GlobalRateLimitMiddleware.reset()
