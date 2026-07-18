@@ -16,7 +16,9 @@ import time as _time
 from datetime import datetime, timezone, timedelta
 from typing import Any, Dict, List, Optional
 
-from fastapi import APIRouter, Depends, HTTPException, Query, Request
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
+
+from pagination import add_pagination_headers
 
 from dependencies import (
     logger,
@@ -39,6 +41,8 @@ router = APIRouter()
 
 @router.get("/devices", response_model=DevicesResponse, dependencies=[Depends(verify_authentication)], tags=["devices"])
 async def get_all_devices(
+    request: Request,
+    response: Response,
     limit: Optional[int] = Query(default=None, ge=1, le=1000, description="Maximum devices to return"),
     offset: int = Query(default=0, ge=0, description="Number of devices to skip for pagination"),
     include_archived: bool = Query(default=False, alias="includeArchived", description="Include archived devices")
@@ -65,6 +69,7 @@ async def get_all_devices(
         _ckey = (include_archived, limit, offset)
         _cached = cache_get("devices", _ckey)
         if _cached is not None:
+            add_pagination_headers(response, request, total=_cached["total"], limit=limit, offset=offset)
             return _cached
 
         conn = get_db_connection()
@@ -267,7 +272,7 @@ async def get_all_devices(
         page = (offset // page_size) + 1 if page_size else 1
         has_more = bool(limit is not None and (offset + len(devices)) < total_devices)
 
-        response = {
+        payload = {
             "devices": devices,
             "total": total_devices or len(devices),
             "message": f"Successfully retrieved {len(devices)} devices",
@@ -275,11 +280,12 @@ async def get_all_devices(
             "pageSize": page_size,
             "hasMore": has_more,
         }
+        add_pagination_headers(response, request, total=payload["total"], limit=limit, offset=offset)
 
         _t1 = _time.monotonic()
         logger.info(f"[DEVICES PERF] {_t1-_t0:.3f}s ({len(devices)} devices)")
-        cache_set("devices", response, _ckey)
-        return response
+        cache_set("devices", payload, _ckey)
+        return payload
 
     except Exception as e:
         print(f"[ERROR] get_all_devices failed: {e}")
