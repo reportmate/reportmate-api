@@ -343,7 +343,33 @@ async def submit_events(request: Request):
         # Connect to database
         conn = get_db_connection()
         cursor = conn.cursor()
-        
+
+        # Idempotency: a client retrying the same submission (network flap,
+        # timeout after the server processed but before the client saw the
+        # response) sends the same Idempotency-Key. The atomic insert loses
+        # the conflict exactly once; replays are acknowledged without
+        # reprocessing. The key row commits with the submission, so a failed
+        # submission rolls its key back and the retry processes normally.
+        idempotency_key = request.headers.get("Idempotency-Key")
+        if idempotency_key:
+            cursor.execute(
+                """INSERT INTO idempotency_keys (key, device_id)
+                   VALUES (%s, %s) ON CONFLICT (key) DO NOTHING RETURNING key""",
+                (idempotency_key[:200], serial_number),
+            )
+            if cursor.fetchone() is None:
+                conn.rollback()
+                conn.close()
+                logger.info(
+                    f"Duplicate submission for {serial_number} (Idempotency-Key replay); acknowledged without reprocessing"
+                )
+                return {
+                    "status": "duplicate",
+                    "idempotent": True,
+                    "serialNumber": serial_number,
+                    "message": "Submission with this Idempotency-Key was already processed",
+                }
+
         # 1. UPSERT device record
         try:
             # Check if device exists
@@ -732,6 +758,9 @@ async def submit_events(request: Request):
                     "DELETE FROM events WHERE timestamp < NOW() - INTERVAL '30 days'"
                 )
                 deleted = cursor.rowcount
+                cursor.execute(
+                    "DELETE FROM idempotency_keys WHERE first_seen < NOW() - INTERVAL '7 days'"
+                )
                 conn.commit()
                 if deleted:
                     logger.info(f"Retention purge: deleted {deleted} events older than 30 days")
