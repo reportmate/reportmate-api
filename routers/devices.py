@@ -240,7 +240,7 @@ async def get_all_devices(
             }
             
             # DEBUG: Log what we're actually adding to device_info
-            logger.info(f"🔍 [HOSTNAME_TEST_v2] Device {serial}: hostname_var={hostname}, network_summary_exists={bool(network_summary)}")
+            logger.info(f"[HOSTNAME_TEST_v2] Device {serial}: hostname_var={hostname}, network_summary_exists={bool(network_summary)}")
 
             if inventory_summary:
                 device_info["inventory"] = inventory_summary
@@ -266,7 +266,7 @@ async def get_all_devices(
         # DEBUG: Check first device in response
         if devices:
             first_dev = devices[0]
-            logger.info(f"🔍 [FINAL_RESPONSE_CHECK] First device: serial={first_dev.get('serialNumber')}, hostname={first_dev.get('hostname')}, has_modules_network={'network' in first_dev.get('modules', {})}")
+            logger.info(f"[FINAL_RESPONSE_CHECK] First device: serial={first_dev.get('serialNumber')}, hostname={first_dev.get('hostname')}, has_modules_network={'network' in first_dev.get('modules', {})}")
 
         page_size = limit or len(devices) or total_devices or 1
         page = (offset // page_size) + 1 if page_size else 1
