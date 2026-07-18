@@ -75,3 +75,19 @@ def test_disable_auth_bypasses_everything(client, monkeypatch):
     # is tracked separately.)
     monkeypatch.setattr(dependencies, "DISABLE_AUTH", True)
     assert client.get("/protected").status_code == 200
+
+
+def test_negotiate_requires_authentication(client, monkeypatch):
+    # The negotiate endpoint mints Web PubSub tokens for the live fleet event
+    # stream; it must never answer anonymous callers.
+    monkeypatch.setattr(dependencies, "DISABLE_AUTH", False)
+    from fastapi.testclient import TestClient
+
+    from main import app
+
+    api = TestClient(app)
+    assert api.get("/api/v1/negotiate").status_code == 401
+    authed = api.get(
+        "/api/v1/negotiate", headers={"X-Client-Passphrase": "test-passphrase"}
+    )
+    assert authed.status_code != 401
