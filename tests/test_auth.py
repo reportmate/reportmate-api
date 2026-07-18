@@ -91,3 +91,36 @@ def test_negotiate_requires_authentication(client, monkeypatch):
         "/api/v1/negotiate", headers={"X-Client-Passphrase": "test-passphrase"}
     )
     assert authed.status_code != 401
+
+
+def test_invalid_api_key_with_valid_passphrase_falls_through(client, monkeypatch):
+    # The deployed Windows client sends both headers when both are configured;
+    # a bad or stale API key must not lock out a device presenting a valid
+    # passphrase (the apiv1-0056ae0 rollout proved it does otherwise).
+    monkeypatch.setattr(dependencies, "DISABLE_AUTH", False)
+    resp = client.get(
+        "/protected",
+        headers={
+            "X-API-Key": "rm_bogus_notakey",
+            "X-Client-Passphrase": "test-passphrase",
+        },
+    )
+    assert resp.status_code == 200
+
+
+def test_invalid_api_key_alone_still_rejected(client, monkeypatch):
+    monkeypatch.setattr(dependencies, "DISABLE_AUTH", False)
+    resp = client.get("/protected", headers={"X-API-Key": "rm_bogus_notakey"})
+    assert resp.status_code == 401
+
+
+def test_invalid_api_key_with_wrong_passphrase_rejected(client, monkeypatch):
+    monkeypatch.setattr(dependencies, "DISABLE_AUTH", False)
+    resp = client.get(
+        "/protected",
+        headers={
+            "X-API-Key": "rm_bogus_notakey",
+            "X-Client-Passphrase": "wrong-passphrase",
+        },
+    )
+    assert resp.status_code == 401
