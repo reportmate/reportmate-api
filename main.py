@@ -18,6 +18,7 @@ from slowapi import _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
 from starlette.exceptions import HTTPException
 
+from etag import ETagMiddleware
 from pagination import PAGINATION_HEADERS
 from rate_limit import GlobalRateLimitMiddleware
 from dependencies import (
@@ -135,8 +136,12 @@ app.add_middleware(
         "Content-Type",
         "Authorization",
     ],
-    expose_headers=["X-Request-ID", *PAGINATION_HEADERS],
+    expose_headers=["X-Request-ID", "ETag", *PAGINATION_HEADERS],
 )
+
+# Innermost of the custom middlewares: 429s (rate limit) and error responses
+# skip it, and request-id still stamps 304s.
+app.add_middleware(ETagMiddleware)
 
 # Added before the request-id middleware so request-id wraps it and 429
 # responses still carry X-Request-ID.
