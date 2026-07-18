@@ -533,10 +533,23 @@ async def verify_authentication(
     elif x_api_key:
         auth = verify_api_key(x_api_key, client_host=client_host)
         if auth is None:
-            logger.warning(
-                f"[ERR] Invalid API key attempt from {user_agent} (IP: {client_host})"
-            )
-            raise HTTPException(status_code=401, detail="Invalid API key")
+            # The deployed Windows client sends BOTH X-API-Key and
+            # X-Client-Passphrase (ApiService.cs adds each when configured).
+            # Hard-failing here rejected every fleet device before its valid
+            # passphrase was ever considered - 100% ingestion outage on the
+            # 0056ae0 rollout. When another credential accompanies a failed
+            # API key, fall through to it; only reject outright when the API
+            # key was the sole credential presented.
+            if x_api_passphrase or x_client_passphrase:
+                logger.warning(
+                    f"[WARN] Invalid API key from {user_agent} (IP: {client_host}) - "
+                    "falling back to accompanying passphrase credential"
+                )
+            else:
+                logger.warning(
+                    f"[ERR] Invalid API key attempt from {user_agent} (IP: {client_host})"
+                )
+                raise HTTPException(status_code=401, detail="Invalid API key")
 
     # ---- Extension point: federated identity (provider-agnostic OIDC) -------
     # A future bearer-token verifier slots in here, e.g.:
@@ -550,7 +563,9 @@ async def verify_authentication(
     # -------------------------------------------------------------------------
 
     # Method 4: Passphrase (Windows/macOS clients, alert functions) -- legacy, full access.
-    elif x_api_passphrase or x_client_passphrase:
+    # Note: `auth is None` (not elif) so a failed-but-accompanied API key above
+    # falls through to the passphrase instead of locking the fleet out.
+    if auth is None and (x_api_passphrase or x_client_passphrase):
         if not REPORTMATE_PASSPHRASE:
             logger.error(
                 "[ERR] REPORTMATE_PASSPHRASE not configured but client attempted passphrase auth"
