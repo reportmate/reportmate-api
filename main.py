@@ -18,6 +18,7 @@ from slowapi import _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
 from starlette.exceptions import HTTPException
 
+from pagination import PAGINATION_HEADERS
 from dependencies import (
     assert_auth_enabled_for_prod,
     get_db_connection,
@@ -133,7 +134,7 @@ app.add_middleware(
         "Content-Type",
         "Authorization",
     ],
-    expose_headers=["X-Request-ID"],
+    expose_headers=["X-Request-ID", *PAGINATION_HEADERS],
 )
 
 
