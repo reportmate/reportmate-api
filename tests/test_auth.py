@@ -63,9 +63,32 @@ def test_wrong_internal_secret_rejected(client, monkeypatch):
     assert resp.status_code == 401
 
 
-def test_managed_identity_accepted(client, monkeypatch):
+def test_managed_identity_rejected_by_default(client, monkeypatch):
+    # The header is attacker-typable unless Azure Easy Auth fronts the app,
+    # so without the explicit opt-in it must not authenticate anything.
     monkeypatch.setattr(dependencies, "DISABLE_AUTH", False)
     resp = client.get("/protected", headers={"X-MS-CLIENT-PRINCIPAL-ID": "abc-123"})
+    assert resp.status_code == 401
+
+
+def test_managed_identity_accepted_with_optin(client, monkeypatch):
+    monkeypatch.setattr(dependencies, "DISABLE_AUTH", False)
+    monkeypatch.setattr(dependencies, "TRUST_EASYAUTH_PRINCIPAL_HEADER", True)
+    resp = client.get("/protected", headers={"X-MS-CLIENT-PRINCIPAL-ID": "abc-123"})
+    assert resp.status_code == 200
+
+
+def test_principal_header_falls_through_to_passphrase(client, monkeypatch):
+    # A caller sending both the untrusted header and a valid passphrase must
+    # still authenticate via the passphrase path.
+    monkeypatch.setattr(dependencies, "DISABLE_AUTH", False)
+    resp = client.get(
+        "/protected",
+        headers={
+            "X-MS-CLIENT-PRINCIPAL-ID": "abc-123",
+            "X-Client-Passphrase": "test-passphrase",
+        },
+    )
     assert resp.status_code == 200
 
 
