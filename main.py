@@ -254,6 +254,9 @@ def _ensure_performance_indexes():
             # usage_history predates them. The events ingest INSERTs these
             # columns; without them every daily usage write fails with
             # 'column ... does not exist' (non-fatal, but loses utilization data).
+            # Idempotency-Key replay guard for POST /events (migration 013)
+            "CREATE TABLE IF NOT EXISTS idempotency_keys (key TEXT PRIMARY KEY, device_id TEXT, first_seen TIMESTAMPTZ NOT NULL DEFAULT NOW())",
+            "CREATE INDEX IF NOT EXISTS idx_idempotency_first_seen ON idempotency_keys(first_seen)",
             "ALTER TABLE usage_history ADD COLUMN IF NOT EXISTS active_seconds DOUBLE PRECISION NOT NULL DEFAULT 0",
             "ALTER TABLE usage_history ADD COLUMN IF NOT EXISTS foreground_seconds DOUBLE PRECISION NOT NULL DEFAULT 0",
             # app_settings table (migration 011) — server-side settings store
