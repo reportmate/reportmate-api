@@ -4,11 +4,12 @@ Health, root, and WebSocket negotiate endpoints.
 
 from datetime import datetime, timezone, timedelta
 
-from fastapi import APIRouter, Query
+from fastapi import APIRouter, Depends, Query
 from fastapi.responses import JSONResponse
 
 from dependencies import (
     logger,
+    verify_authentication,
     get_db_connection,
     HealthResponse,
     WEBPUBSUB_AVAILABLE,
@@ -107,13 +108,15 @@ async def readiness():
     }
 
 
-@router.get("/negotiate", tags=["health"])
+@router.get("/negotiate", dependencies=[Depends(verify_authentication)], tags=["health"])
 async def signalr_negotiate(device: str = Query(default="dashboard")):
     """
     SignalR/WebPubSub negotiate endpoint.
 
-    Generates a client access token for Azure Web PubSub connection.
-    The token allows clients to connect and receive real-time events.
+    Generates a client access token for Azure Web PubSub connection. The token
+    grants a live view of the fleet event stream, so callers must authenticate;
+    the dashboard reaches this through the BFF proxy, which supplies the
+    internal secret.
     """
     if not WEBPUBSUB_AVAILABLE:
         logger.warning("Azure Web PubSub SDK not available, falling back to mock")
