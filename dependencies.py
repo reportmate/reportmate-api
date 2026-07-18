@@ -260,6 +260,14 @@ API_INTERNAL_SECRET = os.getenv("API_INTERNAL_SECRET")
 AZURE_MANAGED_IDENTITY_HEADER = "X-MS-CLIENT-PRINCIPAL-ID"
 DISABLE_AUTH = os.getenv("DISABLE_AUTH", "false").lower() in ("true", "1", "yes")
 
+# X-MS-CLIENT-PRINCIPAL-ID is only evidence of identity when Azure Easy Auth
+# fronts this app: the platform strips inbound X-MS-* headers and injects
+# validated values. Without that guarantee anyone can type the header, so it
+# is ignored unless the operator explicitly opts in.
+TRUST_EASYAUTH_PRINCIPAL_HEADER = os.getenv(
+    "TRUST_EASYAUTH_PRINCIPAL_HEADER", "false"
+).lower() in ("true", "1", "yes")
+
 # Deployment environment marker (optional). Used only to gate the DISABLE_AUTH
 # safety check below; absence is treated as "unknown", not "non-prod".
 APP_ENV = os.getenv("APP_ENV", os.getenv("ENVIRONMENT", "")).strip().lower()
@@ -521,8 +529,11 @@ async def verify_authentication(
             "scopes": list(ALL_SCOPES),
         }
 
-    # Method 2: Azure Managed Identity (Easy Auth) -- legacy IdP integration, full access.
-    elif x_ms_client_principal_id:
+    # Method 2: Azure Managed Identity (Easy Auth) -- legacy IdP integration,
+    # full access. Honoured only behind an explicit opt-in (see the config
+    # comment on TRUST_EASYAUTH_PRINCIPAL_HEADER); otherwise the header is
+    # attacker-typable and the branch would be a full-scope bypass.
+    elif x_ms_client_principal_id and TRUST_EASYAUTH_PRINCIPAL_HEADER:
         auth = {
             "method": "managed_identity",
             "principal_id": x_ms_client_principal_id,
@@ -574,6 +585,10 @@ async def verify_authentication(
         }
 
     if auth is None:
+        if x_ms_client_principal_id and not TRUST_EASYAUTH_PRINCIPAL_HEADER:
+            logger.warning(
+                f"[ERR] X-MS-CLIENT-PRINCIPAL-ID presented without TRUST_EASYAUTH_PRINCIPAL_HEADER enabled; header ignored (IP: {client_host})"
+            )
         logger.warning(
             f"[ERR] Unauthenticated access attempt from {user_agent} (IP: {client_host}, X-Forwarded-For: {x_forwarded_for})"
         )
