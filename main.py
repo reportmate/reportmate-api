@@ -19,6 +19,7 @@ from slowapi.errors import RateLimitExceeded
 from starlette.exceptions import HTTPException
 
 from pagination import PAGINATION_HEADERS
+from rate_limit import GlobalRateLimitMiddleware
 from dependencies import (
     assert_auth_enabled_for_prod,
     get_db_connection,
@@ -136,6 +137,10 @@ app.add_middleware(
     ],
     expose_headers=["X-Request-ID", *PAGINATION_HEADERS],
 )
+
+# Added before the request-id middleware so request-id wraps it and 429
+# responses still carry X-Request-ID.
+app.add_middleware(GlobalRateLimitMiddleware)
 
 
 @app.middleware("http")
