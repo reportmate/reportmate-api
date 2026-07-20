@@ -20,6 +20,7 @@ from starlette.exceptions import HTTPException
 
 from etag import ETagMiddleware
 from pagination import PAGINATION_HEADERS
+from metrics import MetricsMiddleware
 from rate_limit import GlobalRateLimitMiddleware
 from dependencies import (
     assert_auth_enabled_for_prod,
@@ -146,6 +147,9 @@ app.add_middleware(ETagMiddleware)
 # Added before the request-id middleware so request-id wraps it and 429
 # responses still carry X-Request-ID.
 app.add_middleware(GlobalRateLimitMiddleware)
+
+# Records request counts/latencies; skips the scrape endpoint itself.
+app.add_middleware(MetricsMiddleware)
 
 
 @app.middleware("http")
