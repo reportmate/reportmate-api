@@ -23,6 +23,7 @@ from pagination import PAGINATION_HEADERS
 from rate_limit import GlobalRateLimitMiddleware
 from dependencies import (
     assert_auth_enabled_for_prod,
+    close_db_pool,
     get_db_connection,
     limiter,
     logger,
@@ -55,6 +56,8 @@ async def lifespan(app: FastAPI):
     assert_auth_enabled_for_prod()
     _ensure_performance_indexes()
     yield
+    # Drain the connection pool on shutdown.
+    close_db_pool()
 
 
 # ── FastAPI app ─────────────────────────────────────────────────

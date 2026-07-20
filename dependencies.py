@@ -20,6 +20,7 @@ import logging
 import os
 import re
 import secrets
+import threading
 import time as _time
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
@@ -250,6 +251,11 @@ limiter = Limiter(key_func=get_remote_address, default_limits=["120/minute"])
 DATABASE_URL = os.getenv(
     "DATABASE_URL", "postgresql://reportmate:password@localhost:5432/reportmate"
 )
+
+# Connection-pool sizing. Defaults are conservative for a scale-to-zero
+# container serving one fleet; raise DB_POOL_MAX for higher concurrency.
+_DB_POOL_MIN = int(os.getenv("DB_POOL_MIN", "2"))
+_DB_POOL_MAX = int(os.getenv("DB_POOL_MAX", "10"))
 
 # ---------------------------------------------------------------------------
 # Authentication
@@ -622,57 +628,131 @@ async def verify_authentication(
 # ---------------------------------------------------------------------------
 
 
-def get_db_connection():
-    """Get database connection using pg8000 driver."""
-    try:
-        if DATABASE_URL.startswith("postgresql://"):
-            url = DATABASE_URL[13:]
+def _parse_database_url(url: str) -> dict:
+    """Parse a postgres[ql] URL into pg8000 connect kwargs.
 
-            if "?" in url:
-                url, params = url.split("?", 1)
+    Accepts both ``postgresql://`` and ``postgres://`` (cloud providers emit
+    either). Raises ValueError on an unrecognized scheme.
+    """
+    if url.startswith("postgresql://"):
+        rest = url[len("postgresql://") :]
+    elif url.startswith("postgres://"):
+        rest = url[len("postgres://") :]
+    else:
+        raise ValueError("DATABASE_URL must start with postgresql:// or postgres://")
 
-            auth_part, host_part = url.split("@")
-            username, password = auth_part.split(":")
+    if "?" in rest:
+        rest, _params = rest.split("?", 1)
 
-            if "/" in host_part:
-                host_and_port, database_part = host_part.split("/", 1)
-                database = database_part.split("?")[0]
-            else:
-                host_and_port = host_part
-                database = "reportmate"
+    auth_part, host_part = rest.split("@")
+    username, password = auth_part.split(":")
 
-            if ":" in host_and_port:
-                host, port = host_and_port.split(":")
-                port = int(port)
-            else:
-                host = host_and_port
-                port = 5432
+    if "/" in host_part:
+        host_and_port, database_part = host_part.split("/", 1)
+        database = database_part.split("?")[0]
+    else:
+        host_and_port = host_part
+        database = "reportmate"
 
-            # SSL is required by Azure Postgres (default). Self-hosted/local
-            # Postgres often has no TLS, so allow opting out via DB_SSL=false.
-            db_ssl = os.getenv("DB_SSL", "true").lower() not in (
-                "false",
-                "0",
-                "no",
-                "disable",
-            )
-            logger.info(
-                f"Connecting to database: {host}:{port}/{database} (ssl={db_ssl})"
-            )
-            conn = pg8000.connect(
-                host=host,
-                port=port,
-                database=database,
-                user=username,
-                password=password,
-                ssl_context=True if db_ssl else None,
-                timeout=30,
-            )
-            cursor = conn.cursor()
-            cursor.execute("SET statement_timeout = '120s'")
-            conn.commit()
-            cursor.close()
+    if ":" in host_and_port:
+        host, port = host_and_port.split(":")
+        port = int(port)
+    else:
+        host = host_and_port
+        port = 5432
+
+    # SSL is required by Azure Postgres (default). Self-hosted/local Postgres
+    # often has no TLS, so allow opting out via DB_SSL=false.
+    db_ssl = os.getenv("DB_SSL", "true").lower() not in ("false", "0", "no", "disable")
+
+    return {
+        "host": host,
+        "port": port,
+        "database": database,
+        "user": username,
+        "password": password,
+        "ssl_context": True if db_ssl else None,
+        "timeout": 30,
+    }
+
+
+# Connection pool (DBUtils PooledDB over pg8000). Built lazily on first use so
+# the module imports without a database, and rebuilt automatically if the URL
+# changes (tests). Every request borrows a pooled connection via
+# get_db_connection() and returns it by calling .close() — PooledDB's proxy
+# returns the connection to the pool (rolling back any open transaction) rather
+# than tearing down the TCP+TLS socket, which eliminates a per-request Azure
+# Postgres handshake.
+_pool = None
+_pool_url = None
+_pool_lock = threading.Lock()
+
+
+def _get_pool():
+    global _pool, _pool_url
+    if _pool is not None and _pool_url == DATABASE_URL:
+        return _pool
+    with _pool_lock:
+        if _pool is not None and _pool_url == DATABASE_URL:
+            return _pool
+        from dbutils.pooled_db import PooledDB
+
+        kwargs = _parse_database_url(DATABASE_URL)
+
+        def _creator():
+            # Apply statement_timeout once per physical connection and COMMIT it
+            # (via autocommit) so it survives PooledDB's rollback-on-return; a
+            # SET left inside an uncommitted transaction would be undone by the
+            # reset. The connection is handed back with autocommit off so the
+            # routers keep their explicit commit/rollback semantics.
+            conn = pg8000.connect(**kwargs)
+            conn.autocommit = True
+            cur = conn.cursor()
+            cur.execute("SET statement_timeout TO '120s'")
+            cur.close()
+            conn.autocommit = False
             return conn
+
+        logger.info(
+            f"Building DB pool: {kwargs['host']}:{kwargs['port']}/{kwargs['database']} "
+            f"(ssl={kwargs['ssl_context'] is not None}, "
+            f"min={_DB_POOL_MIN}, max={_DB_POOL_MAX})"
+        )
+        _pool = PooledDB(
+            creator=_creator,
+            mincached=_DB_POOL_MIN,
+            maxcached=_DB_POOL_MAX,
+            maxconnections=_DB_POOL_MAX,
+            blocking=True,  # wait for a free connection instead of erroring
+            ping=1,  # validate/reconnect a connection when it is borrowed
+            reset=True,  # rollback any open transaction on return to the pool
+        )
+        _pool_url = DATABASE_URL
+        return _pool
+
+
+def close_db_pool():
+    """Close the pool and all its connections (called on app shutdown)."""
+    global _pool, _pool_url
+    with _pool_lock:
+        if _pool is not None:
+            try:
+                _pool.close()
+            except Exception as e:  # pragma: no cover - best-effort shutdown
+                logger.warning(f"Error closing DB pool: {e}")
+            _pool = None
+            _pool_url = None
+
+
+def get_db_connection():
+    """Borrow a pooled database connection.
+
+    Callers use it exactly as before — ``cursor()``, ``commit()``,
+    ``rollback()`` — and release it by calling ``close()`` in a finally block,
+    which returns it to the pool.
+    """
+    try:
+        return _get_pool().connection()
     except Exception as e:
         logger.error(f"Database connection failed: {e}")
         raise HTTPException(status_code=500, detail="Database connection failed")
