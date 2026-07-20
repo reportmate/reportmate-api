@@ -162,3 +162,16 @@ async def signalr_negotiate(device: str = Query(default="dashboard")):
             "accessToken": None,
             "error": f"Token generation failed: {str(e)}",
         }
+
+
+@router.get(
+    "/metrics",
+    dependencies=[Depends(verify_authentication)],
+    tags=["health"],
+    include_in_schema=False,
+)
+async def metrics():
+    """Prometheus metrics exposition (authenticated; scraper needs a key)."""
+    from metrics import render_latest
+
+    return render_latest()
