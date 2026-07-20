@@ -13,6 +13,17 @@ from main import app
 from rate_limit import GlobalRateLimitMiddleware
 
 
+import pytest
+
+
+@pytest.fixture(autouse=True)
+def _freeze_rate_limit_clock(monkeypatch):
+    """Pin the window so multi-request tests are deterministic."""
+    import rate_limit
+
+    monkeypatch.setattr(rate_limit.time, "time", lambda: 1_000_000.0)
+
+
 def test_default_limit_enforced_per_ip(monkeypatch):
     GlobalRateLimitMiddleware.reset()
     client = TestClient(app)
