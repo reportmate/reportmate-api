@@ -34,6 +34,8 @@ from pydantic import BaseModel, ConfigDict, Field
 from slowapi import Limiter
 from slowapi.util import get_remote_address
 
+from oidc_auth import verify_oidc_bearer
+
 # Azure Web PubSub for real-time events
 try:
     from azure.messaging.webpubsubservice import WebPubSubServiceClient
@@ -473,6 +475,7 @@ async def verify_authentication(
     x_internal_secret: str = Header(None, alias="X-Internal-Secret"),
     x_ms_client_principal_id: str = Header(None, alias="X-MS-CLIENT-PRINCIPAL-ID"),
     x_api_key: str = Header(None, alias="X-API-Key"),
+    authorization: str = Header(None, alias="Authorization"),
     x_forwarded_for: str = Header(None, alias="X-Forwarded-For"),
     user_agent: str = Header(None, alias="User-Agent"),
 ):
@@ -486,7 +489,9 @@ async def verify_authentication(
        against production by ``assert_auth_enabled_for_prod`` at startup).
     1. Internal Secret: X-Internal-Secret (BFF/container-to-container) -- legacy, full access.
     2. Managed Identity: X-MS-CLIENT-PRINCIPAL-ID (Azure Easy Auth) -- legacy, full access.
-    3. API Key: X-API-Key (per-client, scope-limited) -- the only scoped credential.
+    3. API Key: X-API-Key (per-client, scope-limited).
+    3.5 OIDC bearer: Authorization: Bearer <jwt> (federated SSO, IdP-agnostic,
+       scope-limited via IdP roles) -- secretless; inert until configured.
     4. Passphrase: X-API-PASSPHRASE / X-Client-Passphrase (clients, functions) -- legacy, full access.
 
     Legacy credentials receive ALL scopes for backward compatibility; per-client
@@ -562,16 +567,32 @@ async def verify_authentication(
                 )
                 raise HTTPException(status_code=401, detail="Invalid API key")
 
-    # ---- Extension point: federated identity (provider-agnostic OIDC) -------
-    # A future bearer-token verifier slots in here, e.g.:
-    #     elif authorization and authorization.lower().startswith("bearer "):
-    #         auth = verify_oidc_bearer(authorization)
-    # It MUST be IdP-agnostic: validate against configurable issuer(s)/audience/
-    # JWKS (env OIDC_ISSUERS / OIDC_AUDIENCE / OIDC_JWKS_URI), supporting any
+    # Method 3.5: Federated identity -- provider-agnostic OIDC bearer token.
+    # Validates an Authorization: Bearer JWT against configurable issuer(s)/
+    # audience/JWKS (env OIDC_ISSUERS / OIDC_AUDIENCE / OIDC_JWKS_URI), for any
     # OIDC provider (Entra, Okta, Auth0, Keycloak, Google) and multiple issuers
-    # at once -- never hard-coded to one vendor. Map IdP claims/groups -> scopes
-    # so it flows through the same _enforce_scope gate below.
-    # -------------------------------------------------------------------------
+    # at once. The IdP proves identity by signature -- ReportMate stores no
+    # secret for this path. IdP roles/scopes map to ReportMate scopes and flow
+    # through the same _enforce_scope gate below. Inert until configured
+    # (ENABLE_OIDC_AUTH + issuers + audience), so this is purely additive.
+    elif authorization and authorization.lower().startswith("bearer "):
+        auth = verify_oidc_bearer(authorization, client_host=client_host)
+        if auth is None:
+            # Mirror the API-key fall-through: if another credential accompanies
+            # a rejected bearer, let it be considered; only hard-fail when the
+            # bearer token was the sole credential presented.
+            if x_api_passphrase or x_client_passphrase:
+                logger.warning(
+                    f"[WARN] Rejected bearer token from {user_agent} (IP: {client_host}) - "
+                    "falling back to accompanying passphrase credential"
+                )
+            else:
+                logger.warning(
+                    f"[ERR] Rejected bearer token from {user_agent} (IP: {client_host})"
+                )
+                raise HTTPException(
+                    status_code=401, detail="Invalid or unaccepted bearer token"
+                )
 
     # Method 4: Passphrase (Windows/macOS clients, alert functions) -- legacy, full access.
     # Note: `auth is None` (not elif) so a failed-but-accompanied API key above
