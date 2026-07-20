@@ -21,6 +21,7 @@ COPY main.py .
 COPY dependencies.py .
 COPY oidc_auth.py .
 COPY etag.py .
+COPY metrics.py .
 COPY pagination.py .
 COPY rate_limit.py .
 COPY routers/ ./routers/
