@@ -200,6 +200,60 @@ for _router_mod in (
 ):
     app.include_router(_router_mod.router, prefix="/api/v1")
 
+
+# ── OpenAPI: document the authentication schemes ───────────────
+# Auth is enforced by the verify_authentication dependency (not FastAPI's
+# security utilities), so the schemes don't auto-appear in the schema. Inject
+# them here so the published docs show integrators how to authenticate.
+def custom_openapi():
+    if app.openapi_schema:
+        return app.openapi_schema
+    from fastapi.openapi.utils import get_openapi
+
+    schema = get_openapi(
+        title=app.title,
+        version=app.version,
+        description=app.description,
+        routes=app.routes,
+        tags=app.openapi_tags,
+        contact=app.contact,
+        license_info=app.license_info,
+    )
+    schema.setdefault("components", {})["securitySchemes"] = {
+        "ApiKeyAuth": {
+            "type": "apiKey",
+            "in": "header",
+            "name": "X-API-Key",
+            "description": "Per-client scoped API key (`rm_<id>_<secret>`), "
+            "carrying read / ingest / admin scopes. Preferred.",
+        },
+        "ClientPassphrase": {
+            "type": "apiKey",
+            "in": "header",
+            "name": "X-Client-Passphrase",
+            "description": "Shared client passphrase (Windows/macOS agents; legacy).",
+        },
+        "BearerAuth": {
+            "type": "http",
+            "scheme": "bearer",
+            "bearerFormat": "JWT",
+            "description": "OIDC bearer token (provider-agnostic federated SSO).",
+        },
+    }
+    # Any one scheme authenticates a request. The health probes are public, but
+    # a top-level requirement is the accurate default for every other route.
+    schema["security"] = [
+        {"ApiKeyAuth": []},
+        {"ClientPassphrase": []},
+        {"BearerAuth": []},
+    ]
+    app.openapi_schema = schema
+    return schema
+
+
+app.openapi = custom_openapi
+
+
 # ── Root endpoint (unversioned) ────────────────────────────────
 @app.get("/", tags=["health"])
 async def root():
