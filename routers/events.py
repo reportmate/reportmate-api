@@ -13,7 +13,7 @@ from slowapi.util import get_remote_address
 
 from dependencies import (
     broadcast_event, cache_get, cache_set, get_db_connection,
-    invalidate_caches, limiter, load_sql, logger, paginate,
+    invalidate_caches, load_sql, logger, paginate,
     verify_authentication, VALID_MODULE_NAMES,
     infer_platform, build_os_summary,
     EventSubmission,
@@ -229,7 +229,6 @@ async def get_event_payload(event_id: int):
         raise HTTPException(status_code=500, detail=f"Failed to retrieve event payload: {str(e)}")
 
 @router.post("/events", dependencies=[Depends(verify_authentication)], tags=["events"])
-@limiter.limit("30/minute")
 async def submit_events(request: Request):
     """
     Submit device events and unified module data.
