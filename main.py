@@ -25,12 +25,12 @@ from rate_limit import GlobalRateLimitMiddleware
 from dependencies import (
     assert_auth_enabled_for_prod,
     close_db_pool,
-    get_db_connection,
     limiter,
     logger,
     preload_sql_queries,
     request_id_var,
 )
+from migrations import run_migrations
 from routers import (
     admin,
     api_keys,
@@ -48,14 +48,21 @@ preload_sql_queries()
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Application lifespan: ensure performance indexes on startup.
+    """Application lifespan: bring the schema to head on startup.
 
-    ``_ensure_performance_indexes`` is defined further down in this module and
-    is resolved at call time (startup), so it does not need to precede the app.
+    Runs Alembic migrations (versioned, idempotent) before serving traffic,
+    replacing the former ad-hoc startup DDL. Migration failure is logged but
+    non-fatal so the app can still start (and serve reads) if a migration
+    cannot be applied — the readiness probe remains the source of truth for
+    whether the database is usable.
     """
     # Refuse to boot with authentication disabled in a production deployment.
     assert_auth_enabled_for_prod()
-    _ensure_performance_indexes()
+    try:
+        run_migrations()
+        logger.info("[STARTUP] Database migrations at head")
+    except Exception as e:
+        logger.error(f"[STARTUP] Migrations failed: {e}")
     yield
     # Drain the connection pool on shutdown.
     close_db_pool()
@@ -215,123 +222,6 @@ async def root():
             "dashboard": "/api/v1/dashboard",
         },
     }
-
-
-# ── Startup: ensure performance indexes ────────────────────────
-_indexes_ensured = False
-
-
-def _ensure_performance_indexes():
-    """Create indexes needed for fast dashboard queries (idempotent).
-
-    Invoked from the lifespan handler on startup.
-    """
-    global _indexes_ensured
-    if _indexes_ensured:
-        return
-    try:
-        conn = get_db_connection()
-        cursor = conn.cursor()
-        for stmt in [
-            "CREATE INDEX IF NOT EXISTS idx_events_timestamp_desc ON events(timestamp DESC)",
-            "CREATE INDEX IF NOT EXISTS idx_events_device_id ON events(device_id)",
-            "CREATE INDEX IF NOT EXISTS idx_installs_device_id ON installs(device_id)",
-            "CREATE INDEX IF NOT EXISTS idx_inventory_device_id ON inventory(device_id)",
-            "CREATE INDEX IF NOT EXISTS idx_system_device_id ON system(device_id)",
-            "CREATE INDEX IF NOT EXISTS idx_hardware_device_id ON hardware(device_id)",
-            "CREATE INDEX IF NOT EXISTS idx_network_device_id ON network(device_id)",
-            "CREATE INDEX IF NOT EXISTS idx_devices_serial ON devices(serial_number)",
-            "CREATE INDEX IF NOT EXISTS idx_devices_archived ON devices(archived)",
-            # usage_history table + indexes (migration 009)
-            """CREATE TABLE IF NOT EXISTS usage_history (
-                id BIGSERIAL PRIMARY KEY,
-                device_id TEXT NOT NULL,
-                date DATE NOT NULL,
-                app_name TEXT NOT NULL,
-                publisher TEXT NOT NULL DEFAULT '',
-                launches INTEGER NOT NULL DEFAULT 0,
-                total_seconds DOUBLE PRECISION NOT NULL DEFAULT 0,
-                active_seconds DOUBLE PRECISION NOT NULL DEFAULT 0,
-                foreground_seconds DOUBLE PRECISION NOT NULL DEFAULT 0,
-                users JSONB NOT NULL DEFAULT '[]'::jsonb,
-                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-                UNIQUE(device_id, date, app_name)
-            )""",
-            # Backfill active_seconds/foreground_seconds on databases whose
-            # usage_history predates them. The events ingest INSERTs these
-            # columns; without them every daily usage write fails with
-            # 'column ... does not exist' (non-fatal, but loses utilization data).
-            # Idempotency-Key replay guard for POST /events (migration 013)
-            "CREATE TABLE IF NOT EXISTS idempotency_keys (key TEXT PRIMARY KEY, device_id TEXT, first_seen TIMESTAMPTZ NOT NULL DEFAULT NOW())",
-            "CREATE INDEX IF NOT EXISTS idx_idempotency_first_seen ON idempotency_keys(first_seen)",
-            "ALTER TABLE usage_history ADD COLUMN IF NOT EXISTS active_seconds DOUBLE PRECISION NOT NULL DEFAULT 0",
-            "ALTER TABLE usage_history ADD COLUMN IF NOT EXISTS foreground_seconds DOUBLE PRECISION NOT NULL DEFAULT 0",
-            # app_settings table (migration 011) — server-side settings store
-            """CREATE TABLE IF NOT EXISTS app_settings (
-                id BIGSERIAL PRIMARY KEY,
-                scope TEXT NOT NULL DEFAULT 'org',
-                principal TEXT NOT NULL DEFAULT '',
-                value JSONB NOT NULL DEFAULT '{}'::jsonb,
-                schema_version INTEGER NOT NULL DEFAULT 1,
-                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-                updated_by TEXT,
-                UNIQUE(scope, principal)
-            )""",
-            # api_keys table (migration 012) — per-client scoped credentials.
-            # Only the sha256 hash of the secret is stored, never the secret.
-            """CREATE TABLE IF NOT EXISTS api_keys (
-                id TEXT PRIMARY KEY,
-                client_id TEXT NOT NULL,
-                key_hash TEXT NOT NULL,
-                scopes JSONB NOT NULL DEFAULT '[]'::jsonb,
-                active BOOLEAN NOT NULL DEFAULT TRUE,
-                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-                created_by TEXT,
-                last_used TIMESTAMPTZ
-            )""",
-            "CREATE INDEX IF NOT EXISTS idx_api_keys_active ON api_keys(active)",
-            # api_key_audit table — append-only log of key mgmt + auth events.
-            """CREATE TABLE IF NOT EXISTS api_key_audit (
-                id BIGSERIAL PRIMARY KEY,
-                key_id TEXT,
-                action TEXT NOT NULL,
-                actor TEXT,
-                detail JSONB NOT NULL DEFAULT '{}'::jsonb,
-                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-            )""",
-            "CREATE INDEX IF NOT EXISTS idx_api_key_audit_key ON api_key_audit(key_id, created_at DESC)",
-            "CREATE INDEX IF NOT EXISTS idx_usage_history_device_date ON usage_history(device_id, date DESC)",
-            "CREATE INDEX IF NOT EXISTS idx_usage_history_app_date ON usage_history(app_name, date DESC)",
-            "CREATE INDEX IF NOT EXISTS idx_usage_history_date ON usage_history(date)",
-            # Module tables missing indexes
-            "CREATE INDEX IF NOT EXISTS idx_security_device_id ON security(device_id)",
-            "CREATE INDEX IF NOT EXISTS idx_profiles_device_id ON profiles(device_id)",
-            "CREATE INDEX IF NOT EXISTS idx_management_device_id ON management(device_id)",
-            "CREATE INDEX IF NOT EXISTS idx_applications_device_id ON applications(device_id)",
-            "CREATE INDEX IF NOT EXISTS idx_applications_data_gin ON applications USING gin(data)",
-            "CREATE INDEX IF NOT EXISTS idx_peripherals_device_id ON peripherals(device_id)",
-            "CREATE INDEX IF NOT EXISTS idx_identity_device_id ON identity(device_id)",
-            # Composite indexes for DISTINCT ON ... ORDER BY updated_at DESC pattern
-            "CREATE INDEX IF NOT EXISTS idx_applications_device_updated ON applications(device_id, updated_at DESC)",
-            "CREATE INDEX IF NOT EXISTS idx_installs_device_updated ON installs(device_id, updated_at DESC)",
-            "CREATE INDEX IF NOT EXISTS idx_security_device_updated ON security(device_id, updated_at DESC)",
-            "CREATE INDEX IF NOT EXISTS idx_hardware_device_updated ON hardware(device_id, updated_at DESC)",
-            "CREATE INDEX IF NOT EXISTS idx_network_device_updated ON network(device_id, updated_at DESC)",
-            "CREATE INDEX IF NOT EXISTS idx_management_device_updated ON management(device_id, updated_at DESC)",
-            "CREATE INDEX IF NOT EXISTS idx_profiles_device_updated ON profiles(device_id, updated_at DESC)",
-            "CREATE INDEX IF NOT EXISTS idx_system_device_updated ON system(device_id, updated_at DESC)",
-            "CREATE INDEX IF NOT EXISTS idx_inventory_device_updated ON inventory(device_id, updated_at DESC)",
-        ]:
-            try:
-                cursor.execute(stmt)
-            except Exception:
-                pass  # Index may already exist or table may not exist yet
-        conn.commit()
-        conn.close()
-        _indexes_ensured = True
-        logger.info("[STARTUP] Performance indexes ensured")
-    except Exception as e:
-        logger.warning(f"[STARTUP] Could not ensure indexes: {e}")
 
 
 # ── Error handlers ─────────────────────────────────────────────

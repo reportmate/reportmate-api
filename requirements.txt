@@ -8,3 +8,5 @@ azure-messaging-webpubsubservice>=1.0.0
 slowapi>=0.1.9
 PyJWT[crypto]>=2.8.0
 prometheus-client>=0.20
+alembic>=1.13
+sqlalchemy>=2.0
