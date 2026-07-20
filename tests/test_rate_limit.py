@@ -68,3 +68,16 @@ def test_429_carries_retry_information():
         or "error" in resp.json()
         or "detail" in resp.json()
     )
+
+
+def test_no_per_route_slowapi_limit_on_ingestion():
+    # The slowapi per-route limit on POST /events keyed on the ingress
+    # connection IP (get_remote_address), not the client — collapsing the
+    # whole fleet into ~2 shared buckets and mass-429'ing legitimate device
+    # check-ins. It was removed; the global XFF-keyed middleware is the only
+    # ingestion limiter now. No slowapi per-route limits should remain.
+    import main  # noqa: F401 - registers routes
+
+    from dependencies import limiter
+
+    assert getattr(limiter, "_route_limits", {}) == {}
