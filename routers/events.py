@@ -555,6 +555,7 @@ async def submit_events(request: Request):
                                     logger.info(f"Updated OS info for device {serial_number}: {os_name} {os_version}")
                         except Exception as os_update_error:
                             logger.error(f"Failed to update OS info for device {serial_number}: {os_update_error}")
+                            conn.rollback()
                     
                 except Exception as module_error:
                     logger.error(f"Failed to store {module_name} module: {module_error}")
@@ -621,6 +622,7 @@ async def submit_events(request: Request):
                     logger.info(f"Updated device name for {serial_number}: {device_name.strip()}")
         except Exception as name_error:
             logger.error(f"Failed to update device name for {serial_number}: {name_error}")
+            conn.rollback()
         
         # 3. Store events from payload with validation
         events_stored = 0
@@ -696,6 +698,7 @@ async def submit_events(request: Request):
                 
             except Exception as event_error:
                 logger.error(f"Failed to store event: {event_error}")
+                conn.rollback()
                 continue
         
         # 4. ONLY create a system event if NO events were sent in payload
@@ -742,6 +745,7 @@ async def submit_events(request: Request):
                     logger.warning(f"Failed to broadcast fallback event: {broadcast_error}")
             except Exception as system_event_error:
                 logger.error(f"Failed to create system event: {system_event_error}")
+                conn.rollback()
         elif has_installs_module and events_stored == 0:
             logger.warning(f"[WARN] INSTALLS MODULE PRESENT but NO events sent - this should not happen! Device: {serial_number}")
         else:
