@@ -101,6 +101,84 @@ def test_connection_is_reused_after_close(pooled):
     assert len(seen) == 1
 
 
+@pytest.fixture
+def fake_pg8000(monkeypatch):
+    """Drive the pool with fake connections so failover can be tested without a
+    live database. Yields the list of physical connections the pool created."""
+    created = []
+
+    class _FakeCursor:
+        def __init__(self, conn):
+            self._c = conn
+
+        def execute(self, sql, *args, **kwargs):
+            # A "dropped" connection fails every query until a fresh physical
+            # connection is made — the same shape as an Azure NAT idle-drop.
+            if self._c.dead:
+                raise OSError("cannot read from timed out object")
+            self._c.last = sql
+
+        def fetchone(self):
+            return (1,)
+
+        def close(self):
+            pass
+
+    class _FakeConn:
+        def __init__(self):
+            self.dead = False
+            self.autocommit = False
+            self._usock = None  # keepalive helper no-ops on this
+            self.last = None
+
+        def cursor(self):
+            return _FakeCursor(self)
+
+        def close(self):
+            pass
+
+        def commit(self):
+            pass
+
+        def rollback(self):
+            if self.dead:
+                raise OSError("cannot read from timed out object")
+
+    def _connect(**kwargs):
+        conn = _FakeConn()
+        created.append(conn)
+        return conn
+
+    monkeypatch.setattr(dependencies.pg8000, "connect", _connect)
+    monkeypatch.setenv("DB_SSL", "false")
+    monkeypatch.setattr(dependencies, "DATABASE_URL", "postgresql://u:p@h:5432/db")
+    monkeypatch.setattr(dependencies, "_DB_POOL_MIN", 1)
+    monkeypatch.setattr(dependencies, "_DB_POOL_MAX", 3)
+    dependencies.close_db_pool()
+    yield created
+    dependencies.close_db_pool()
+
+
+def test_stale_pooled_connection_reconnects_transparently(fake_pg8000):
+    # Regression for the recurring "database unavailable" outage: a pooled
+    # connection whose TCP flow was silently dropped (NAT idle timeout) must be
+    # transparently reconnected on borrow rather than surfacing the raw
+    # "cannot read from timed out object" OSError. The guard is OSError being in
+    # the pool's `failures` set; `ping=1` alone does not help because pg8000 has
+    # no ping() for DBUtils to call.
+    created = fake_pg8000
+    conn = dependencies.get_db_connection()
+    created[0].dead = True  # simulate the idle-dropped socket
+
+    cur = conn.cursor()
+    cur.execute("SELECT 1")  # must reconnect + retry, not raise
+    assert cur.fetchone()[0] == 1
+    assert len(created) > 1, "pool did not create a fresh connection"
+    assert created[-1].dead is False
+    cur.close()
+    conn.close()
+
+
 @integration
 def test_open_transaction_is_reset_on_return(pooled):
     # A borrower that leaves a transaction open (reset=True) must not leak that
