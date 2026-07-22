@@ -20,6 +20,7 @@ import logging
 import os
 import re
 import secrets
+import socket
 import threading
 import time as _time
 from datetime import datetime, timezone, timedelta
@@ -709,6 +710,39 @@ _pool_url = None
 _pool_lock = threading.Lock()
 
 
+def _enable_tcp_keepalive(conn):
+    """Keep idle pooled sockets alive under the Azure NAT gateway idle timeout.
+
+    A pooled connection that sits idle longer than the NAT gateway's flow idle
+    timeout (default ~4 min) has its TCP flow silently dropped; the next borrow
+    then fails with ``OSError: cannot read from timed out object`` deep inside
+    pg8000. Enabling OS keepalives with probes starting well under that window
+    keeps the flow warm so it is not dropped in the first place.
+
+    Best-effort: this reaches for pg8000's private socket and the keepalive
+    knobs are platform-specific (TCP_KEEPIDLE et al. are Linux; absent on
+    macOS). Any failure here is non-fatal — the pool's ``failures`` reconnect
+    (see ``_get_pool``) still recovers a dropped socket on next use.
+    """
+    sock = getattr(conn, "_usock", None)
+    if sock is None:
+        return
+    try:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+        # Probe after 60s idle, every 30s, drop after 3 failures — all under the
+        # ~240s NAT idle window so an idle pooled connection stays established.
+        for opt_name, value in (
+            ("TCP_KEEPIDLE", 60),
+            ("TCP_KEEPINTVL", 30),
+            ("TCP_KEEPCNT", 3),
+        ):
+            opt = getattr(socket, opt_name, None)
+            if opt is not None:
+                sock.setsockopt(socket.IPPROTO_TCP, opt, value)
+    except OSError as e:  # pragma: no cover - platform-dependent, non-fatal
+        logger.debug(f"TCP keepalive setup skipped: {e}")
+
+
 def _get_pool():
     global _pool, _pool_url
     if _pool is not None and _pool_url == DATABASE_URL:
@@ -727,12 +761,18 @@ def _get_pool():
             # reset. The connection is handed back with autocommit off so the
             # routers keep their explicit commit/rollback semantics.
             conn = pg8000.connect(**kwargs)
+            _enable_tcp_keepalive(conn)
             conn.autocommit = True
             cur = conn.cursor()
             cur.execute("SET statement_timeout TO '120s'")
             cur.close()
             conn.autocommit = False
             return conn
+
+        # Name the DB-API module explicitly so DBUtils uses pg8000's own
+        # threadsafety and exception classes instead of inferring them from a
+        # returned connection object.
+        _creator.dbapi = pg8000
 
         logger.info(
             f"Building DB pool: {kwargs['host']}:{kwargs['port']}/{kwargs['database']} "
@@ -745,7 +785,22 @@ def _get_pool():
             maxcached=_DB_POOL_MAX,
             maxconnections=_DB_POOL_MAX,
             blocking=True,  # wait for a free connection instead of erroring
-            ping=1,  # validate/reconnect a connection when it is borrowed
+            # ping=1 is ineffective with pg8000: DBUtils calls conn.ping(),
+            # which pg8000 does not implement, so it disables the check after the
+            # first attempt and stale connections are handed out unvalidated.
+            # The real guard is `failures` below: a dropped socket surfaces as a
+            # bare OSError ("cannot read from timed out object") which is NOT in
+            # SteadyDB's default failover set (OperationalError/InterfaceError/
+            # InternalError), so without listing it here a NAT idle-drop poisons
+            # the pooled connection until the container restarts. Including
+            # OSError lets SteadyDB transparently reconnect and retry on borrow.
+            ping=1,
+            failures=(
+                pg8000.InterfaceError,
+                pg8000.OperationalError,
+                pg8000.InternalError,
+                OSError,
+            ),
             reset=True,  # rollback any open transaction on return to the pool
         )
         _pool_url = DATABASE_URL
