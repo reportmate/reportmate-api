@@ -17,9 +17,28 @@ from dependencies import (
     verify_authentication, VALID_MODULE_NAMES,
     infer_platform, build_os_summary,
     EventSubmission,
+    extract_ingest_identity, record_ingest_failure,
 )
 
 router = APIRouter(tags=["events"])
+
+
+def _reject_ingest(request: Request, payload, *, reason: str, detail: str,
+                   status_code: int = 400):
+    """Persist a rejected check-in with whatever identity it presented, then
+    raise the HTTP error. The device failed validation, but it still told us
+    who it is -- that is exactly what /events/failures exists to surface."""
+    record_ingest_failure(
+        failure_type="validation",
+        reason=reason,
+        status_code=status_code,
+        detail=detail,
+        endpoint=request.url.path,
+        client_ip=request.client.host if request.client else None,
+        user_agent=request.headers.get("user-agent"),
+        identity=extract_ingest_identity(payload),
+    )
+    raise HTTPException(status_code=status_code, detail=detail)
 
 @router.get("/events", dependencies=[Depends(verify_authentication)], tags=["events"])
 async def get_events(
@@ -134,6 +153,101 @@ async def get_events(
     except Exception as e:
         logger.error(f"Failed to get events: {e}")
         raise HTTPException(status_code=500, detail=f"Failed to retrieve events: {str(e)}")
+
+@router.get("/events/failures", dependencies=[Depends(verify_authentication)], tags=["events"])
+async def get_ingest_failures(
+    limit: int = Query(default=100, ge=1, le=1000, description="Maximum number of failures to return"),
+    offset: int = Query(default=0, ge=0, description="Number of failures to skip (for pagination)"),
+    serial: Optional[str] = Query(default=None, description="Filter by serial number (case-insensitive substring)"),
+    reason: Optional[str] = Query(default=None, description="Filter by rejection reason code"),
+    hours: int = Query(default=168, ge=1, le=2160, description="Look-back window in hours (default 7 days)"),
+):
+    """
+    Rejected device check-ins (failed registrations).
+
+    Every device request that was turned away -- bad or missing credentials,
+    malformed payload, invalid serial -- is recorded with whatever identity
+    the device presented. This answers "the client was installed but the
+    device never appeared": if the machine reached the server at all, it is
+    listed here with the reason it was rejected.
+
+    Reason codes: auth -> invalid_passphrase, invalid_api_key,
+    invalid_bearer_token, invalid_internal_secret, missing_credentials,
+    insufficient_scope; validation -> malformed_json, invalid_payload,
+    empty_serial, sentinel_serial, short_serial, hostname_serial,
+    letters_only_serial.
+    """
+    try:
+        _ckey = (limit, offset, serial or '', reason or '', hours)
+        _cached = cache_get("events_failures", _ckey)
+        if _cached is not None:
+            return _cached
+        conn = get_db_connection()
+        cursor = conn.cursor()
+
+        filter_params = {"hours": hours, "serial": serial, "reason": reason}
+        cursor.execute(load_sql("events/count_ingest_failures"), filter_params)
+        total = cursor.fetchone()[0]
+
+        cursor.execute(
+            load_sql("events/summary_ingest_failures"),
+            {"hours": hours, "serial": serial},
+        )
+        summary = [
+            {
+                "reason": row[0],
+                "count": row[1],
+                "devices": row[2],
+                "lastSeen": row[3].isoformat() if row[3] else None,
+            }
+            for row in cursor.fetchall()
+        ]
+
+        cursor.execute(
+            load_sql("events/list_ingest_failures"),
+            {**filter_params, "limit": limit, "offset": offset},
+        )
+        rows = cursor.fetchall()
+        conn.close()
+
+        failures = []
+        for row in rows:
+            (fid, occurred_at, failure_type, fail_reason, detail, status_code,
+             endpoint, client_ip, user_agent, serial_number, device_uuid,
+             device_name, platform, client_version) = row
+            failures.append({
+                "id": fid,
+                "ts": occurred_at.isoformat() if occurred_at else None,
+                "failureType": failure_type,
+                "reason": fail_reason,
+                "detail": detail,
+                "statusCode": status_code,
+                "endpoint": endpoint,
+                "clientIp": client_ip,
+                "userAgent": user_agent,
+                "serialNumber": serial_number,
+                "deviceUuid": device_uuid,
+                "deviceName": device_name,
+                "platform": platform,
+                "clientVersion": client_version,
+            })
+
+        _result = {
+            "success": True,
+            "failures": failures,
+            "summary": summary,
+            "total": total,
+            "count": len(failures),
+            "limit": limit,
+            "offset": offset,
+            "hours": hours,
+        }
+        cache_set("events_failures", _result, _ckey)
+        return _result
+
+    except Exception as e:
+        logger.error(f"Failed to get ingest failures: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to retrieve ingest failures: {str(e)}")
 
 @router.get("/events/{event_id}/payload", dependencies=[Depends(verify_authentication)], tags=["events"])
 async def get_event_payload(event_id: int):
@@ -257,13 +371,25 @@ async def submit_events(request: Request):
     }
     """
     try:
-        payload = await request.json()
-        
+        try:
+            payload = await request.json()
+        except Exception:
+            _reject_ingest(
+                request, None,
+                reason="malformed_json",
+                detail="Request body is not valid JSON",
+            )
+
         # Validate top-level structure via Pydantic
         try:
             submission = EventSubmission.model_validate(payload)
         except Exception as validation_err:
-            raise HTTPException(status_code=422, detail=f"Invalid payload: {validation_err}")
+            _reject_ingest(
+                request, payload,
+                reason="invalid_payload",
+                status_code=422,
+                detail=f"Invalid payload: {validation_err}",
+            )
         
         # Extract metadata - support both snake_case and camelCase for Windows client compatibility
         meta = submission.metadata
@@ -279,9 +405,10 @@ async def submit_events(request: Request):
         # This prevents database pollution from client bugs and crafted payloads.
         # A real `-1` device in prod is what motivated the sentinel block below.
         if not serial_number or not serial_number.strip():
-            raise HTTPException(
-                status_code=400,
-                detail="Invalid serial number: empty or whitespace-only."
+            _reject_ingest(
+                request, payload,
+                reason="empty_serial",
+                detail="Invalid serial number: empty or whitespace-only.",
             )
 
         normalized = serial_number.strip().lower()
@@ -295,9 +422,10 @@ async def submit_events(request: Request):
         }
         if normalized in SENTINEL_SERIALS:
             logger.error(f"Rejected device registration: serial_number '{serial_number}' is a known sentinel value")
-            raise HTTPException(
-                status_code=400,
-                detail=f"Invalid serial number: '{serial_number}' is a sentinel/placeholder value. Device must provide a real hardware serial number."
+            _reject_ingest(
+                request, payload,
+                reason="sentinel_serial",
+                detail=f"Invalid serial number: '{serial_number}' is a sentinel/placeholder value. Device must provide a real hardware serial number.",
             )
 
         # Real hardware serials are typically 6+ chars. Reject pure-numeric serials
@@ -305,9 +433,10 @@ async def submit_events(request: Request):
         bare = serial_number.lstrip('-')
         if bare.isdigit() and len(bare) < 4:
             logger.error(f"Rejected device registration: serial_number '{serial_number}' is too short / numeric-only")
-            raise HTTPException(
-                status_code=400,
-                detail=f"Invalid serial number: '{serial_number}' is too short to be a real hardware serial."
+            _reject_ingest(
+                request, payload,
+                reason="short_serial",
+                detail=f"Invalid serial number: '{serial_number}' is too short to be a real hardware serial.",
             )
 
         hostname_patterns = [
@@ -322,18 +451,20 @@ async def submit_events(request: Request):
         for pattern in hostname_patterns:
             if re.match(pattern, serial_number, re.IGNORECASE):
                 logger.error(f"Rejected device registration: serial_number '{serial_number}' matches hostname pattern '{pattern}'")
-                raise HTTPException(
-                    status_code=400,
-                    detail=f"Invalid serial number: '{serial_number}' appears to be a hostname. Device must provide hardware serial number (BIOS/chassis serial)."
+                _reject_ingest(
+                    request, payload,
+                    reason="hostname_serial",
+                    detail=f"Invalid serial number: '{serial_number}' appears to be a hostname. Device must provide hardware serial number (BIOS/chassis serial).",
                 )
 
         # Additional validation: Serial numbers should not contain only letters and hyphens
         # Real serials usually have numbers
         if serial_number.replace('-', '').isalpha():
             logger.error(f"Rejected device registration: serial_number '{serial_number}' contains only letters (likely a hostname)")
-            raise HTTPException(
-                status_code=400,
-                detail=f"Invalid serial number: '{serial_number}' contains only letters and appears to be a hostname. Device must provide hardware serial number."
+            _reject_ingest(
+                request, payload,
+                reason="letters_only_serial",
+                detail=f"Invalid serial number: '{serial_number}' contains only letters and appears to be a hostname. Device must provide hardware serial number.",
             )
         
         logger.info(f"Processing unified payload for device {serial_number} (UUID: {device_uuid})")
