@@ -18,6 +18,7 @@ import hmac
 import json
 import logging
 import os
+import random
 import re
 import secrets
 import socket
@@ -102,6 +103,7 @@ _CACHE_TTL: dict = {
     "system": 30,
     "inventory": 30,
     "events": 15,
+    "events_failures": 15,
     "settings": 30,
 }
 
@@ -208,6 +210,9 @@ def preload_sql_queries():
         "events/list_events",
         "events/get_device_events",
         "events/get_event_payload",
+        "events/list_ingest_failures",
+        "events/count_ingest_failures",
+        "events/summary_ingest_failures",
         "admin/archive_device",
         "admin/unarchive_device",
         "admin/get_device_for_delete",
@@ -475,6 +480,195 @@ def audit_api_key(key_id, action: str, actor=None, detail=None) -> None:
         logger.error(f"API key audit write failed ({action} {key_id}): {e}")
 
 
+# ---------------------------------------------------------------------------
+# Ingest failure recording
+# ---------------------------------------------------------------------------
+#
+# A device that fails auth or payload validation still told us exactly who it
+# is -- the client sends serial/UUID/hostname alongside its credentials in the
+# same request. Persisting rejections makes "machine X is trying to check in
+# but being turned away" visible in the product (GET /api/v1/events/failures)
+# instead of only in container stdout. Best-effort by design: recording must
+# never break or slow the rejection path, so every error here is swallowed
+# after a log line. No FK to devices -- a rejected machine is typically not
+# registered yet, which is the whole point of recording it.
+
+INGEST_FAILURES_RETENTION_DAYS = int(
+    os.getenv("INGEST_FAILURES_RETENTION_DAYS", "30")
+)
+# Hard row cap so the table stays bounded even under a fleet-wide outage or a
+# scanner flood; oldest rows beyond the cap are trimmed on the purge cycle.
+INGEST_FAILURES_MAX_ROWS = int(os.getenv("INGEST_FAILURES_MAX_ROWS", "50000"))
+# A device retrying in a loop produces identical failures; collapse repeats of
+# the same (serial, reason, ip) within this window into the first row.
+INGEST_FAILURES_DEDUP_MINUTES = int(os.getenv("INGEST_FAILURES_DEDUP_MINUTES", "15"))
+
+_INGEST_IDENTITY_FIELDS = (
+    "serial_number",
+    "device_uuid",
+    "device_name",
+    "platform",
+    "client_version",
+)
+
+
+def extract_ingest_identity(payload) -> Dict[str, Optional[str]]:
+    """Best-effort device identity from a (possibly malformed) ingest payload.
+
+    Accepts the parsed payload dict, raw request bytes, or None. Never raises.
+    """
+    identity: Dict[str, Optional[str]] = {f: None for f in _INGEST_IDENTITY_FIELDS}
+    try:
+        if isinstance(payload, (bytes, bytearray)):
+            payload = json.loads(payload)
+        if not isinstance(payload, dict):
+            return identity
+        meta = payload.get("metadata")
+        if not isinstance(meta, dict):
+            return identity
+        identity["serial_number"] = meta.get("serialNumber") or meta.get("serial_number")
+        identity["device_uuid"] = meta.get("deviceId") or meta.get("device_id")
+        identity["platform"] = meta.get("platform")
+        identity["client_version"] = meta.get("clientVersion") or meta.get("client_version")
+        additional = meta.get("additional")
+        if isinstance(additional, dict):
+            identity["device_name"] = additional.get("deviceName") or additional.get("device_name")
+    except Exception:
+        pass
+    return {
+        k: (str(v)[:255] if v not in (None, "") else None)
+        for k, v in identity.items()
+    }
+
+
+def record_ingest_failure(
+    *,
+    failure_type: str,
+    reason: str,
+    status_code: Optional[int] = None,
+    detail: Optional[str] = None,
+    endpoint: Optional[str] = None,
+    client_ip: Optional[str] = None,
+    user_agent: Optional[str] = None,
+    identity: Optional[Dict[str, Optional[str]]] = None,
+) -> None:
+    """Persist one rejected check-in to ingest_failures. Never raises."""
+    try:
+        ident = identity or {}
+        conn = get_db_connection()
+        inserted = False
+        try:
+            cursor = conn.cursor()
+            # Burst guard: a client retrying in a loop (or a scanner hammering
+            # the endpoint) repeats the same failure -- keep the first row per
+            # (serial, reason, ip) per dedup window instead of one per attempt.
+            cursor.execute(
+                """INSERT INTO ingest_failures
+                       (failure_type, reason, status_code, detail, endpoint,
+                        client_ip, user_agent, serial_number, device_uuid,
+                        device_name, platform, client_version)
+                   SELECT %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
+                   WHERE NOT EXISTS (
+                       SELECT 1 FROM ingest_failures
+                       WHERE reason = %s
+                         AND serial_number IS NOT DISTINCT FROM %s
+                         AND client_ip IS NOT DISTINCT FROM %s
+                         AND occurred_at > NOW() - make_interval(mins => %s)
+                   )
+                   RETURNING id""",
+                (
+                    failure_type[:20],
+                    reason[:50],
+                    status_code,
+                    (detail or "")[:2000] or None,
+                    (endpoint or "")[:200] or None,
+                    (client_ip or "")[:64] or None,
+                    (user_agent or "")[:400] or None,
+                    ident.get("serial_number"),
+                    ident.get("device_uuid"),
+                    ident.get("device_name"),
+                    ident.get("platform"),
+                    ident.get("client_version"),
+                    reason[:50],
+                    ident.get("serial_number"),
+                    (client_ip or "")[:64] or None,
+                    INGEST_FAILURES_DEDUP_MINUTES,
+                ),
+            )
+            inserted = cursor.fetchone() is not None
+            # Opportunistic purge, same pattern as the events table: age out
+            # old rows AND trim to a hard cap so the table stays bounded even
+            # under a fleet-wide outage.
+            if random.random() < 0.02:
+                cursor.execute(
+                    "DELETE FROM ingest_failures"
+                    " WHERE occurred_at < NOW() - make_interval(days => %s)",
+                    (INGEST_FAILURES_RETENTION_DAYS,),
+                )
+                cursor.execute(
+                    """DELETE FROM ingest_failures
+                       WHERE id <= COALESCE((
+                           SELECT id FROM ingest_failures
+                           ORDER BY id DESC
+                           OFFSET %s LIMIT 1
+                       ), 0)""",
+                    (INGEST_FAILURES_MAX_ROWS,),
+                )
+            conn.commit()
+        finally:
+            conn.close()
+        if inserted:
+            logger.info(
+                f"[INGEST-FAILURE] Recorded {failure_type}/{reason} "
+                f"(serial={ident.get('serial_number')}, ip={client_ip})"
+            )
+    except Exception as e:
+        logger.warning(f"[INGEST-FAILURE] Could not record {failure_type}/{reason}: {e}")
+
+
+def _is_ingest_request(request: Request) -> bool:
+    return request.method == "POST" and request.url.path.rstrip("/").endswith("/events")
+
+
+async def _record_auth_failure(
+    request: Request,
+    *,
+    reason: str,
+    status_code: int,
+    detail: str,
+    user_agent: Optional[str],
+) -> None:
+    """Record an auth rejection worth surfacing. Never raises.
+
+    Ingest POSTs are always recorded -- that is a device trying to check in,
+    and its body carries the identity of the machine that failed. Other
+    endpoints are recorded only when the caller presented a device-style
+    credential (wrong passphrase / API key), so unauthenticated scanner
+    probes of GET endpoints don't flood the table.
+    """
+    try:
+        is_ingest = _is_ingest_request(request)
+        if not is_ingest and reason not in ("invalid_passphrase", "invalid_api_key"):
+            return
+        identity = None
+        if is_ingest:
+            body = await request.body()
+            if body:
+                identity = extract_ingest_identity(body)
+        record_ingest_failure(
+            failure_type="auth",
+            reason=reason,
+            status_code=status_code,
+            detail=detail,
+            endpoint=request.url.path,
+            client_ip=request.client.host if request.client else None,
+            user_agent=user_agent,
+            identity=identity,
+        )
+    except Exception as e:
+        logger.warning(f"[INGEST-FAILURE] Auth-failure recording skipped: {e}")
+
+
 async def verify_authentication(
     request: Request,
     x_api_passphrase: str = Header(None, alias="X-API-PASSPHRASE"),
@@ -531,6 +725,13 @@ async def verify_authentication(
             logger.warning(
                 f"[ERR] Invalid internal secret attempt from {user_agent} (IP: {client_host})"
             )
+            await _record_auth_failure(
+                request,
+                reason="invalid_internal_secret",
+                status_code=401,
+                detail="X-Internal-Secret did not match",
+                user_agent=user_agent,
+            )
             raise HTTPException(
                 status_code=401, detail="Invalid internal authentication credentials"
             )
@@ -572,6 +773,13 @@ async def verify_authentication(
                 logger.warning(
                     f"[ERR] Invalid API key attempt from {user_agent} (IP: {client_host})"
                 )
+                await _record_auth_failure(
+                    request,
+                    reason="invalid_api_key",
+                    status_code=401,
+                    detail="X-API-Key was not recognized (sole credential presented)",
+                    user_agent=user_agent,
+                )
                 raise HTTPException(status_code=401, detail="Invalid API key")
 
     # Method 3.5: Federated identity -- provider-agnostic OIDC bearer token.
@@ -597,6 +805,13 @@ async def verify_authentication(
                 logger.warning(
                     f"[ERR] Rejected bearer token from {user_agent} (IP: {client_host})"
                 )
+                await _record_auth_failure(
+                    request,
+                    reason="invalid_bearer_token",
+                    status_code=401,
+                    detail="Bearer token was rejected (sole credential presented)",
+                    user_agent=user_agent,
+                )
                 raise HTTPException(
                     status_code=401, detail="Invalid or unaccepted bearer token"
                 )
@@ -617,6 +832,13 @@ async def verify_authentication(
             logger.warning(
                 f"[ERR] Invalid passphrase attempt from {user_agent} (IP: {client_host})"
             )
+            await _record_auth_failure(
+                request,
+                reason="invalid_passphrase",
+                status_code=401,
+                detail="Client passphrase did not match",
+                user_agent=user_agent,
+            )
             raise HTTPException(
                 status_code=401, detail="Invalid authentication credentials"
             )
@@ -635,13 +857,30 @@ async def verify_authentication(
         logger.warning(
             f"[ERR] Unauthenticated access attempt from {user_agent} (IP: {client_host}, X-Forwarded-For: {x_forwarded_for})"
         )
+        await _record_auth_failure(
+            request,
+            reason="missing_credentials",
+            status_code=401,
+            detail="No credentials presented (client likely has no passphrase/API key configured)",
+            user_agent=user_agent,
+        )
         raise HTTPException(
             status_code=401,
             detail="Authentication required. Supply X-API-Key (per-client), "
             "X-Client-Passphrase (clients), or X-Internal-Secret (internal).",
         )
 
-    _enforce_scope(request, auth.get("scopes", []))
+    try:
+        _enforce_scope(request, auth.get("scopes", []))
+    except HTTPException as scope_exc:
+        await _record_auth_failure(
+            request,
+            reason="insufficient_scope",
+            status_code=scope_exc.status_code,
+            detail=str(scope_exc.detail),
+            user_agent=user_agent,
+        )
+        raise
     return auth
 
 
