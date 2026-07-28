@@ -1429,21 +1429,33 @@ CAMPUS_DNS_SERVERS = ('10.3.0.11', '172.16.20.10')
 CAMPUS_IP_PREFIXES = tuple(f'10.{octet}.' for octet in range(14, 24)) + ('10.100.',)
 
 
-def _is_on_campus(active_ip, dns_servers) -> bool:
-    """Was this device on the campus network at its last check-in?
+def _has_campus_dns(dns_servers) -> bool:
+    """Is the device resolving against campus DNS?
 
-    DNS is the stronger signal: campus resolvers are handed out by campus DHCP and a
-    home router will never serve them. IP prefix is only a fallback, because a private
-    10.x range on its own is also what plenty of home networks look like.
+    True on the campus LAN, but equally true over VPN from anywhere in the world, so
+    this answers "reachable on the campus network", not "physically on campus".
+    """
+    if not dns_servers:
+        return False
+    servers = dns_servers if isinstance(dns_servers, list) else [dns_servers]
+    return any(str(s) in CAMPUS_DNS_SERVERS for s in servers)
+
+
+def _is_on_campus(active_ip, dns_servers) -> bool:
+    """Was this device physically on the campus network at its last check-in?
+
+    Deliberately keyed on the campus address range alone. Campus DNS looks like the
+    stronger signal and is not: a VPN client resolves campus DNS from a living room,
+    so a DNS-based test reports home machines as on campus. Anything keyed on that
+    would attach personally-owned peripherals to institutional inventory.
+
+    dns_servers is still accepted so callers can tell the two states apart via
+    _has_campus_dns - campus DNS with an off-campus address is the VPN case, worth
+    surfacing rather than silently discarding.
 
     Point-in-time by necessity - module rows are upserted per device, so there is no
     history to ask "was it ever on campus".
     """
-    if dns_servers:
-        servers = dns_servers if isinstance(dns_servers, list) else [dns_servers]
-        if any(str(s) in CAMPUS_DNS_SERVERS for s in servers):
-            return True
-
     return bool(active_ip) and str(active_ip).startswith(CAMPUS_IP_PREFIXES)
 
 
@@ -1464,7 +1476,8 @@ async def get_bulk_hardware(
     - Hardware specs (manufacturer, model, CPU, memory, storage, GPU)
     - OS information (name, version, architecture)
     - Attached displays, normalized across both clients, keyed for asset inventory
-    - Network position: active IP, DNS servers, and a derived on-campus flag
+    - Network position: active IP, DNS servers, a physically-on-campus flag,
+      and a campus-DNS flag (the two differ over VPN)
     """
     try:
         _ckey = (include_archived, limit)
@@ -1598,6 +1611,7 @@ async def get_bulk_hardware(
                         'ipAddress': active_ip,
                         'dnsServers': dns_servers,
                         'onCampus': _is_on_campus(active_ip, dns_servers),
+                        'campusDns': _has_campus_dns(dns_servers),
                     },
                 })
             
