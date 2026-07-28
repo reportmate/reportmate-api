@@ -16,11 +16,17 @@ SELECT DISTINCT ON (d.serial_number)
     inv.data->>'location' as location,
     COALESCE(inv.data->>'asset_tag', inv.data->>'assetTag') as asset_tag,
     inv.data->>'department' as department,
-    inv.data->>'fleet' as fleet
+    inv.data->>'fleet' as fleet,
+    n.data->'activeConnection'->>'ipAddress' as active_ip,
+    -- The two clients write DNS to different keys: Windows to dns.servers, macOS to
+    -- dnsConfiguration.nameservers. Reading only one makes the other platform's whole
+    -- fleet look like it has no DNS at all, so coalesce here rather than in each caller.
+    COALESCE(n.data->'dns'->'servers', n.data->'dnsConfiguration'->'nameservers') as dns_servers
 FROM devices d
 LEFT JOIN hardware h ON d.id = h.device_id
 LEFT JOIN system s ON d.id = s.device_id
 LEFT JOIN inventory inv ON d.id = inv.device_id
+LEFT JOIN network n ON d.id = n.device_id
 WHERE d.serial_number IS NOT NULL
     AND d.serial_number NOT LIKE 'TEST-%%'
     AND h.data IS NOT NULL
