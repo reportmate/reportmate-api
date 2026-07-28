@@ -1420,6 +1420,45 @@ async def get_bulk_applications(
             except Exception:
                 pass
 
+# Campus resolvers. A device that answers one of these on its last check-in was on
+# the campus network at that moment.
+CAMPUS_DNS_SERVERS = ('10.3.0.11', '172.16.20.10')
+
+# Campus /16s. Used only as a fallback for devices whose client did not report DNS,
+# so a missing DNS payload does not silently read as "off campus".
+CAMPUS_IP_PREFIXES = tuple(f'10.{octet}.' for octet in range(14, 24)) + ('10.100.',)
+
+
+def _has_campus_dns(dns_servers) -> bool:
+    """Is the device resolving against campus DNS?
+
+    True on the campus LAN, but equally true over VPN from anywhere in the world, so
+    this answers "reachable on the campus network", not "physically on campus".
+    """
+    if not dns_servers:
+        return False
+    servers = dns_servers if isinstance(dns_servers, list) else [dns_servers]
+    return any(str(s) in CAMPUS_DNS_SERVERS for s in servers)
+
+
+def _is_on_campus(active_ip, dns_servers) -> bool:
+    """Was this device physically on the campus network at its last check-in?
+
+    Deliberately keyed on the campus address range alone. Campus DNS looks like the
+    stronger signal and is not: a VPN client resolves campus DNS from a living room,
+    so a DNS-based test reports home machines as on campus. Anything keyed on that
+    would attach personally-owned peripherals to institutional inventory.
+
+    dns_servers is still accepted so callers can tell the two states apart via
+    _has_campus_dns - campus DNS with an off-campus address is the VPN case, worth
+    surfacing rather than silently discarding.
+
+    Point-in-time by necessity - module rows are upserted per device, so there is no
+    history to ask "was it ever on campus".
+    """
+    return bool(active_ip) and str(active_ip).startswith(CAMPUS_IP_PREFIXES)
+
+
 @router.get("/hardware", dependencies=[Depends(verify_authentication)], tags=["fleet"])
 async def get_bulk_hardware(
     include_archived: bool = Query(default=False, alias="includeArchived", description="Include archived devices in results"),
@@ -1436,6 +1475,9 @@ async def get_bulk_hardware(
     - Device identifiers (serial number, device ID, name)
     - Hardware specs (manufacturer, model, CPU, memory, storage, GPU)
     - OS information (name, version, architecture)
+    - Attached displays, normalized across both clients, keyed for asset inventory
+    - Network position: active IP, DNS servers, a physically-on-campus flag,
+      and a campus-DNS flag (the two differ over VPN)
     """
     try:
         _ckey = (include_archived, limit)
@@ -1463,7 +1505,8 @@ async def get_bulk_hardware(
         for row in rows:
             try:
                 (serial_number, device_uuid, last_seen, hardware_data, collected_at, system_data,
-                 device_name, computer_name, usage, catalog, location, asset_tag, department, fleet) = row
+                 device_name, computer_name, usage, catalog, location, asset_tag, department, fleet,
+                 active_ip, dns_servers) = row
 
                 device_display_name = device_name or computer_name or serial_number
                 
@@ -1510,6 +1553,27 @@ async def get_bulk_hardware(
                         'architecture': processor_data.get('architecture'),
                     }
                 
+                # Displays, normalized across the two clients. macOS writes snake_case keys
+                # and Windows has written camelCase, so accept either and emit one shape -
+                # asset inventory keys on serialNumber and cannot branch per platform.
+                displays_data = hw_details.get('displays')
+                slim_displays = None
+                if isinstance(displays_data, list):
+                    slim_displays = [{
+                        'name': disp.get('name'),
+                        'serialNumber': disp.get('serial_number') or disp.get('serialNumber'),
+                        'manufacturer': disp.get('manufacturer'),
+                        'model': disp.get('model'),
+                        'type': disp.get('type'),
+                        'resolution': disp.get('resolution'),
+                        'vendorId': disp.get('vendor_id') or disp.get('vendorId'),
+                        'productId': disp.get('product_id') or disp.get('productId'),
+                        'manufactureYear': disp.get('manufacture_year') or disp.get('manufactureYear'),
+                        'isMainDisplay': disp.get('is_main_display') or disp.get('isMainDisplay'),
+                        'connectionType': disp.get('connection_type') or disp.get('connectionType'),
+                        'online': disp.get('online'),
+                    } for disp in displays_data if isinstance(disp, dict)]
+
                 all_hardware.append({
                     'serialNumber': serial_number,
                     'deviceId': device_uuid,
@@ -1542,6 +1606,13 @@ async def get_bulk_hardware(
                     'department': department,
                     'area': department,
                     'fleet': fleet,
+                    'displays': slim_displays,
+                    'network': {
+                        'ipAddress': active_ip,
+                        'dnsServers': dns_servers,
+                        'onCampus': _is_on_campus(active_ip, dns_servers),
+                        'campusDns': _has_campus_dns(dns_servers),
+                    },
                 })
             
             except Exception as e:
