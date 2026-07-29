@@ -1569,6 +1569,10 @@ async def get_bulk_hardware(
                         'vendorId': disp.get('vendor_id') or disp.get('vendorId'),
                         'productId': disp.get('product_id') or disp.get('productId'),
                         'manufactureYear': disp.get('manufacture_year') or disp.get('manufactureYear'),
+                        # Week pairs with the year to make an actual EDID manufacture date.
+                        # Year alone collapses every panel to 1 January, which is precise
+                        # enough to look real and wrong enough to mislead an EOL date.
+                        'manufactureWeek': disp.get('manufacture_week') or disp.get('manufactureWeek'),
                         'isMainDisplay': disp.get('is_main_display') or disp.get('isMainDisplay'),
                         'connectionType': disp.get('connection_type') or disp.get('connectionType'),
                         'online': disp.get('online'),
