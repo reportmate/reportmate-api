@@ -48,7 +48,7 @@ def make_token(rsa_keys):
             "aud": aud,
             "sub": "subject-123",
             "oid": "object-id-abc",
-            "preferred_username": "rod@ecuad.ca",
+            "preferred_username": "alice@example.edu",
             "iat": now,
             "exp": now + timedelta(seconds=exp_delta),
         }
@@ -109,7 +109,7 @@ def test_admin_token_can_read(oidc_client, make_token):
     assert body["method"] == "oidc"
     assert body["issuer"] == ISSUER
     assert body["principal"] == "object-id-abc"
-    assert body["username"] == "rod@ecuad.ca"
+    assert body["username"] == "alice@example.edu"
     assert set(body["scopes"]) == {"read", "ingest", "admin"}
 
 
