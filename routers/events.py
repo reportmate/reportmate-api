@@ -40,6 +40,65 @@ def _reject_ingest(request: Request, payload, *, reason: str, detail: str,
     )
     raise HTTPException(status_code=status_code, detail=detail)
 
+
+def _squash_serial(value):
+    """Lowercase and drop every non-alphanumeric character.
+
+    Used only for placeholder matching, so that "Default string",
+    "Defaultstring" and "DEFAULT_STRING" collapse to one key. Real serials are
+    compared verbatim everywhere else."""
+    return re.sub(r'[^a-z0-9]', '', (value or '').lower())
+
+
+def _reported_hostnames(payload):
+    """Every hostname / computer name the payload reports about itself.
+
+    A client putting its hostname in the serial field is the failure this
+    guards against, and the payload carries the hostname separately -- so it is
+    detectable by comparison instead of by guessing from the serial's shape.
+    Shape guessing rejected genuine hardware: Lenovo serials like PF520813 and
+    the all-letter randomized serials Apple has issued since 2021 are both
+    indistinguishable from a hostname by shape alone."""
+    names = set()
+    if not isinstance(payload, dict):
+        return names
+
+    def add(value):
+        if isinstance(value, str) and value.strip():
+            names.add(value.strip())
+
+    meta = payload.get('metadata')
+    if isinstance(meta, dict):
+        additional = meta.get('additional')
+        if isinstance(additional, dict):
+            add(additional.get('deviceName'))
+            add(additional.get('device_name'))
+
+    modules_data = payload.get('modules', payload)
+    if not isinstance(modules_data, dict):
+        return names
+
+    def unwrap(module):
+        value = modules_data.get(module)
+        if isinstance(value, list) and value:
+            value = value[0]
+        return value if isinstance(value, dict) else {}
+
+    inventory = unwrap('inventory')
+    add(inventory.get('deviceName'))
+    add(inventory.get('device_name'))
+    add(inventory.get('computer_name'))
+
+    hardware_system = unwrap('hardware').get('system')
+    if isinstance(hardware_system, dict):
+        add(hardware_system.get('computer_name'))
+        add(hardware_system.get('hostname'))
+
+    add(unwrap('network').get('hostname'))
+    add(unwrap('system').get('hostname'))
+    return names
+
+
 @router.get("/events", dependencies=[Depends(verify_authentication)], tags=["events"])
 async def get_events(
     limit: int = Query(default=100, ge=1, le=1000, description="Maximum number of events to return"),
@@ -175,7 +234,7 @@ async def get_ingest_failures(
     invalid_bearer_token, invalid_internal_secret, missing_credentials,
     insufficient_scope; validation -> malformed_json, invalid_payload,
     empty_serial, sentinel_serial, short_serial, hostname_serial,
-    letters_only_serial.
+    serial_equals_hostname.
     """
     try:
         _ckey = (limit, offset, serial or '', reason or '', hours)
@@ -411,15 +470,18 @@ async def submit_events(request: Request):
                 detail="Invalid serial number: empty or whitespace-only.",
             )
 
-        normalized = serial_number.strip().lower()
-        SENTINEL_SERIALS = {
+        # Squashing non-alphanumerics means the spaced OEM strings below also
+        # match the run-together forms real BIOSes report ("Defaultstring",
+        # "SystemSerialNumber", "ToBeFilledByOEM").
+        normalized = _squash_serial(serial_number)
+        SENTINEL_SERIALS = {_squash_serial(s) for s in (
             "-1", "0", "1",
             "unknown", "none", "null", "n/a", "na",
             "(empty)", "empty",
             "default string", "system serial number",
             "to be filled by o.e.m.", "to be filled by o.e.m",
             "00000000", "000000000",
-        }
+        )}
         if normalized in SENTINEL_SERIALS:
             logger.error(f"Rejected device registration: serial_number '{serial_number}' is a known sentinel value")
             _reject_ingest(
@@ -439,13 +501,13 @@ async def submit_events(request: Request):
                 detail=f"Invalid serial number: '{serial_number}' is too short to be a real hardware serial.",
             )
 
+        # Only the machine-generated Windows defaults stay as shape checks: the
+        # random suffix is padded to the 15-char NetBIOS limit, so the prefix
+        # fixes its length and nothing resembles a hardware serial.
         hostname_patterns = [
-            r'^[A-Z]+-[A-Z]+$',  # All caps with hyphens (e.g., TOLUWANI-AGBI, AWI-JUMP)
-            r'^[A-Z]+\-[A-Z0-9]+\-[A-Z0-9]+$',  # Pattern like DESKTOP-ABC123
-            r'^WIN-[A-Z0-9]+$',  # Windows default hostnames
-            r'^[A-Z]+-[A-Z]+-[A-Z]+-[0-9]+$',
-            r'^[A-Z]{4,}-[0-9]{4}$',
-            r'^[A-Z]{2,}\d{2,}$',
+            r'^DESKTOP-[A-Z0-9]{7}$',  # e.g. DESKTOP-DUMMY01
+            r'^LAPTOP-[A-Z0-9]{8}$',   # e.g. LAPTOP-1A7GKLCD
+            r'^WIN-[A-Z0-9]{11}$',     # Windows Server default
         ]
 
         for pattern in hostname_patterns:
@@ -457,14 +519,15 @@ async def submit_events(request: Request):
                     detail=f"Invalid serial number: '{serial_number}' appears to be a hostname. Device must provide hardware serial number (BIOS/chassis serial).",
                 )
 
-        # Additional validation: Serial numbers should not contain only letters and hyphens
-        # Real serials usually have numbers
-        if serial_number.replace('-', '').isalpha():
-            logger.error(f"Rejected device registration: serial_number '{serial_number}' contains only letters (likely a hostname)")
+        # The real failure -- a client sending its hostname where the hardware
+        # serial belongs -- is caught by comparing the two, which no shape
+        # heuristic can do without also rejecting genuine serials.
+        if normalized and normalized in {_squash_serial(n) for n in _reported_hostnames(payload)}:
+            logger.error(f"Rejected device registration: serial_number '{serial_number}' matches the hostname the payload reports")
             _reject_ingest(
                 request, payload,
-                reason="letters_only_serial",
-                detail=f"Invalid serial number: '{serial_number}' contains only letters and appears to be a hostname. Device must provide hardware serial number.",
+                reason="serial_equals_hostname",
+                detail=f"Invalid serial number: '{serial_number}' is the device's own hostname, not a hardware serial. Device must provide the BIOS/chassis serial number.",
             )
         
         logger.info(f"Processing unified payload for device {serial_number} (UUID: {device_uuid})")
