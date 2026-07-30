@@ -94,9 +94,8 @@ All endpoints require authentication via one of:
 API requests are subject to rate limiting. Contact support for increased limits.
     """,
     contact={
-        "name": "ReportMate Support",
-        "url": "https://reportmate.example.edu",
-        "email": "support@example.com",
+        "name": "ReportMate",
+        "url": "https://reportmate.app",
     },
     license_info={
         "name": "AGPL-3.0",
