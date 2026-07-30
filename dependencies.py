@@ -269,6 +269,22 @@ _DB_POOL_MAX = int(os.getenv("DB_POOL_MAX", "10"))
 # Authentication
 # ---------------------------------------------------------------------------
 
+# REPORTMATE_PASSPHRASE holds a comma-separated list so a passphrase can be
+# rotated without an outage: publish the new one alongside the old, ship it to
+# the fleet, wait for every client to check in on it, then drop the old.
+#
+# Order is meaningful. The first entry is the current passphrase; anything after
+# it is deprecated-but-still-accepted, and authenticating with one emits a
+# warning naming the caller. Watching that warning fall silent is how you know
+# the fleet has finished rolling over and the old entry is safe to remove.
+def _parse_passphrases(raw: Optional[str]) -> List[str]:
+    return [p.strip() for p in (raw or "").split(",") if p.strip()]
+
+
+# Holds the raw configured value, which may name several passphrases. It is
+# split per request rather than once at import so that changing this attribute
+# at runtime takes effect -- which is how the tests drive it, and what any
+# future reload would rely on.
 REPORTMATE_PASSPHRASE = os.getenv("REPORTMATE_PASSPHRASE")
 API_INTERNAL_SECRET = os.getenv("API_INTERNAL_SECRET")
 AZURE_MANAGED_IDENTITY_HEADER = "X-MS-CLIENT-PRINCIPAL-ID"
@@ -820,7 +836,8 @@ async def verify_authentication(
     # Note: `auth is None` (not elif) so a failed-but-accompanied API key above
     # falls through to the passphrase instead of locking the fleet out.
     if auth is None and (x_api_passphrase or x_client_passphrase):
-        if not REPORTMATE_PASSPHRASE:
+        candidates = _parse_passphrases(REPORTMATE_PASSPHRASE)
+        if not candidates:
             logger.error(
                 "[ERR] REPORTMATE_PASSPHRASE not configured but client attempted passphrase auth"
             )
@@ -828,7 +845,23 @@ async def verify_authentication(
                 status_code=500, detail="Server authentication not configured"
             )
         presented = x_api_passphrase or x_client_passphrase
-        if not hmac.compare_digest(presented, REPORTMATE_PASSPHRASE):
+        # Every candidate is compared, without an early break, so the time taken
+        # does not reveal which entry matched.
+        matched_index = -1
+        for _idx, _candidate in enumerate(candidates):
+            if hmac.compare_digest(presented, _candidate):
+                matched_index = _idx
+        if matched_index > 0:
+            logger.warning(
+                "[ROTATION] Deprecated passphrase (position %d of %d) accepted from "
+                "%s (IP: %s). This client has not picked up the current passphrase; "
+                "do not retire that entry until these stop.",
+                matched_index + 1,
+                len(candidates),
+                user_agent,
+                client_host,
+            )
+        if matched_index < 0:
             logger.warning(
                 f"[ERR] Invalid passphrase attempt from {user_agent} (IP: {client_host})"
             )
