@@ -2,9 +2,10 @@
 
 import json
 import logging
+import math
 import re
 import time as _time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
@@ -39,6 +40,67 @@ def _reject_ingest(request: Request, payload, *, reason: str, detail: str,
         identity=extract_ingest_identity(payload),
     )
     raise HTTPException(status_code=status_code, detail=detail)
+
+
+# Physical ceiling for one machine-day of human attention. Applied to
+# active/foreground only: total_seconds is process lifetime, and multi-process
+# apps (browsers, Adobe) legitimately exceed 24h of summed process time in a
+# single day, so capping it would destroy real data.
+USAGE_DAY_SECONDS_CAP = 86400
+
+# Usage dates outside this window are client bugs (unset clocks, garbage
+# parses), not history worth keying forever. The future bound allows for
+# timezone skew between a client's local date and server UTC.
+_USAGE_DATE_MIN = "2020-01-01"
+_USAGE_DATE_FUTURE_SKEW = timedelta(days=2)
+
+
+def _usage_entry_numbers(entry):
+    """Coerce the numeric fields of one dailyUsageHistory entry.
+
+    Returns (launches, total, active, foreground, clamped), or None when a value
+    is non-numeric or non-finite -- those carry no recoverable measurement, and
+    accumulating them would silently poison the daily totals.
+
+    A negative value is clamped to zero rather than dropping the row. macOS
+    clients stamp -1 as an unknown-duration sentinel on sessions a watcher
+    restart interrupted, so a negative totalSeconds arrives on ordinary healthy
+    Macs alongside correct foreground and active figures. Rejecting the whole
+    row would discard those -- on one production week that was 120
+    foreground-hours for XCreds Login Overlay across 21 devices, and ~50 apps
+    in total. The clamp is reported exactly as a rejection is, so the anomaly
+    still surfaces instead of being absorbed."""
+    try:
+        values = (
+            int(entry.get('launches', 0) or 0),
+            float(entry.get('totalSeconds', 0) or 0),
+            float(entry.get('activeSeconds', 0) or 0),
+            float(entry.get('foregroundSeconds', 0) or 0),
+        )
+    except (TypeError, ValueError):
+        return None
+    if not all(map(math.isfinite, values)):
+        return None
+    if min(values) < 0:
+        launches, total, active, foreground = values
+        return (max(0, launches), max(0.0, total), max(0.0, active),
+                max(0.0, foreground), True)
+    return values + (False,)
+
+
+def _usage_entry_date(entry):
+    """Return the entry's date as YYYY-MM-DD, or None if malformed or outside
+    the plausible window. A malformed date must not reach the INSERT: one bad
+    row would abort the whole batch."""
+    raw = str(entry.get('date') or '')[:10]
+    try:
+        parsed = datetime.strptime(raw, '%Y-%m-%d').date()
+    except ValueError:
+        return None
+    today = datetime.now(timezone.utc).date()
+    if raw < _USAGE_DATE_MIN or parsed > today + _USAGE_DATE_FUTURE_SKEW:
+        return None
+    return raw
 
 
 def _squash_serial(value):
@@ -684,24 +746,47 @@ async def submit_events(request: Request):
                         daily_history = module_data.get('dailyUsageHistory', [])
                         if daily_history:
                             try:
+                                stored = 0
+                                rejected = []
+                                capped = []
+                                clamped = []
                                 for entry in daily_history:
-                                    date_val = entry.get('date')
-                                    app_name = entry.get('appName')
-                                    if not date_val or not app_name:
+                                    if not isinstance(entry, dict):
+                                        rejected.append('non-object entry')
                                         continue
+                                    app_name = entry.get('appName')
+                                    if not entry.get('date') or not app_name:
+                                        continue
+                                    date_val = _usage_entry_date(entry)
+                                    if date_val is None:
+                                        rejected.append(f"{app_name}@{entry.get('date')}: bad date")
+                                        continue
+                                    numbers = _usage_entry_numbers(entry)
+                                    if numbers is None:
+                                        rejected.append(f"{app_name}@{date_val}: non-numeric or non-finite")
+                                        continue
+                                    launches, total_s, active_s, fg_s, was_clamped = numbers
+                                    if was_clamped:
+                                        clamped.append(f"{app_name}@{date_val}: negative clamped to zero")
                                     # activeSeconds / foregroundSeconds are optional — clients that
                                     # don't yet implement idle-time tracking will omit them and
                                     # contribute 0 to those columns. Same accumulate semantics as
-                                    # total_seconds (the existing process-lifetime metric).
+                                    # total_seconds (the existing process-lifetime metric), except
+                                    # active/foreground measure human attention, which one machine
+                                    # can supply for at most 24h per day — LEAST() holds the
+                                    # accumulated value at that ceiling so a re-sending client can
+                                    # never again inflate a day past physical reality. RETURNING
+                                    # reports rows sitting at the ceiling so the anomaly is
+                                    # surfaced instead of silently absorbed.
                                     cursor.execute("""
                                         INSERT INTO usage_history (device_id, date, app_name, publisher, launches, total_seconds, active_seconds, foreground_seconds, users, updated_at)
-                                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb, NOW())
+                                        VALUES (%s, %s, %s, %s, %s, %s, LEAST(%s, %s), LEAST(%s, %s), %s::jsonb, NOW())
                                         ON CONFLICT (device_id, date, app_name) DO UPDATE SET
                                             publisher = COALESCE(NULLIF(EXCLUDED.publisher, ''), usage_history.publisher),
                                             launches = usage_history.launches + EXCLUDED.launches,
                                             total_seconds = usage_history.total_seconds + EXCLUDED.total_seconds,
-                                            active_seconds = usage_history.active_seconds + EXCLUDED.active_seconds,
-                                            foreground_seconds = usage_history.foreground_seconds + EXCLUDED.foreground_seconds,
+                                            active_seconds = LEAST(usage_history.active_seconds + EXCLUDED.active_seconds, %s),
+                                            foreground_seconds = LEAST(usage_history.foreground_seconds + EXCLUDED.foreground_seconds, %s),
                                             users = COALESCE((
                                                 SELECT jsonb_agg(DISTINCT u)
                                                 FROM (
@@ -712,19 +797,47 @@ async def submit_events(request: Request):
                                                 WHERE u IS NOT NULL AND u <> ''
                                             ), '[]'::jsonb),
                                             updated_at = NOW()
+                                        RETURNING (active_seconds >= %s OR foreground_seconds >= %s)
                                     """, (
                                         serial_number,
                                         date_val,
                                         app_name,
                                         entry.get('publisher', ''),
-                                        entry.get('launches', 0),
-                                        entry.get('totalSeconds', 0),
-                                        entry.get('activeSeconds', 0),
-                                        entry.get('foregroundSeconds', 0),
-                                        json.dumps(entry.get('users', []))
+                                        launches,
+                                        total_s,
+                                        active_s, USAGE_DAY_SECONDS_CAP,
+                                        fg_s, USAGE_DAY_SECONDS_CAP,
+                                        json.dumps(entry.get('users', [])),
+                                        USAGE_DAY_SECONDS_CAP,
+                                        USAGE_DAY_SECONDS_CAP,
+                                        USAGE_DAY_SECONDS_CAP,
+                                        USAGE_DAY_SECONDS_CAP,
                                     ))
+                                    row = cursor.fetchone()
+                                    if row and row[0]:
+                                        capped.append(f"{app_name}@{date_val}")
+                                    stored += 1
                                 conn.commit()
-                                logger.info(f"Accumulated {len(daily_history)} daily usage entries for device {serial_number}")
+                                logger.info(f"Accumulated {stored} daily usage entries for device {serial_number}")
+                                if rejected or capped or clamped:
+                                    # The payload is still accepted — only the offending rows
+                                    # were dropped, clamped, or held at the ceiling — but the
+                                    # violation is a client bug that must be visible in
+                                    # /events/failures, not only in container logs.
+                                    # Invisibility is how the Mac re-send defect poisoned
+                                    # months of data.
+                                    record_ingest_failure(
+                                        failure_type="validation",
+                                        reason="usage_out_of_bounds",
+                                        status_code=200,
+                                        detail=(f"rejected {len(rejected)} usage rows {rejected[:5]}, "
+                                                f"{len(clamped)} with negatives clamped {clamped[:5]}, "
+                                                f"{len(capped)} at daily active/foreground ceiling {capped[:5]}"),
+                                        endpoint=request.url.path,
+                                        client_ip=request.client.host if request.client else None,
+                                        user_agent=request.headers.get("user-agent"),
+                                        identity=extract_ingest_identity(payload),
+                                    )
                             except Exception as usage_err:
                                 logger.error(f"Failed to store daily usage history for {serial_number}: {usage_err}")
                                 conn.rollback()
