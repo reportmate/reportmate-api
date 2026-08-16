@@ -14,7 +14,7 @@ from slowapi.util import get_remote_address
 
 from dependencies import (
     broadcast_event, cache_get, cache_set, get_db_connection,
-    invalidate_caches, load_sql, logger, paginate,
+    load_sql, logger, paginate,
     verify_authentication, VALID_MODULE_NAMES,
     infer_platform, build_os_summary,
     EventSubmission,
@@ -22,6 +22,33 @@ from dependencies import (
 )
 
 router = APIRouter(tags=["events"])
+
+_CIMIAN_ERROR_RE = re.compile(r'(error|failed|problem|install-error)')
+_CIMIAN_WARNING_RE = re.compile(r'(warning|needs-attention)')
+_MUNKI_ERROR_RE = re.compile(r'(error|failed)')
+
+
+def _install_issue_counts(module_data):
+    """Per-device install error/warning counts for the installs module.
+
+    Mirrors the status-matching rules the dashboard aggregate uses (and the
+    backfill in migration 0003), so the precomputed columns agree with what
+    the dashboard previously derived from the JSONB at read time."""
+    def _items(source):
+        items = (((module_data or {}).get(source) or {}).get('items')) or []
+        return items if isinstance(items, list) else []
+
+    def _status(item, key):
+        return str(item.get(key) or '').lower() if isinstance(item, dict) else ''
+
+    cimian = [_status(i, 'currentStatus') for i in _items('cimian')]
+    munki = [_status(i, 'status') for i in _items('munki')]
+    return (
+        sum(1 for s in cimian if _CIMIAN_ERROR_RE.search(s) or s == 'needs_reinstall'),
+        sum(1 for s in cimian if _CIMIAN_WARNING_RE.search(s)),
+        sum(1 for s in munki if _MUNKI_ERROR_RE.search(s)),
+        sum(1 for s in munki if 'warning' in s),
+    )
 
 
 def _reject_ingest(request: Request, payload, *, reason: str, detail: str,
@@ -720,6 +747,27 @@ async def submit_events(request: Request):
                             VALUES (%s, %s::jsonb, %s, %s, %s)
                         """, (serial_number, module_json, collected_at, datetime.now(timezone.utc), datetime.now(timezone.utc)))
                     
+                    # Keep the precomputed dashboard counters in step with the
+                    
+                    # JSONB payload (columns added in migration 0003).
+                    
+                    if module_name == 'installs':
+                    
+                        ce, cw, me, mw = _install_issue_counts(module_data)
+                    
+                        cursor.execute("""
+                    
+                            UPDATE installs
+                    
+                            SET cimian_errors = %s, cimian_warnings = %s,
+                    
+                                munki_errors = %s, munki_warnings = %s
+                    
+                            WHERE device_id = %s
+                    
+                        """, (ce, cw, me, mw, serial_number))
+
+                    
                     conn.commit()
                     modules_processed.append(module_name)
                     logger.info(f"Stored {module_name} module for device {serial_number}")
@@ -1079,7 +1127,13 @@ async def submit_events(request: Request):
                 conn.rollback()
 
         conn.close()
-        invalidate_caches()
+        # NOTE: no cache invalidation here. Devices report every few seconds
+        # fleet-wide, so wiping the response caches on every ingest meant the
+        # 30s-TTL aggregates (dashboard, devices, stats) never survived long
+        # enough to serve a second request -- every page load paid a full
+        # multi-second recompute. Read caches expire by TTL instead; admin
+        # and settings writes (which must be visible immediately) still call
+        # invalidate_caches().
         
         logger.info(f"[SUCCESS] Successfully processed device {serial_number}: {len(modules_processed)} modules, {events_stored} events")
         

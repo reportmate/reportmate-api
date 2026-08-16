@@ -127,7 +127,15 @@ def cache_set(namespace: str, data, key: tuple = ()):
 
 
 def invalidate_caches():
-    """Clear ALL cached responses. Called after any data write."""
+    """Clear ALL cached responses.
+
+    Called after admin and settings writes, which must be visible on the next
+    read. Deliberately NOT called from the ingestion path: devices report
+    every few seconds fleet-wide, so wiping on ingest meant the 30s-TTL
+    aggregate caches (dashboard, devices, stats) never survived long enough
+    to serve a second request. Ingested data becomes visible as read caches
+    expire by TTL.
+    """
     _CACHE.clear()
     logger.info("[CACHE] All caches invalidated (data write detected)")
 
