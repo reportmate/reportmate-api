@@ -1774,14 +1774,15 @@ def get_installs_filters(
             sessions = cimian_data.get('sessions', []) or munki_data.get('sessions', [])
             latest_session = sessions[0] if sessions else None
             
-            # Build device record with slimmed items — keep only fields the frontend needs
-            # for status categorization, error/warning widgets, and drill-down tables.
-            # Drops: type, category, developer, updateCount, failureCount, installCount,
-            # mappedStatus, warningCount, installMethod, pendingReason, totalSessions,
-            # hasInstallLoop, recentAttempts, lastAttemptStatus, lastSeenInSession, installLoopDetected
-            ITEM_KEEP_FIELDS = ('id', 'itemName', 'displayName', 'name', 'itemType',
-                                'currentStatus', 'status', 'lastError', 'lastWarning',
-                                'latestVersion', 'installedVersion', 'lastUpdate', 'lastAttemptTime')
+            # Build device record with slimmed items — keep only fields the
+            # installs page actually reads: names for labels and pill matching,
+            # statuses for categorization, and last error/warning strings for
+            # the drill-down tables. Everything else (ids, versions, item
+            # types, timestamps) came to ~10MB of a 28MB response across
+            # ~113k items and had no reader; per-item version data lives in
+            # the /installs report endpoint.
+            ITEM_KEEP_FIELDS = ('itemName', 'displayName', 'name',
+                                'currentStatus', 'status', 'lastError', 'lastWarning')
             
             cimian_slim = None
             if cimian_data:
@@ -1793,7 +1794,9 @@ def get_installs_filters(
                     'config': config,
                     'version': cimian_data.get('version'),
                     'status': cimian_data.get('status'),
-                    'sessions': (cimian_data.get('sessions') or [])[:5],
+                    # The page reads only sessions[0].status; five full
+                    # session objects per device were ~6MB of the payload.
+                    'sessions': (cimian_data.get('sessions') or [])[:1],
                     'items': slim_items,
                     'itemCounts': {
                         'total': len(cimian_data.get('items', [])),

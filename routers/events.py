@@ -4,6 +4,7 @@ import json
 import logging
 import math
 import re
+import threading
 import time as _time
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
@@ -49,6 +50,35 @@ def _install_issue_counts(module_data):
         sum(1 for s in munki if _MUNKI_ERROR_RE.search(s)),
         sum(1 for s in munki if 'warning' in s),
     )
+
+
+def _run_retention_purge():
+    """Delete expired events/idempotency keys in bounded batches.
+
+    Runs on a daemon thread off the request path. The batch cap keeps any
+    single run's lock and WAL footprint small; the 1%-of-ingests trigger
+    means the backlog drains across runs.
+    """
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute("""
+            DELETE FROM events WHERE id IN (
+                SELECT id FROM events
+                WHERE timestamp < NOW() - INTERVAL '30 days'
+                LIMIT 50000
+            )
+        """)
+        deleted = cursor.rowcount
+        cursor.execute(
+            "DELETE FROM idempotency_keys WHERE first_seen < NOW() - INTERVAL '7 days'"
+        )
+        conn.commit()
+        conn.close()
+        if deleted:
+            logger.info(f"Retention purge: deleted {deleted} events older than 30 days")
+    except Exception as purge_error:
+        logger.warning(f"Retention purge failed (non-fatal): {purge_error}")
 
 
 def _reject_ingest(request: Request, payload, *, reason: str, detail: str,
@@ -733,12 +763,25 @@ async def submit_events(request: Request):
                     module_json = json.dumps(module_data)
                     
                     if module_exists:
-                        # Update existing module
+                        # Unchanged-payload fast path: most check-ins resend
+                        # identical module data, and rewriting the JSONB every
+                        # time re-TOASTs multi-MB values on every ingest --
+                        # that churn is what grew applications to 24GB for
+                        # ~900 live rows. jsonb equality is content-based, so
+                        # when nothing changed only the fixed-width timestamp
+                        # columns are updated and the TOAST data is reused.
                         cursor.execute(f"""
                             UPDATE {table_name}
-                            SET data = %s::jsonb, collected_at = %s, updated_at = %s
-                            WHERE device_id = %s
-                        """, (module_json, collected_at, datetime.now(timezone.utc), serial_number))
+                            SET collected_at = %s, updated_at = %s
+                            WHERE device_id = %s AND data = %s::jsonb
+                        """, (collected_at, datetime.now(timezone.utc), serial_number, module_json))
+                        data_changed = cursor.rowcount == 0
+                        if data_changed:
+                            cursor.execute(f"""
+                                UPDATE {table_name}
+                                SET data = %s::jsonb, collected_at = %s, updated_at = %s
+                                WHERE device_id = %s
+                            """, (module_json, collected_at, datetime.now(timezone.utc), serial_number))
                     else:
                         # Insert new module record
                         # NOTE: device_id column references devices.id which equals serial_number
@@ -746,28 +789,19 @@ async def submit_events(request: Request):
                             INSERT INTO {table_name} (device_id, data, collected_at, created_at, updated_at)
                             VALUES (%s, %s::jsonb, %s, %s, %s)
                         """, (serial_number, module_json, collected_at, datetime.now(timezone.utc), datetime.now(timezone.utc)))
-                    
+                        data_changed = True
+
                     # Keep the precomputed dashboard counters in step with the
-                    
                     # JSONB payload (columns added in migration 0003).
-                    
-                    if module_name == 'installs':
-                    
+                    if module_name == 'installs' and data_changed:
                         ce, cw, me, mw = _install_issue_counts(module_data)
-                    
                         cursor.execute("""
-                    
                             UPDATE installs
-                    
                             SET cimian_errors = %s, cimian_warnings = %s,
-                    
                                 munki_errors = %s, munki_warnings = %s
-                    
                             WHERE device_id = %s
-                    
                         """, (ce, cw, me, mw, serial_number))
 
-                    
                     conn.commit()
                     modules_processed.append(module_name)
                     logger.info(f"Stored {module_name} module for device {serial_number}")
@@ -1108,23 +1142,14 @@ async def submit_events(request: Request):
         
         conn.commit()
 
-        # Periodic retention: purge events older than 30 days (runs ~1% of requests to avoid overhead)
+        # Periodic retention: purge old events on ~1% of requests. Runs on a
+        # daemon thread with its own connection and a bounded batch, so a
+        # large backlog delete never runs inside this request (this endpoint
+        # stays async for the WebPubSub broadcast, and an inline multi-second
+        # DELETE here previously stalled the event loop and health probes).
         import random
         if random.random() < 0.01:
-            try:
-                cursor.execute(
-                    "DELETE FROM events WHERE timestamp < NOW() - INTERVAL '30 days'"
-                )
-                deleted = cursor.rowcount
-                cursor.execute(
-                    "DELETE FROM idempotency_keys WHERE first_seen < NOW() - INTERVAL '7 days'"
-                )
-                conn.commit()
-                if deleted:
-                    logger.info(f"Retention purge: deleted {deleted} events older than 30 days")
-            except Exception as purge_error:
-                logger.warning(f"Retention purge failed (non-fatal): {purge_error}")
-                conn.rollback()
+            threading.Thread(target=_run_retention_purge, daemon=True).start()
 
         conn.close()
         # NOTE: no cache invalidation here. Devices report every few seconds
