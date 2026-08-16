@@ -40,7 +40,7 @@ router = APIRouter()
 
 
 @router.get("/devices", response_model=DevicesResponse, dependencies=[Depends(verify_authentication)], tags=["devices"])
-async def get_all_devices(
+def get_all_devices(
     request: Request,
     response: Response,
     limit: Optional[int] = Query(default=None, ge=1, le=1000, description="Maximum devices to return"),
@@ -296,7 +296,7 @@ async def get_all_devices(
             conn.close()
 
 @router.get("/device/{serial_number}", dependencies=[Depends(verify_authentication)], tags=["devices"])
-async def get_device_by_serial(serial_number: str):
+def get_device_by_serial(serial_number: str):
     """
     Get individual device details with all modules.
     
@@ -410,7 +410,7 @@ async def get_device_by_serial(serial_number: str):
 
 
 @router.get("/device/{serial_number}/installs/log", dependencies=[Depends(verify_authentication)], tags=["devices"])
-async def get_device_installs_log(serial_number: str):
+def get_device_installs_log(serial_number: str):
     """
     Get the full run log for the installs module.
     
@@ -441,7 +441,7 @@ async def get_device_installs_log(serial_number: str):
         raise HTTPException(status_code=500, detail=f"Failed to retrieve installs log: {str(e)}")
 
 @router.get("/device/{serial_number}/events", dependencies=[Depends(verify_authentication)], tags=["devices"])
-async def get_device_events(
+def get_device_events(
     serial_number: str,
     limit: int = 100,
     type: str = Query(default=None, description="Filter by event type (success, warning, error, info, system)")
@@ -525,7 +525,7 @@ async def get_device_events(
 
 
 @router.get("/device/{serial_number}/info", dependencies=[Depends(verify_authentication)], tags=["devices"])
-async def get_device_info_fast(serial_number: str):
+def get_device_info_fast(serial_number: str):
     """
     Fast endpoint returning only InfoTab data for progressive loading.
     
@@ -623,7 +623,7 @@ async def get_device_info_fast(serial_number: str):
 
 
 @router.get("/device/{serial_number}/modules/{module_name}", dependencies=[Depends(verify_authentication)], tags=["devices"])
-async def get_device_module(serial_number: str, module_name: str):
+def get_device_module(serial_number: str, module_name: str):
     """
     Get individual module data for progressive/on-demand loading.
 
@@ -700,7 +700,7 @@ async def get_device_module(serial_number: str, module_name: str):
 
 
 @router.get("/device/{serial_number}/applications/usage/history", dependencies=[Depends(verify_authentication)], tags=["devices"])
-async def get_device_usage_history(
+def get_device_usage_history(
     serial_number: str,
     days: int = Query(default=90, ge=1, le=548, description="Number of days to look back"),
     app_name: Optional[str] = Query(default=None, alias="appName", description="Filter by application name")

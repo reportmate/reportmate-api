@@ -974,7 +974,12 @@ def _parse_database_url(url: str) -> dict:
         "user": username,
         "password": password,
         "ssl_context": True if db_ssl else None,
-        "timeout": 30,
+        # Socket read timeout. Must exceed the server-side statement_timeout
+        # (120s, set per pooled connection below): the server is the arbiter
+        # of how long a query may run; if the socket gives up first the
+        # request 500s ("The read operation timed out") while the query keeps
+        # burning on the server. Observed on /debug/database under load.
+        "timeout": 130,
     }
 
 

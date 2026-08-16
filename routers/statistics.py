@@ -367,7 +367,7 @@ def _compute_dashboard_data(events_limit: int, include_archived: bool):
         raise HTTPException(status_code=500, detail=f"Failed to retrieve dashboard data: {str(e)}")
 
 @router.get("/stats/installs", dependencies=[Depends(verify_authentication)], tags=["statistics"])
-async def get_install_stats():
+def get_install_stats():
     """
     Get aggregated install statistics for dashboard widgets.
     

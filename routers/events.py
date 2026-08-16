@@ -189,7 +189,7 @@ def _reported_hostnames(payload):
 
 
 @router.get("/events", dependencies=[Depends(verify_authentication)], tags=["events"])
-async def get_events(
+def get_events(
     limit: int = Query(default=100, ge=1, le=1000, description="Maximum number of events to return"),
     offset: int = Query(default=0, ge=0, description="Number of events to skip (for pagination)"),
     startDate: str = Query(default=None, description="Filter events after this ISO8601 date"),
@@ -303,7 +303,7 @@ async def get_events(
         raise HTTPException(status_code=500, detail=f"Failed to retrieve events: {str(e)}")
 
 @router.get("/events/failures", dependencies=[Depends(verify_authentication)], tags=["events"])
-async def get_ingest_failures(
+def get_ingest_failures(
     limit: int = Query(default=100, ge=1, le=1000, description="Maximum number of failures to return"),
     offset: int = Query(default=0, ge=0, description="Number of failures to skip (for pagination)"),
     serial: Optional[str] = Query(default=None, description="Filter by serial number (case-insensitive substring)"),
@@ -398,7 +398,7 @@ async def get_ingest_failures(
         raise HTTPException(status_code=500, detail=f"Failed to retrieve ingest failures: {str(e)}")
 
 @router.get("/events/{event_id}/payload", dependencies=[Depends(verify_authentication)], tags=["events"])
-async def get_event_payload(event_id: int):
+def get_event_payload(event_id: int):
     """
     Get the FULL payload for a specific event including related module data.
     

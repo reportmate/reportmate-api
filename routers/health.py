@@ -26,7 +26,7 @@ router = APIRouter(tags=["health"])
 
 
 @router.get("/health", response_model=HealthResponse, tags=["health"])
-async def health_check():
+def health_check():
     """
     Health check endpoint for monitoring and load balancers.
 
@@ -64,7 +64,7 @@ async def health_check():
 
 
 @router.get("/health/live", tags=["health"])
-async def liveness():
+def liveness():
     """
     Liveness probe -- the process is up and serving.
 
@@ -76,7 +76,7 @@ async def liveness():
 
 
 @router.get("/health/ready", tags=["health"])
-async def readiness():
+def readiness():
     """
     Readiness probe -- verifies the API can reach its database.
 
@@ -109,7 +109,7 @@ async def readiness():
 
 
 @router.get("/negotiate", dependencies=[Depends(verify_authentication)], tags=["health"])
-async def signalr_negotiate(device: str = Query(default="dashboard")):
+def signalr_negotiate(device: str = Query(default="dashboard")):
     """
     SignalR/WebPubSub negotiate endpoint.
 
@@ -170,7 +170,7 @@ async def signalr_negotiate(device: str = Query(default="dashboard")):
     tags=["health"],
     include_in_schema=False,
 )
-async def metrics():
+def metrics():
     """Prometheus metrics exposition (authenticated; scraper needs a key)."""
     from metrics import render_latest
 
