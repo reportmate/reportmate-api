@@ -4,6 +4,7 @@ import json
 import logging
 import math
 import re
+import threading
 import time as _time
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
@@ -14,7 +15,7 @@ from slowapi.util import get_remote_address
 
 from dependencies import (
     broadcast_event, cache_get, cache_set, get_db_connection,
-    invalidate_caches, load_sql, logger, paginate,
+    load_sql, logger, paginate,
     verify_authentication, VALID_MODULE_NAMES,
     infer_platform, build_os_summary,
     EventSubmission,
@@ -22,6 +23,62 @@ from dependencies import (
 )
 
 router = APIRouter(tags=["events"])
+
+_CIMIAN_ERROR_RE = re.compile(r'(error|failed|problem|install-error)')
+_CIMIAN_WARNING_RE = re.compile(r'(warning|needs-attention)')
+_MUNKI_ERROR_RE = re.compile(r'(error|failed)')
+
+
+def _install_issue_counts(module_data):
+    """Per-device install error/warning counts for the installs module.
+
+    Mirrors the status-matching rules the dashboard aggregate uses (and the
+    backfill in migration 0003), so the precomputed columns agree with what
+    the dashboard previously derived from the JSONB at read time."""
+    def _items(source):
+        items = (((module_data or {}).get(source) or {}).get('items')) or []
+        return items if isinstance(items, list) else []
+
+    def _status(item, key):
+        return str(item.get(key) or '').lower() if isinstance(item, dict) else ''
+
+    cimian = [_status(i, 'currentStatus') for i in _items('cimian')]
+    munki = [_status(i, 'status') for i in _items('munki')]
+    return (
+        sum(1 for s in cimian if _CIMIAN_ERROR_RE.search(s) or s == 'needs_reinstall'),
+        sum(1 for s in cimian if _CIMIAN_WARNING_RE.search(s)),
+        sum(1 for s in munki if _MUNKI_ERROR_RE.search(s)),
+        sum(1 for s in munki if 'warning' in s),
+    )
+
+
+def _run_retention_purge():
+    """Delete expired events/idempotency keys in bounded batches.
+
+    Runs on a daemon thread off the request path. The batch cap keeps any
+    single run's lock and WAL footprint small; the 1%-of-ingests trigger
+    means the backlog drains across runs.
+    """
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute("""
+            DELETE FROM events WHERE id IN (
+                SELECT id FROM events
+                WHERE timestamp < NOW() - INTERVAL '30 days'
+                LIMIT 50000
+            )
+        """)
+        deleted = cursor.rowcount
+        cursor.execute(
+            "DELETE FROM idempotency_keys WHERE first_seen < NOW() - INTERVAL '7 days'"
+        )
+        conn.commit()
+        conn.close()
+        if deleted:
+            logger.info(f"Retention purge: deleted {deleted} events older than 30 days")
+    except Exception as purge_error:
+        logger.warning(f"Retention purge failed (non-fatal): {purge_error}")
 
 
 def _reject_ingest(request: Request, payload, *, reason: str, detail: str,
@@ -162,7 +219,7 @@ def _reported_hostnames(payload):
 
 
 @router.get("/events", dependencies=[Depends(verify_authentication)], tags=["events"])
-async def get_events(
+def get_events(
     limit: int = Query(default=100, ge=1, le=1000, description="Maximum number of events to return"),
     offset: int = Query(default=0, ge=0, description="Number of events to skip (for pagination)"),
     startDate: str = Query(default=None, description="Filter events after this ISO8601 date"),
@@ -276,7 +333,7 @@ async def get_events(
         raise HTTPException(status_code=500, detail=f"Failed to retrieve events: {str(e)}")
 
 @router.get("/events/failures", dependencies=[Depends(verify_authentication)], tags=["events"])
-async def get_ingest_failures(
+def get_ingest_failures(
     limit: int = Query(default=100, ge=1, le=1000, description="Maximum number of failures to return"),
     offset: int = Query(default=0, ge=0, description="Number of failures to skip (for pagination)"),
     serial: Optional[str] = Query(default=None, description="Filter by serial number (case-insensitive substring)"),
@@ -371,7 +428,7 @@ async def get_ingest_failures(
         raise HTTPException(status_code=500, detail=f"Failed to retrieve ingest failures: {str(e)}")
 
 @router.get("/events/{event_id}/payload", dependencies=[Depends(verify_authentication)], tags=["events"])
-async def get_event_payload(event_id: int):
+def get_event_payload(event_id: int):
     """
     Get the FULL payload for a specific event including related module data.
     
@@ -706,12 +763,25 @@ async def submit_events(request: Request):
                     module_json = json.dumps(module_data)
                     
                     if module_exists:
-                        # Update existing module
+                        # Unchanged-payload fast path: most check-ins resend
+                        # identical module data, and rewriting the JSONB every
+                        # time re-TOASTs multi-MB values on every ingest --
+                        # that churn is what grew applications to 24GB for
+                        # ~900 live rows. jsonb equality is content-based, so
+                        # when nothing changed only the fixed-width timestamp
+                        # columns are updated and the TOAST data is reused.
                         cursor.execute(f"""
                             UPDATE {table_name}
-                            SET data = %s::jsonb, collected_at = %s, updated_at = %s
-                            WHERE device_id = %s
-                        """, (module_json, collected_at, datetime.now(timezone.utc), serial_number))
+                            SET collected_at = %s, updated_at = %s
+                            WHERE device_id = %s AND data = %s::jsonb
+                        """, (collected_at, datetime.now(timezone.utc), serial_number, module_json))
+                        data_changed = cursor.rowcount == 0
+                        if data_changed:
+                            cursor.execute(f"""
+                                UPDATE {table_name}
+                                SET data = %s::jsonb, collected_at = %s, updated_at = %s
+                                WHERE device_id = %s
+                            """, (module_json, collected_at, datetime.now(timezone.utc), serial_number))
                     else:
                         # Insert new module record
                         # NOTE: device_id column references devices.id which equals serial_number
@@ -719,7 +789,19 @@ async def submit_events(request: Request):
                             INSERT INTO {table_name} (device_id, data, collected_at, created_at, updated_at)
                             VALUES (%s, %s::jsonb, %s, %s, %s)
                         """, (serial_number, module_json, collected_at, datetime.now(timezone.utc), datetime.now(timezone.utc)))
-                    
+                        data_changed = True
+
+                    # Keep the precomputed dashboard counters in step with the
+                    # JSONB payload (columns added in migration 0003).
+                    if module_name == 'installs' and data_changed:
+                        ce, cw, me, mw = _install_issue_counts(module_data)
+                        cursor.execute("""
+                            UPDATE installs
+                            SET cimian_errors = %s, cimian_warnings = %s,
+                                munki_errors = %s, munki_warnings = %s
+                            WHERE device_id = %s
+                        """, (ce, cw, me, mw, serial_number))
+
                     conn.commit()
                     modules_processed.append(module_name)
                     logger.info(f"Stored {module_name} module for device {serial_number}")
@@ -1060,26 +1142,23 @@ async def submit_events(request: Request):
         
         conn.commit()
 
-        # Periodic retention: purge events older than 30 days (runs ~1% of requests to avoid overhead)
+        # Periodic retention: purge old events on ~1% of requests. Runs on a
+        # daemon thread with its own connection and a bounded batch, so a
+        # large backlog delete never runs inside this request (this endpoint
+        # stays async for the WebPubSub broadcast, and an inline multi-second
+        # DELETE here previously stalled the event loop and health probes).
         import random
         if random.random() < 0.01:
-            try:
-                cursor.execute(
-                    "DELETE FROM events WHERE timestamp < NOW() - INTERVAL '30 days'"
-                )
-                deleted = cursor.rowcount
-                cursor.execute(
-                    "DELETE FROM idempotency_keys WHERE first_seen < NOW() - INTERVAL '7 days'"
-                )
-                conn.commit()
-                if deleted:
-                    logger.info(f"Retention purge: deleted {deleted} events older than 30 days")
-            except Exception as purge_error:
-                logger.warning(f"Retention purge failed (non-fatal): {purge_error}")
-                conn.rollback()
+            threading.Thread(target=_run_retention_purge, daemon=True).start()
 
         conn.close()
-        invalidate_caches()
+        # NOTE: no cache invalidation here. Devices report every few seconds
+        # fleet-wide, so wiping the response caches on every ingest meant the
+        # 30s-TTL aggregates (dashboard, devices, stats) never survived long
+        # enough to serve a second request -- every page load paid a full
+        # multi-second recompute. Read caches expire by TTL instead; admin
+        # and settings writes (which must be visible immediately) still call
+        # invalidate_caches().
         
         logger.info(f"[SUCCESS] Successfully processed device {serial_number}: {len(modules_processed)} modules, {events_stored} events")
         
