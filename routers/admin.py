@@ -15,7 +15,7 @@ from dependencies import (
 router = APIRouter(tags=["admin"])
 
 @router.patch("/device/{serial_number}/archive", dependencies=[Depends(verify_authentication)], tags=["devices"])
-async def archive_device(serial_number: str):
+def archive_device(serial_number: str):
     """
     Archive a device (soft delete).
     
@@ -92,7 +92,7 @@ async def archive_device(serial_number: str):
         raise HTTPException(status_code=500, detail=f"Failed to archive device: {str(e)}")
 
 @router.patch("/device/{serial_number}/unarchive", dependencies=[Depends(verify_authentication)], tags=["devices"])
-async def unarchive_device(serial_number: str):
+def unarchive_device(serial_number: str):
     """
     Unarchive a device (restore from soft delete).
     
@@ -161,7 +161,7 @@ async def unarchive_device(serial_number: str):
         raise HTTPException(status_code=500, detail=f"Failed to unarchive device: {str(e)}")
 
 @router.delete("/device/{serial_number}", dependencies=[Depends(verify_authentication)], tags=["devices"])
-async def delete_device(serial_number: str, confirm: bool = Query(False)):
+def delete_device(serial_number: str, confirm: bool = Query(False)):
     """
     Permanently delete a device and all its data.
     
@@ -277,7 +277,7 @@ async def delete_device(serial_number: str, confirm: bool = Query(False)):
         raise HTTPException(status_code=500, detail=f"Failed to delete device: {str(e)}")
 
 @router.delete("/admin/usage-history/cleanup", dependencies=[Depends(verify_authentication)], tags=["admin"])
-async def cleanup_usage_history(
+def cleanup_usage_history(
     months: int = Query(default=18, ge=1, le=36, description="Retain data for this many months")
 ):
     """
@@ -299,7 +299,7 @@ async def cleanup_usage_history(
         raise HTTPException(status_code=500, detail=str(e))
 
 @router.delete("/admin/installs/clear-errors", dependencies=[Depends(verify_authentication)], tags=["admin"])
-async def clear_stale_installs_errors(
+def clear_stale_installs_errors(
     days: int = Query(default=10, ge=1, le=365, description="Clear errors/warnings from devices that haven't reported in this many days")
 ):
     """
@@ -409,7 +409,7 @@ async def clear_stale_installs_errors(
         raise HTTPException(status_code=500, detail=f"Installs error cleanup failed: {str(e)}")
 
 @router.get("/debug/database", dependencies=[Depends(verify_authentication)], tags=["admin"])
-async def debug_database():
+def debug_database():
     """
     Database diagnostic endpoint - analyze storage usage and data cleanup opportunities.
     
@@ -488,16 +488,22 @@ async def debug_database():
         diagnostics["totalOrphanedRecords"] = total_orphaned
         
         # 3. Check events table - should we have retention policy?
-        cursor.execute("SELECT COUNT(*), MIN(timestamp), MAX(timestamp) FROM events")
-        event_row = cursor.fetchone()
-        diagnostics["events"] = {
-            "totalEvents": event_row[0],
-            "oldestEvent": event_row[1].isoformat() if event_row[1] else None,
-            "newestEvent": event_row[2].isoformat() if event_row[2] else None
-        }
+        # Guarded like the per-table stages above: a slow scan degrades this
+        # section instead of failing the whole diagnostic with a 500.
+        try:
+            cursor.execute("SELECT COUNT(*), MIN(timestamp), MAX(timestamp) FROM events")
+            event_row = cursor.fetchone()
+            diagnostics["events"] = {
+                "totalEvents": event_row[0],
+                "oldestEvent": event_row[1].isoformat() if event_row[1] else None,
+                "newestEvent": event_row[2].isoformat() if event_row[2] else None
+            }
+        except Exception as e:
+            diagnostics["events"] = {"error": str(e)}
         
-        # 4. Table sizes
-        cursor.execute("""
+        # 4. Table sizes (guarded: degrade instead of 500 on slow stats)
+        try:
+            cursor.execute("""
             SELECT 
                 relname,
                 n_live_tup,
@@ -508,15 +514,17 @@ async def debug_database():
                              'applications', 'profiles', 'network', 'security')
             ORDER BY pg_total_relation_size(relid) DESC
         """)
-        table_sizes = []
-        for row in cursor.fetchall():
-            table_sizes.append({
-                "table": row[0],
-                "liveRows": row[1],
-                "deadRows": row[2],
-                "totalSize": row[3]
-            })
-        diagnostics["tableSizes"] = table_sizes
+            table_sizes = []
+            for row in cursor.fetchall():
+                table_sizes.append({
+                    "table": row[0],
+                    "liveRows": row[1],
+                    "deadRows": row[2],
+                    "totalSize": row[3]
+                })
+            diagnostics["tableSizes"] = table_sizes
+        except Exception as e:
+            diagnostics["tableSizes"] = {"error": str(e)}
         
         # 5. Cleanup recommendations
         recommendations = []

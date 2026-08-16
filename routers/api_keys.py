@@ -42,7 +42,7 @@ def _actor(auth: dict) -> str:
 
 
 @router.post("/admin/api-keys", tags=["admin"])
-async def create_api_key(
+def create_api_key(
     body: CreateApiKey,
     auth: dict = Depends(verify_authentication),
 ):
@@ -93,7 +93,7 @@ async def create_api_key(
 
 
 @router.get("/admin/api-keys", tags=["admin"])
-async def list_api_keys(auth: dict = Depends(verify_authentication)):
+def list_api_keys(auth: dict = Depends(verify_authentication)):
     """List API keys (metadata only; secrets are never returned)."""
     conn = get_db_connection()
     cursor = conn.cursor()
@@ -127,7 +127,7 @@ async def list_api_keys(auth: dict = Depends(verify_authentication)):
 
 
 @router.delete("/admin/api-keys/{key_id}", tags=["admin"])
-async def revoke_api_key(
+def revoke_api_key(
     key_id: str,
     auth: dict = Depends(verify_authentication),
 ):

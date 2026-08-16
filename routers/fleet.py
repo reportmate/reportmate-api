@@ -16,7 +16,7 @@ from dependencies import (
 router = APIRouter(tags=["fleet"])
 
 @router.get("/applications/filters", dependencies=[Depends(verify_authentication)], tags=["fleet"])
-async def get_applications_filters(
+def get_applications_filters(
     include_archived: bool = Query(default=False, alias="includeArchived")
 ):
     """
@@ -128,7 +128,7 @@ async def get_applications_filters(
 
 
 @router.get("/applications/usage", dependencies=[Depends(verify_authentication)], tags=["fleet"])
-async def get_fleet_applications_usage(
+def get_fleet_applications_usage(
     request: Request,
     days: int = Query(default=30, ge=1, le=548, description="Lookback window in days"),
     applicationNames: Optional[str] = Query(default=None, description="Comma-separated app names to include"),
@@ -567,7 +567,7 @@ async def get_fleet_applications_usage(
 
 
 @router.get("/applications/usage/by-device", dependencies=[Depends(verify_authentication)], tags=["fleet"])
-async def get_application_usage_by_device(
+def get_application_usage_by_device(
     request: Request,
     app: str = Query(..., description="Application name pattern (substring, case-insensitive)"),
     days: int = Query(default=30, ge=1, le=548, description="Lookback window in days"),
@@ -755,7 +755,7 @@ async def get_application_usage_by_device(
 
 
 @router.get("/applications/collection-health", dependencies=[Depends(verify_authentication)], tags=["fleet"])
-async def get_applications_collection_health(
+def get_applications_collection_health(
     request: Request,
     freshDays: int = Query(default=7, ge=1, le=90, description="Days within which a device is considered healthy"),
     staleDays: int = Query(default=30, ge=1, le=180, description="Days beyond which a device is considered dark"),
@@ -926,7 +926,7 @@ async def get_applications_collection_health(
 
 
 @router.get("/applications/distribution", dependencies=[Depends(verify_authentication)], tags=["fleet"])
-async def get_applications_distribution(
+def get_applications_distribution(
     request: Request,
     applicationNames: str = Query(..., description="Comma-separated app names to aggregate (required)"),
     usages: Optional[str] = Query(default=None, description="Comma-separated inventory usages"),
@@ -1146,7 +1146,7 @@ async def get_applications_distribution(
 
 
 @router.get("/applications", dependencies=[Depends(verify_authentication)], tags=["fleet"])
-async def get_bulk_applications(
+def get_bulk_applications(
     request: Request,
     deviceNames: Optional[str] = None,
     applicationNames: Optional[str] = None,
@@ -1460,7 +1460,7 @@ def _is_on_campus(active_ip, dns_servers) -> bool:
 
 
 @router.get("/hardware", dependencies=[Depends(verify_authentication)], tags=["fleet"])
-async def get_bulk_hardware(
+def get_bulk_hardware(
     include_archived: bool = Query(default=False, alias="includeArchived", description="Include archived devices in results"),
     limit: int = Query(default=2000, ge=1, le=5000, description="Maximum devices to return (default 2000, max 5000)"),
     offset: int = Query(default=0, ge=0, description="Number of items to skip"),
@@ -1634,7 +1634,7 @@ async def get_bulk_hardware(
 
 
 @router.get("/installs/filters", dependencies=[Depends(verify_authentication)], tags=["fleet"])
-async def get_installs_filters(
+def get_installs_filters(
     include_archived: bool = Query(default=False, alias="includeArchived")
 ):
     """
@@ -1774,14 +1774,15 @@ async def get_installs_filters(
             sessions = cimian_data.get('sessions', []) or munki_data.get('sessions', [])
             latest_session = sessions[0] if sessions else None
             
-            # Build device record with slimmed items — keep only fields the frontend needs
-            # for status categorization, error/warning widgets, and drill-down tables.
-            # Drops: type, category, developer, updateCount, failureCount, installCount,
-            # mappedStatus, warningCount, installMethod, pendingReason, totalSessions,
-            # hasInstallLoop, recentAttempts, lastAttemptStatus, lastSeenInSession, installLoopDetected
-            ITEM_KEEP_FIELDS = ('id', 'itemName', 'displayName', 'name', 'itemType',
-                                'currentStatus', 'status', 'lastError', 'lastWarning',
-                                'latestVersion', 'installedVersion', 'lastUpdate', 'lastAttemptTime')
+            # Build device record with slimmed items — keep only fields the
+            # installs page actually reads: names for labels and pill matching,
+            # statuses for categorization, and last error/warning strings for
+            # the drill-down tables. Everything else (ids, versions, item
+            # types, timestamps) came to ~10MB of a 28MB response across
+            # ~113k items and had no reader; per-item version data lives in
+            # the /installs report endpoint.
+            ITEM_KEEP_FIELDS = ('itemName', 'displayName', 'name',
+                                'currentStatus', 'status', 'lastError', 'lastWarning')
             
             cimian_slim = None
             if cimian_data:
@@ -1793,7 +1794,9 @@ async def get_installs_filters(
                     'config': config,
                     'version': cimian_data.get('version'),
                     'status': cimian_data.get('status'),
-                    'sessions': (cimian_data.get('sessions') or [])[:5],
+                    # The page reads only sessions[0].status; five full
+                    # session objects per device were ~6MB of the payload.
+                    'sessions': (cimian_data.get('sessions') or [])[:1],
                     'items': slim_items,
                     'itemCounts': {
                         'total': len(cimian_data.get('items', [])),
@@ -1882,7 +1885,7 @@ async def get_installs_filters(
 
 
 @router.get("/installs", dependencies=[Depends(verify_authentication)], tags=["fleet"])
-async def get_bulk_installs(
+def get_bulk_installs(
     include_archived: bool = Query(default=False, alias="includeArchived", description="Include archived devices in results"),
     limit: Optional[int] = Query(default=None, ge=1, le=5000, description="Maximum items to return"),
     offset: int = Query(default=0, ge=0, description="Number of items to skip"),
@@ -2001,7 +2004,7 @@ async def get_bulk_installs(
 
 
 @router.get("/installs/full", dependencies=[Depends(verify_authentication)], tags=["fleet"])
-async def get_bulk_installs_full(
+def get_bulk_installs_full(
     include_archived: bool = Query(default=False, alias="includeArchived"),
     limit: Optional[int] = Query(default=None, ge=1, le=5000, description="Maximum items to return"),
     offset: int = Query(default=0, ge=0, description="Number of items to skip"),
@@ -2131,7 +2134,7 @@ async def get_bulk_installs_full(
 
 
 @router.get("/network", dependencies=[Depends(verify_authentication)], tags=["fleet"])
-async def get_bulk_network(
+def get_bulk_network(
     include_archived: bool = Query(default=False, alias="includeArchived", description="Include archived devices in results"),
     limit: Optional[int] = Query(default=None, ge=1, le=5000, description="Maximum items to return"),
     offset: int = Query(default=0, ge=0, description="Number of items to skip"),
@@ -2216,7 +2219,7 @@ async def get_bulk_network(
         raise HTTPException(status_code=500, detail=f"Failed to retrieve bulk network: {str(e)}")
 
 @router.get("/security", dependencies=[Depends(verify_authentication)], tags=["fleet"])
-async def get_bulk_security(
+def get_bulk_security(
     include_archived: bool = Query(default=False, alias="includeArchived", description="Include archived devices in results"),
     limit: Optional[int] = Query(default=None, ge=1, le=5000, description="Maximum items to return"),
     offset: int = Query(default=0, ge=0, description="Number of items to skip"),
@@ -2386,7 +2389,7 @@ async def get_bulk_security(
 CERT_SEARCH_HARD_LIMIT = 10000
 
 @router.get("/security/certificates", dependencies=[Depends(verify_authentication)], tags=["fleet"])
-async def search_fleet_certificates(
+def search_fleet_certificates(
     search: str = Query(default="", description="Search term to match against certificate commonName, issuer, subject, or serialNumber"),
     status: str = Query(default="all", description="Filter by certificate status: all, valid, expired, expiring"),
     limit: int = Query(default=1000, ge=1, le=CERT_SEARCH_HARD_LIMIT, description=f"Maximum results to return (max {CERT_SEARCH_HARD_LIMIT})"),
@@ -2500,7 +2503,7 @@ def _detect_mdm_provider_from_url(url: str) -> str:
 
 
 @router.get("/management", dependencies=[Depends(verify_authentication)], tags=["fleet"])
-async def get_bulk_management(
+def get_bulk_management(
     include_archived: bool = Query(default=False, alias="includeArchived", description="Include archived devices in results"),
     limit: Optional[int] = Query(default=None, ge=1, le=5000, description="Maximum items to return"),
     offset: int = Query(default=0, ge=0, description="Number of items to skip"),
@@ -2698,7 +2701,7 @@ async def get_bulk_management(
         raise HTTPException(status_code=500, detail=f"Failed to retrieve bulk management: {str(e)}")
 
 @router.get("/inventory", dependencies=[Depends(verify_authentication)], tags=["fleet"])
-async def get_bulk_inventory(
+def get_bulk_inventory(
     include_archived: bool = Query(default=False, alias="includeArchived", description="Include archived devices in results"),
     limit: Optional[int] = Query(default=None, ge=1, le=5000, description="Maximum items to return"),
     offset: int = Query(default=0, ge=0, description="Number of items to skip"),
@@ -2768,7 +2771,7 @@ async def get_bulk_inventory(
         raise HTTPException(status_code=500, detail=f"Failed to retrieve bulk inventory: {str(e)}")
 
 @router.get("/system", dependencies=[Depends(verify_authentication)], tags=["fleet"])
-async def get_bulk_system(
+def get_bulk_system(
     include_archived: bool = Query(default=False, alias="includeArchived", description="Include archived devices in results"),
     limit: int = Query(default=1000, le=5000, description="Maximum number of devices to return (default 1000, max 5000)"),
     offset: int = Query(default=0, ge=0, description="Number of items to skip"),
@@ -2988,7 +2991,7 @@ async def get_bulk_system(
         raise HTTPException(status_code=500, detail=f"Failed to retrieve bulk system: {str(e)}")
 
 @router.get("/peripherals", dependencies=[Depends(verify_authentication)], tags=["fleet"])
-async def get_bulk_peripherals(
+def get_bulk_peripherals(
     include_archived: bool = Query(default=False, alias="includeArchived", description="Include archived devices in results"),
     limit: Optional[int] = Query(default=None, ge=1, le=5000, description="Maximum items to return"),
     offset: int = Query(default=0, ge=0, description="Number of items to skip"),
@@ -3096,7 +3099,7 @@ async def get_bulk_peripherals(
         raise HTTPException(status_code=500, detail=f"Failed to retrieve bulk peripherals: {str(e)}")
 
 @router.get("/identity", dependencies=[Depends(verify_authentication)], tags=["fleet"])
-async def get_bulk_identity(
+def get_bulk_identity(
     include_archived: bool = Query(default=False, alias="includeArchived", description="Include archived devices in results"),
     limit: Optional[int] = Query(default=None, ge=1, le=5000, description="Maximum items to return"),
     offset: int = Query(default=0, ge=0, description="Number of items to skip"),
@@ -3313,7 +3316,7 @@ async def get_bulk_identity(
 
 
 @router.get("/profiles", dependencies=[Depends(verify_authentication)], tags=["fleet"])
-async def get_bulk_profiles(
+def get_bulk_profiles(
     include_archived: bool = Query(default=False, alias="includeArchived", description="Include archived devices in results"),
     limit: Optional[int] = Query(default=None, ge=1, le=5000, description="Maximum items to return"),
     offset: int = Query(default=0, ge=0, description="Number of items to skip"),
