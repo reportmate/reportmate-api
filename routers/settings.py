@@ -37,7 +37,7 @@ _CACHE_NS = "settings"
 _CONTROL_PLANE_METHODS = {"internal_secret", "auth_disabled"}
 
 
-async def require_internal_secret(auth: dict = Depends(verify_authentication)):
+def require_internal_secret(auth: dict = Depends(verify_authentication)):
     """Allow only internal-service callers (the admin-gated proxy). Rejects the
     fleet passphrase and managed-identity callers used for device ingestion."""
     if (auth or {}).get("method") not in _CONTROL_PLANE_METHODS:
@@ -108,7 +108,7 @@ def _validate_document(doc: Any) -> SettingsDocument:
 
 
 @router.get("/settings", dependencies=[Depends(verify_authentication)], tags=["settings"])
-async def get_settings():
+def get_settings():
     """Return the org-scoped settings document.
 
     When no document exists yet, returns ``{"exists": false, "value": null}`` so
@@ -224,7 +224,7 @@ async def put_settings(
 
 
 @router.get("/settings/inventory/discover", dependencies=[Depends(require_internal_secret)], tags=["settings"])
-async def discover_inventory_keys(
+def discover_inventory_keys(
     include_archived: bool = Query(default=False, description="Include archived devices in discovery"),
 ):
     """Discover the inventory keys present across the fleet, with sample values.

@@ -13,6 +13,7 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import JSONResponse
 from slowapi import _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
@@ -152,6 +153,12 @@ app.add_middleware(
 # Innermost of the custom middlewares: 429s (rate limit) and error responses
 # skip it, and request-id still stamps 304s.
 app.add_middleware(ETagMiddleware)
+
+# Outside ETag so the tag is computed on the uncompressed body and 304s
+# skip compression entirely. Fleet payloads are large, repetitive JSON
+# (devices ~1MB, installs filters ~27MB raw) that compresses an order
+# of magnitude.
+app.add_middleware(GZipMiddleware, minimum_size=1024)
 
 # Added before the request-id middleware so request-id wraps it and 429
 # responses still carry X-Request-ID.

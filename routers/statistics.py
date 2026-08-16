@@ -1,11 +1,14 @@
 """Fleet analytics, dashboard data, and reporting endpoints."""
 
+import asyncio
 import json
 import time as _time
+from collections import defaultdict
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query
+from starlette.concurrency import run_in_threadpool
 
 from dependencies import (
     cache_get, cache_set, get_db_connection, load_sql, logger,
@@ -13,6 +16,10 @@ from dependencies import (
 )
 
 router = APIRouter(tags=["statistics"])
+
+# Single-flight locks per dashboard cache key: when the cache is cold, only
+# one request recomputes; concurrent requests await it and read the cache.
+_dashboard_locks = defaultdict(asyncio.Lock)
 
 @router.get("/dashboard", dependencies=[Depends(verify_authentication)], tags=["statistics"])
 async def get_dashboard_data(
@@ -39,15 +46,31 @@ async def get_dashboard_data(
             "lastUpdated": str          # ISO8601 timestamp
         }
     """
-    conn = None
-    try:
-        _t0 = _time.monotonic()
+    _ckey = (include_archived, events_limit)
+    _cached = cache_get("dashboard", _ckey)
+    if _cached is not None:
+        return _cached
 
-        # Check in-memory cache before hitting the database
-        _ckey = (include_archived, events_limit)
+    async with _dashboard_locks[_ckey]:
+        # Re-check after waiting: the holder that just released the lock has
+        # already stored a fresh result.
         _cached = cache_get("dashboard", _ckey)
         if _cached is not None:
             return _cached
+
+        # The compute is synchronous DB work; run it off the event loop so a
+        # multi-second recompute cannot stall ingest and health traffic.
+        result = await run_in_threadpool(
+            _compute_dashboard_data, events_limit, include_archived
+        )
+        cache_set("dashboard", result, _ckey)
+        return result
+
+
+def _compute_dashboard_data(events_limit: int, include_archived: bool):
+    conn = None
+    try:
+        _t0 = _time.monotonic()
 
         conn = get_db_connection()
         cursor = conn.cursor()
@@ -170,11 +193,12 @@ async def get_dashboard_data(
         _t5 = _time.monotonic()
         logger.info(f"[DASHBOARD PERF] device transform: {_t5-_t4:.3f}s")
 
-        # === INSTALL STATS - per-device aggregation, one scan of installs ===
-        # Computes both item totals (sum of error/warning items) AND device counts
-        # (number of distinct devices with at least one error/warning), split by
-        # platform. Device counts mirror the /devices/installs page categorization
-        # so the dashboard widgets match what the user sees on that page.
+        # === INSTALL STATS - plain aggregate over precomputed counters ===
+        # The per-device error/warning counts are maintained at ingest time
+        # (and backfilled by migration 0003), so this is a cheap column scan
+        # over ~1 row per device instead of expanding every install item's
+        # JSONB per request. Item totals and device counts stay split by
+        # platform, mirroring the /devices/installs page categorization.
         install_stats = {
             "devicesWithErrors": 0, "devicesWithWarnings": 0,
             "winDevicesWithErrors": 0, "winDevicesWithWarnings": 0,
@@ -190,46 +214,33 @@ async def get_dashboard_data(
                     SELECT
                         d.serial_number,
                         LOWER(COALESCE(d.platform, '')) AS plat,
-                        (SELECT COUNT(*) FROM jsonb_array_elements(COALESCE(i.data->'cimian'->'items','[]'::jsonb)) item
-                         WHERE LOWER(item->>'currentStatus') ~ '(error|failed|problem|install-error)'
-                            OR LOWER(item->>'currentStatus') = 'needs_reinstall'
-                        ) AS cimian_errors,
-                        (SELECT COUNT(*) FROM jsonb_array_elements(COALESCE(i.data->'cimian'->'items','[]'::jsonb)) item
-                         WHERE LOWER(item->>'currentStatus') ~ '(warning|needs-attention)'
-                        ) AS cimian_warnings,
-                        (SELECT COUNT(*) FROM jsonb_array_elements(COALESCE(i.data->'munki'->'items','[]'::jsonb)) item
-                         WHERE LOWER(item->>'status') ~ '(error|failed)'
-                        ) AS munki_errors,
-                        (SELECT COUNT(*) FROM jsonb_array_elements(COALESCE(i.data->'munki'->'items','[]'::jsonb)) item
-                         WHERE LOWER(item->>'status') LIKE '%%warning%%'
-                        ) AS munki_warnings
+                        i.cimian_errors,
+                        i.cimian_warnings,
+                        i.munki_errors,
+                        i.munki_warnings
                     FROM installs i
                     INNER JOIN devices d ON d.serial_number = i.device_id
                     WHERE d.archived = FALSE
-                      AND (
-                          jsonb_typeof(i.data->'cimian'->'items') = 'array'
-                          OR jsonb_typeof(i.data->'munki'->'items') = 'array'
-                      )
                 )
                 SELECT
                     -- Item totals (per platform)
-                    COALESCE(SUM(CASE WHEN plat LIKE '%%windows%%' THEN cimian_errors   ELSE 0 END), 0) AS win_error_items,
-                    COALESCE(SUM(CASE WHEN plat LIKE '%%windows%%' THEN cimian_warnings ELSE 0 END), 0) AS win_warning_items,
-                    COALESCE(SUM(CASE WHEN plat LIKE '%%mac%%'     THEN munki_errors    ELSE 0 END), 0) AS mac_error_items,
-                    COALESCE(SUM(CASE WHEN plat LIKE '%%mac%%'     THEN munki_warnings  ELSE 0 END), 0) AS mac_warning_items,
+                    COALESCE(SUM(CASE WHEN plat ~ 'windows' THEN cimian_errors   ELSE 0 END), 0) AS win_error_items,
+                    COALESCE(SUM(CASE WHEN plat ~ 'windows' THEN cimian_warnings ELSE 0 END), 0) AS win_warning_items,
+                    COALESCE(SUM(CASE WHEN plat ~ 'mac'     THEN munki_errors    ELSE 0 END), 0) AS mac_error_items,
+                    COALESCE(SUM(CASE WHEN plat ~ 'mac'     THEN munki_warnings  ELSE 0 END), 0) AS mac_warning_items,
                     -- Device counts (per platform)
-                    COUNT(DISTINCT CASE WHEN plat LIKE '%%windows%%' AND cimian_errors   > 0 THEN serial_number END) AS win_devices_errors,
-                    COUNT(DISTINCT CASE WHEN plat LIKE '%%windows%%' AND cimian_warnings > 0 THEN serial_number END) AS win_devices_warnings,
-                    COUNT(DISTINCT CASE WHEN plat LIKE '%%mac%%'     AND munki_errors    > 0 THEN serial_number END) AS mac_devices_errors,
-                    COUNT(DISTINCT CASE WHEN plat LIKE '%%mac%%'     AND munki_warnings  > 0 THEN serial_number END) AS mac_devices_warnings,
+                    COUNT(DISTINCT CASE WHEN plat ~ 'windows' AND cimian_errors   > 0 THEN serial_number END) AS win_devices_errors,
+                    COUNT(DISTINCT CASE WHEN plat ~ 'windows' AND cimian_warnings > 0 THEN serial_number END) AS win_devices_warnings,
+                    COUNT(DISTINCT CASE WHEN plat ~ 'mac'     AND munki_errors    > 0 THEN serial_number END) AS mac_devices_errors,
+                    COUNT(DISTINCT CASE WHEN plat ~ 'mac'     AND munki_warnings  > 0 THEN serial_number END) AS mac_devices_warnings,
                     -- Device counts (cross-platform)
                     COUNT(DISTINCT CASE
-                        WHEN (plat LIKE '%%windows%%' AND cimian_errors   > 0)
-                          OR (plat LIKE '%%mac%%'     AND munki_errors    > 0)
+                        WHEN (plat ~ 'windows' AND cimian_errors > 0)
+                          OR (plat ~ 'mac'     AND munki_errors  > 0)
                         THEN serial_number END) AS devices_errors,
                     COUNT(DISTINCT CASE
-                        WHEN (plat LIKE '%%windows%%' AND cimian_warnings > 0)
-                          OR (plat LIKE '%%mac%%'     AND munki_warnings  > 0)
+                        WHEN (plat ~ 'windows' AND cimian_warnings > 0)
+                          OR (plat ~ 'mac'     AND munki_warnings  > 0)
                         THEN serial_number END) AS devices_warnings,
                     COUNT(*) > 0 AS has_data
                 FROM device_install
@@ -259,22 +270,16 @@ async def get_dashboard_data(
         _t6 = _time.monotonic()
         logger.info(f"[DASHBOARD PERF] install stats: {_t6-_t5:.3f}s (devices_errors={install_stats['devicesWithErrors']}, devices_warnings={install_stats['devicesWithWarnings']})")
 
-        # === EVENTS (per-type diverse fetch via window function) ===
+        # === EVENTS (per-type diverse fetch, bounded index scans) ===
         # A plain ORDER BY timestamp returns 100% info events because every
-        # module collection creates one.  Window function picks top-N per type
-        # so success/warning/error/system are always represented.
+        # module collection creates one, so top-N is taken per type to keep
+        # success/warning/error/system represented. Each branch is a bounded
+        # scan of idx_events_type_timestamp_desc (migration 0003) -- the
+        # previous window function sorted the entire events table (~1.4M
+        # rows) on every call.
         events = []
         try:
             cursor.execute("""
-                WITH ranked AS (
-                    SELECT e.id, e.device_id, e.event_type, e.message, e.timestamp,
-                           ROW_NUMBER() OVER (
-                               PARTITION BY e.event_type
-                               ORDER BY e.timestamp DESC
-                           ) AS rn
-                    FROM events e
-                    WHERE e.event_type IN ('success','warning','error','system','info')
-                )
                 SELECT r.id, r.device_id, r.event_type, r.message, r.timestamp,
                        COALESCE(
                            NULLIF(NULLIF(i.data->>'deviceName',''),'Unknown'),
@@ -286,12 +291,31 @@ async def get_dashboard_data(
                            s.data->'operatingSystem'->>'name',
                            i.data->>'platform'
                        ) AS platform
-                FROM ranked r
+                FROM (
+                    (SELECT id, device_id, event_type, message, timestamp
+                     FROM events WHERE event_type = 'success'
+                     ORDER BY timestamp DESC LIMIT %s)
+                    UNION ALL
+                    (SELECT id, device_id, event_type, message, timestamp
+                     FROM events WHERE event_type = 'warning'
+                     ORDER BY timestamp DESC LIMIT %s)
+                    UNION ALL
+                    (SELECT id, device_id, event_type, message, timestamp
+                     FROM events WHERE event_type = 'error'
+                     ORDER BY timestamp DESC LIMIT %s)
+                    UNION ALL
+                    (SELECT id, device_id, event_type, message, timestamp
+                     FROM events WHERE event_type = 'system'
+                     ORDER BY timestamp DESC LIMIT %s)
+                    UNION ALL
+                    (SELECT id, device_id, event_type, message, timestamp
+                     FROM events WHERE event_type = 'info'
+                     ORDER BY timestamp DESC LIMIT %s)
+                ) r
                 LEFT JOIN inventory i ON r.device_id = i.device_id
                 LEFT JOIN system s ON r.device_id = s.device_id
-                WHERE r.rn <= %s
                 ORDER BY r.timestamp DESC
-            """, (events_limit,))
+            """, (events_limit,) * 5)
 
             for row in cursor.fetchall():
                 event_id, device_id, event_type, message, timestamp, device_name, asset_tag, platform = row
@@ -332,9 +356,8 @@ async def get_dashboard_data(
             "lastUpdated": datetime.now(timezone.utc).isoformat()
         }
 
-        # Store in cache
-        cache_set("dashboard", result, _ckey)
-
+        # Caching happens in the async endpoint wrapper (under the
+        # single-flight lock), not here.
         return result
         
     except Exception as e:
@@ -344,7 +367,7 @@ async def get_dashboard_data(
         raise HTTPException(status_code=500, detail=f"Failed to retrieve dashboard data: {str(e)}")
 
 @router.get("/stats/installs", dependencies=[Depends(verify_authentication)], tags=["statistics"])
-async def get_install_stats():
+def get_install_stats():
     """
     Get aggregated install statistics for dashboard widgets.
     
