@@ -356,6 +356,12 @@ def get_fleet_applications_usage(
 
         applications: List[Dict[str, Any]] = []
         total_seconds_sum = 0.0
+        # Summed separately from total_seconds because the two answer different
+        # questions. total_seconds is process lifetime summed over concurrent
+        # processes and has no wall-clock ceiling, so its fleet sum routinely
+        # exceeds devices x 24 x days by more than an order of magnitude and is
+        # not reportable on its own. Work item 4251; surfaced by 4521.
+        total_active_seconds_sum = 0.0
         total_launches_sum = 0
         single_user_apps: List[Dict[str, Any]] = []
         all_users: set = set()
@@ -414,6 +420,7 @@ def get_fleet_applications_usage(
             })
 
             total_seconds_sum += total_secs
+            total_active_seconds_sum += active_secs
             total_launches_sum += launch_count
             all_users.update(users)
             all_devices.update(devices)
@@ -521,12 +528,18 @@ def get_fleet_applications_usage(
 
         summary = {
             "totalAppsTracked": len(applications),
+            "totalActiveHours": round(total_active_seconds_sum / 3600, 2),
             "totalUsageHours": round(total_seconds_sum / 3600, 2),
             "totalLaunches": total_launches_sum,
             "uniqueUsers": len(all_users),
             "uniqueDevices": len(all_devices),
             "singleUserAppCount": len(single_user_apps),
             "unusedAppCount": 0,
+            # How many applications drew no active use at all in the window.
+            # Overwhelmingly background services, which is why a report headed
+            # by total hours reads as though the fleet's busiest software is a
+            # set of daemons nobody has opened.
+            "noActiveUseAppCount": sum(1 for a in applications if not a["activeSeconds"]),
         }
 
         result = {
