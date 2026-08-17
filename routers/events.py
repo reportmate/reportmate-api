@@ -13,13 +13,16 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from slowapi import Limiter
 from slowapi.util import get_remote_address
 
+from starlette.requests import ClientDisconnect
+
 from dependencies import (
     broadcast_event, cache_get, cache_set, get_db_connection,
     load_sql, logger, paginate,
     verify_authentication, VALID_MODULE_NAMES,
     infer_platform, build_os_summary,
     EventSubmission,
-    extract_ingest_identity, record_ingest_failure,
+    extract_ingest_identity, extract_ingest_identity_headers,
+    merge_ingest_identity, record_ingest_failure, resolve_client_ip,
 )
 
 router = APIRouter(tags=["events"])
@@ -81,20 +84,47 @@ def _run_retention_purge():
         logger.warning(f"Retention purge failed (non-fatal): {purge_error}")
 
 
+def _transport_note(request: Request, received, error):
+    """How much of the body actually arrived, and what went wrong reading it.
+
+    A rejection that only says "not valid JSON" cannot distinguish a client
+    serializing garbage from an upload that died in flight, and those have
+    opposite fixes. Declared vs received length plus the exception class
+    separates them at a glance, so it rides along in the detail the failures
+    view already renders."""
+    declared = request.headers.get("content-length")
+    parts = ["declared=" + (declared if declared is not None else "absent")]
+    if received is not None:
+        parts.append(f"received={received}")
+    encoding = request.headers.get("content-encoding")
+    if encoding:
+        parts.append(f"encoding={encoding}")
+    if error is not None:
+        parts.append(f"error={type(error).__name__}")
+    return "[" + " ".join(parts) + "]"
+
+
 def _reject_ingest(request: Request, payload, *, reason: str, detail: str,
                    status_code: int = 400):
     """Persist a rejected check-in with whatever identity it presented, then
     raise the HTTP error. The device failed validation, but it still told us
-    who it is -- that is exactly what /events/failures exists to surface."""
+    who it is -- that is exactly what /events/failures exists to surface.
+
+    Identity comes from the body when it parsed and from the mirrored request
+    headers when it did not, so a rejection stays attributable even when the
+    payload was never readable."""
     record_ingest_failure(
         failure_type="validation",
         reason=reason,
         status_code=status_code,
         detail=detail,
         endpoint=request.url.path,
-        client_ip=request.client.host if request.client else None,
+        client_ip=resolve_client_ip(request),
         user_agent=request.headers.get("user-agent"),
-        identity=extract_ingest_identity(payload),
+        identity=merge_ingest_identity(
+            extract_ingest_identity(payload),
+            extract_ingest_identity_headers(request),
+        ),
     )
     raise HTTPException(status_code=status_code, detail=detail)
 
@@ -351,9 +381,14 @@ def get_ingest_failures(
 
     Reason codes: auth -> invalid_passphrase, invalid_api_key,
     invalid_bearer_token, invalid_internal_secret, missing_credentials,
-    insufficient_scope; validation -> malformed_json, invalid_payload,
-    empty_serial, sentinel_serial, short_serial, hostname_serial,
-    serial_equals_hostname.
+    insufficient_scope; validation -> upload_aborted, body_unreadable,
+    empty_body, malformed_json, invalid_payload, empty_serial,
+    sentinel_serial, short_serial, hostname_serial, serial_equals_hostname.
+
+    upload_aborted / body_unreadable / empty_body are transport failures --
+    the device reached the server but its payload did not arrive intact.
+    malformed_json means a body that arrived and did not parse. The detail
+    carries declared vs received byte counts so the two stay separable.
     """
     try:
         _ckey = (limit, offset, serial or '', reason or '', hours)
@@ -549,13 +584,48 @@ async def submit_events(request: Request):
     }
     """
     try:
+        # Read the body explicitly rather than via request.json(), which
+        # collapses "the client hung up mid-upload" and "the client sent
+        # garbage" into a single exception. Those have opposite fixes -- one
+        # is a network story, the other a client-serializer story -- and the
+        # failures view is only actionable if it can tell them apart.
+        raw_body = None
         try:
-            payload = await request.json()
-        except Exception:
+            raw_body = await request.body()
+        except ClientDisconnect as disconnect_error:
+            _reject_ingest(
+                request, None,
+                reason="upload_aborted",
+                detail="Client disconnected before the request body arrived. "
+                       + _transport_note(request, None, disconnect_error),
+            )
+        except Exception as body_error:
+            _reject_ingest(
+                request, None,
+                reason="body_unreadable",
+                detail=f"Request body could not be read: {body_error} "
+                       + _transport_note(request, None, body_error),
+            )
+
+        if not raw_body:
+            _reject_ingest(
+                request, None,
+                reason="empty_body",
+                detail="Request body was empty. "
+                       + _transport_note(request, 0, None),
+            )
+
+        try:
+            payload = json.loads(raw_body)
+        except Exception as parse_error:
+            # A body that arrived short of its declared length is a truncated
+            # upload wearing a parse error's clothes; _transport_note is what
+            # tells the two apart on the failures page.
             _reject_ingest(
                 request, None,
                 reason="malformed_json",
-                detail="Request body is not valid JSON",
+                detail=f"Request body is not valid JSON: {parse_error} "
+                       + _transport_note(request, len(raw_body), parse_error),
             )
 
         # Validate top-level structure via Pydantic
@@ -916,7 +986,7 @@ async def submit_events(request: Request):
                                                 f"{len(clamped)} with negatives clamped {clamped[:5]}, "
                                                 f"{len(capped)} at daily active/foreground ceiling {capped[:5]}"),
                                         endpoint=request.url.path,
-                                        client_ip=request.client.host if request.client else None,
+                                        client_ip=resolve_client_ip(request),
                                         user_agent=request.headers.get("user-agent"),
                                         identity=extract_ingest_identity(payload),
                                     )
