@@ -252,6 +252,7 @@ def test_failures_endpoint_lists_rows(monkeypatch):
     conn = RecordingConnection(
         results=[
             (3,),                                  # count fetchone
+            (3, 0),                                # outcome counts fetchone
             [("invalid_passphrase", 3, 1, now)],   # summary fetchall
             [row],                                 # list fetchall
         ]
@@ -274,6 +275,165 @@ def test_failures_endpoint_lists_rows(monkeypatch):
     assert f["reason"] == "invalid_passphrase"
     assert f["statusCode"] == 401
     assert f["ts"] == now.isoformat()
+    assert f["outcome"] == "rejected"
+
+
+# ---------------------------------------------------------------------------
+# outcome: repaired check-ins are not failures
+#
+# nul_in_payload and usage_out_of_bounds are recorded at 200 -- the data was
+# kept, the client defect is the news. At fleet scale that is thousands of
+# rows a day, which buries the handful of devices that genuinely could not get
+# in on a page that exists to surface exactly those. The split is derived from
+# the recorded status so it reads correctly over rows written before it.
+# ---------------------------------------------------------------------------
+
+def _failures_conn(now, rows, count=None, counts=(0, 0), summary=None):
+    return RecordingConnection(
+        results=[
+            (len(rows) if count is None else count,),
+            counts,
+            summary if summary is not None else [],
+            rows,
+        ]
+    )
+
+
+def _row(reason, status, serial="TESTSERIAL0001", ts=None):
+    return (
+        7, ts, "validation", reason, "detail", status,
+        "/api/v1/events", "10.1.2.3", "ReportMate/2026.08.16",
+        serial, "1111", "EXAMPLE-PC", "Windows", "2026.08.16",
+    )
+
+
+def _outcome_params(conn):
+    """Params of every query that actually carries the outcome predicate."""
+    params = [q[1] for q in conn.cur.queries if "%(outcome)s" in q[0]]
+    assert params, "no query carried the outcome predicate"
+    return params
+
+
+def test_failures_default_to_rejected_only(monkeypatch):
+    import routers.events as events_router
+
+    dependencies.invalidate_caches()
+    now = datetime.now(timezone.utc)
+    conn = _failures_conn(now, [_row("malformed_json", 400, ts=now)], counts=(9, 300))
+    monkeypatch.setattr(events_router, "get_db_connection", lambda: conn)
+
+    resp = TestClient(app).get(
+        "/api/v1/events/failures?hours=24",
+        headers={"X-Internal-Secret": "test-internal-secret"},
+    )
+    body = resp.json()
+    assert body["outcome"] == "rejected"
+    # The caller asked for nothing, so the page must not be dominated by rows
+    # whose check-in succeeded.
+    assert all(p["outcome"] == "rejected" for p in _outcome_params(conn))
+
+
+def test_accepted_outcome_is_reachable(monkeypatch):
+    import routers.events as events_router
+
+    dependencies.invalidate_caches()
+    now = datetime.now(timezone.utc)
+    conn = _failures_conn(now, [_row("nul_in_payload", 200, ts=now)], counts=(9, 300))
+    monkeypatch.setattr(events_router, "get_db_connection", lambda: conn)
+
+    resp = TestClient(app).get(
+        "/api/v1/events/failures?hours=24&outcome=accepted",
+        headers={"X-Internal-Secret": "test-internal-secret"},
+    )
+    body = resp.json()
+    assert body["outcome"] == "accepted"
+    assert body["failures"][0]["outcome"] == "accepted"
+    assert all(p["outcome"] == "accepted" for p in _outcome_params(conn))
+
+
+def test_outcome_all_drops_the_filter(monkeypatch):
+    import routers.events as events_router
+
+    dependencies.invalidate_caches()
+    now = datetime.now(timezone.utc)
+    conn = _failures_conn(now, [_row("malformed_json", 400, ts=now)], counts=(9, 300))
+    monkeypatch.setattr(events_router, "get_db_connection", lambda: conn)
+
+    TestClient(app).get(
+        "/api/v1/events/failures?hours=24&outcome=all",
+        headers={"X-Internal-Secret": "test-internal-secret"},
+    )
+    assert all(p["outcome"] is None for p in _outcome_params(conn))
+
+
+def test_both_counts_are_always_present(monkeypatch):
+    """The other side has to be one click away, not invisible."""
+    import routers.events as events_router
+
+    dependencies.invalidate_caches()
+    now = datetime.now(timezone.utc)
+    conn = _failures_conn(now, [_row("malformed_json", 400, ts=now)], counts=(9, 2947))
+    monkeypatch.setattr(events_router, "get_db_connection", lambda: conn)
+
+    body = TestClient(app).get(
+        "/api/v1/events/failures?hours=24",
+        headers={"X-Internal-Secret": "test-internal-secret"},
+    ).json()
+    assert body["counts"] == {"rejected": 9, "accepted": 2947}
+
+
+def test_outcome_rejects_unknown_values(monkeypatch):
+    import routers.events as events_router
+
+    dependencies.invalidate_caches()
+    monkeypatch.setattr(events_router, "get_db_connection", lambda: RecordingConnection())
+    resp = TestClient(app).get(
+        "/api/v1/events/failures?outcome=whatever",
+        headers={"X-Internal-Secret": "test-internal-secret"},
+    )
+    assert resp.status_code == 422
+
+
+def test_rows_are_classified_by_recorded_status(monkeypatch):
+    """Derived, not stored -- so rows written before the split read correctly."""
+    import routers.events as events_router
+
+    dependencies.invalidate_caches()
+    now = datetime.now(timezone.utc)
+    rows = [_row("nul_in_payload", 200, ts=now), _row("rate_limited", 429, ts=now),
+            _row("upload_aborted", None, ts=now)]
+    conn = _failures_conn(now, rows, counts=(2, 1))
+    monkeypatch.setattr(events_router, "get_db_connection", lambda: conn)
+
+    body = TestClient(app).get(
+        "/api/v1/events/failures?hours=24&outcome=all",
+        headers={"X-Internal-Secret": "test-internal-secret"},
+    ).json()
+    assert [f["outcome"] for f in body["failures"]] == ["accepted", "rejected", "rejected"]
+
+
+def test_outcome_is_part_of_the_cache_key(monkeypatch):
+    """Otherwise the first caller's view is served to the other tab."""
+    import routers.events as events_router
+
+    dependencies.invalidate_caches()
+    now = datetime.now(timezone.utc)
+    rejected = _failures_conn(now, [_row("malformed_json", 400, ts=now)], counts=(1, 5))
+    monkeypatch.setattr(events_router, "get_db_connection", lambda: rejected)
+    first = TestClient(app).get(
+        "/api/v1/events/failures?hours=24",
+        headers={"X-Internal-Secret": "test-internal-secret"},
+    ).json()
+
+    accepted = _failures_conn(now, [_row("nul_in_payload", 200, ts=now)], counts=(1, 5))
+    monkeypatch.setattr(events_router, "get_db_connection", lambda: accepted)
+    second = TestClient(app).get(
+        "/api/v1/events/failures?hours=24&outcome=accepted",
+        headers={"X-Internal-Secret": "test-internal-secret"},
+    ).json()
+
+    assert first["failures"][0]["reason"] == "malformed_json"
+    assert second["failures"][0]["reason"] == "nul_in_payload"
 
 
 def test_failures_endpoint_requires_auth(monkeypatch):

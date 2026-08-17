@@ -401,6 +401,12 @@ def get_ingest_failures(
     serial: Optional[str] = Query(default=None, description="Filter by serial number (case-insensitive substring)"),
     reason: Optional[str] = Query(default=None, description="Filter by rejection reason code"),
     hours: int = Query(default=168, ge=1, le=2160, description="Look-back window in hours (default 7 days)"),
+    outcome: str = Query(
+        default="rejected",
+        pattern="^(rejected|accepted|all)$",
+        description="rejected (default) = the check-in was turned away; "
+                    "accepted = kept but repaired on the way in; all = both",
+    ),
 ):
     """
     Rejected device check-ins (failed registrations).
@@ -424,26 +430,53 @@ def get_ingest_failures(
     200 -- the check-in was accepted, but it carried a client defect worth
     seeing.
 
+    Those two are therefore NOT failures, and ``outcome`` keeps them out of a
+    view whose whole promise is "these devices did not get through". The split
+    is derived from the recorded status rather than a stored flag, so it reads
+    correctly over history as well: outcome=rejected is status >= 400 (or
+    unrecorded), outcome=accepted is status < 400. A client defect that the
+    server repairs can be several thousand rows a day -- large enough to bury
+    the handful of genuinely rejected devices this page exists to surface --
+    while still being worth watching until the client-side fix rolls out.
+    counts.rejected / counts.accepted are always both present so the other
+    side is one click away rather than invisible.
+
     upload_aborted / body_unreadable / empty_body are transport failures --
     the device reached the server but its payload did not arrive intact.
     malformed_json means a body that arrived and did not parse. The detail
     carries declared vs received byte counts so the two stay separable.
     """
     try:
-        _ckey = (limit, offset, serial or '', reason or '', hours)
+        _ckey = (limit, offset, serial or '', reason or '', hours, outcome)
         _cached = cache_get("events_failures", _ckey)
         if _cached is not None:
             return _cached
         conn = get_db_connection()
         cursor = conn.cursor()
 
-        filter_params = {"hours": hours, "serial": serial, "reason": reason}
+        outcome_filter = None if outcome == "all" else outcome
+        filter_params = {
+            "hours": hours,
+            "serial": serial,
+            "reason": reason,
+            "outcome": outcome_filter,
+        }
         cursor.execute(load_sql("events/count_ingest_failures"), filter_params)
         total = cursor.fetchone()[0]
 
         cursor.execute(
-            load_sql("events/summary_ingest_failures"),
+            load_sql("events/outcome_counts_ingest_failures"),
             {"hours": hours, "serial": serial},
+        )
+        _counts_row = cursor.fetchone()
+        counts = {
+            "rejected": _counts_row[0] if _counts_row else 0,
+            "accepted": _counts_row[1] if _counts_row else 0,
+        }
+
+        cursor.execute(
+            load_sql("events/summary_ingest_failures"),
+            {"hours": hours, "serial": serial, "outcome": outcome_filter},
         )
         summary = [
             {
@@ -474,6 +507,7 @@ def get_ingest_failures(
                 "reason": fail_reason,
                 "detail": detail,
                 "statusCode": status_code,
+                "outcome": "accepted" if status_code is not None and status_code < 400 else "rejected",
                 "endpoint": endpoint,
                 "clientIp": client_ip,
                 "userAgent": user_agent,
@@ -493,6 +527,8 @@ def get_ingest_failures(
             "limit": limit,
             "offset": offset,
             "hours": hours,
+            "outcome": outcome,
+            "counts": counts,
         }
         cache_set("events_failures", _result, _ckey)
         return _result
