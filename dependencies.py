@@ -268,10 +268,17 @@ DATABASE_URL = os.getenv(
     "DATABASE_URL", "postgresql://reportmate:password@localhost:5432/reportmate"
 )
 
-# Connection-pool sizing. Defaults are conservative for a scale-to-zero
-# container serving one fleet; raise DB_POOL_MAX for higher concurrency.
+# Connection-pool sizing. The ceiling must cover the request threadpool:
+# endpoints run as sync functions in Starlette's threadpool (40 workers), and
+# the pool blocks borrowers when exhausted -- with a 10-connection cap, a
+# burst of a dozen slow bulk-endpoint requests held every connection for
+# 10-15s and queued everything else past the frontend's 30s abort (observed
+# as empty report pages while the database sat at 12% CPU). Sized to the
+# threadpool so a full house of workers can each hold one connection; the
+# server-side max_connections on the flexible server is an order of
+# magnitude above this.
 _DB_POOL_MIN = int(os.getenv("DB_POOL_MIN", "2"))
-_DB_POOL_MAX = int(os.getenv("DB_POOL_MAX", "10"))
+_DB_POOL_MAX = int(os.getenv("DB_POOL_MAX", "40"))
 
 # ---------------------------------------------------------------------------
 # Authentication
