@@ -310,6 +310,39 @@ def _error_reference(request: Request) -> str:
     return getattr(request.state, "request_id", None) or uuid.uuid4().hex[:12]
 
 
+def _record_server_error(request: Request, status_code: int, detail: str, ref: str) -> None:
+    """Record a server-side failure on the ingest path. Never raises.
+
+    A 5xx is a check-in the device made correctly and the server lost. Leaving
+    it out of ingest_failures meant the view that answers "installed but never
+    appeared" could not show the cases where the fault was ours. Identity comes
+    from headers because the body may never have been read.
+    """
+    try:
+        from dependencies import (
+            _is_ingest_request,
+            extract_ingest_identity_headers,
+            record_ingest_failure,
+            resolve_client_ip,
+        )
+
+        if not _is_ingest_request(request):
+            return
+        record_ingest_failure(
+            failure_type="server_error",
+            reason="internal_error",
+            status_code=status_code,
+            detail=f"{detail} (reference {ref})",
+            endpoint=request.url.path,
+            client_ip=resolve_client_ip(request),
+            user_agent=request.headers.get("user-agent"),
+            identity=extract_ingest_identity_headers(request),
+        )
+    except Exception:
+        # The error path must never raise a second error.
+        pass
+
+
 @app.exception_handler(HTTPException)
 async def http_exception_handler(request: Request, exc: HTTPException):
     label = _HTTP_ERROR_LABELS.get(exc.status_code, "Error")
@@ -323,6 +356,7 @@ async def http_exception_handler(request: Request, exc: HTTPException):
         logger.error(
             f"{request.method} {request.url.path} -> {exc.status_code}: {exc.detail}"
         )
+        _record_server_error(request, exc.status_code, str(exc.detail), ref)
         return JSONResponse(
             status_code=exc.status_code,
             content={
@@ -352,6 +386,7 @@ async def unhandled_exception_handler(request: Request, exc: Exception):
     logger.exception(
         f"Unhandled exception on {request.method} {request.url.path}: {exc}"
     )
+    _record_server_error(request, 500, f"{type(exc).__name__}: {exc}", ref)
     return JSONResponse(
         status_code=500,
         content={

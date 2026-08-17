@@ -84,6 +84,38 @@ def _run_retention_purge():
         logger.warning(f"Retention purge failed (non-fatal): {purge_error}")
 
 
+# json.dumps always emits a NUL code point as this six-character escape, so
+# its presence in the raw body is an exact, cheap precheck for whether the
+# payload needs sanitizing at all. Most check-ins do not.
+_NUL_ESCAPE = b"\\u0000"
+
+
+def _strip_nul(value):
+    """Remove NUL code points from every string in a decoded payload.
+
+    Postgres jsonb cannot represent \\u0000 anywhere in a string: the write
+    fails with SQLSTATE 22P05 and takes the whole module with it, while the
+    device still receives a 200. That is how 171 Windows machines went a month
+    with a frozen identity module -- Get-Tpm returns ManufacturerIdTxt as a
+    NUL-padded 4-byte field ("IFX\\u0000", "NTC\\u0000"), and one unstorable
+    character discarded every other field alongside it.
+
+    Stripping rather than rejecting is deliberate: the NUL is padding, never
+    meaning, and the rest of the module is entirely valid data that the fleet
+    needs. Keys are cleaned too -- a NUL in a key fails the same write.
+    """
+    if isinstance(value, str):
+        return value.replace("\x00", "")
+    if isinstance(value, dict):
+        return {
+            (k.replace("\x00", "") if isinstance(k, str) else k): _strip_nul(v)
+            for k, v in value.items()
+        }
+    if isinstance(value, list):
+        return [_strip_nul(v) for v in value]
+    return value
+
+
 def _transport_note(request: Request, received, error):
     """How much of the body actually arrived, and what went wrong reading it.
 
@@ -383,7 +415,14 @@ def get_ingest_failures(
     invalid_bearer_token, invalid_internal_secret, missing_credentials,
     insufficient_scope; validation -> upload_aborted, body_unreadable,
     empty_body, malformed_json, invalid_payload, empty_serial,
-    sentinel_serial, short_serial, hostname_serial, serial_equals_hostname.
+    sentinel_serial, short_serial, hostname_serial, serial_equals_hostname,
+    nul_in_payload, usage_out_of_bounds; throttle -> rate_limited;
+    server_error -> internal_error.
+
+    rate_limited and internal_error are recorded at the status the caller
+    actually received. nul_in_payload and usage_out_of_bounds are recorded at
+    200 -- the check-in was accepted, but it carried a client defect worth
+    seeing.
 
     upload_aborted / body_unreadable / empty_body are transport failures --
     the device reached the server but its payload did not arrive intact.
@@ -617,6 +656,27 @@ async def submit_events(request: Request):
 
         try:
             payload = json.loads(raw_body)
+            if _NUL_ESCAPE in raw_body:
+                payload = _strip_nul(payload)
+                # Recorded at 200, exactly as usage_out_of_bounds is: the
+                # check-in is accepted and the data kept, but a client shipping
+                # unstorable characters is a defect that has to stay visible
+                # rather than be silently absorbed. Watching this fall to zero
+                # is how the client-side fix gets confirmed as rolled out.
+                record_ingest_failure(
+                    failure_type="validation",
+                    reason="nul_in_payload",
+                    status_code=200,
+                    detail="Payload contained NUL code points, which Postgres "
+                           "jsonb cannot store; stripped before writing.",
+                    endpoint=request.url.path,
+                    client_ip=resolve_client_ip(request),
+                    user_agent=request.headers.get("user-agent"),
+                    identity=merge_ingest_identity(
+                        extract_ingest_identity(payload),
+                        extract_ingest_identity_headers(request),
+                    ),
+                )
         except Exception as parse_error:
             # A body that arrived short of its declared length is a truncated
             # upload wearing a parse error's clothes; _transport_note is what
