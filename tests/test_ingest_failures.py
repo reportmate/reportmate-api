@@ -282,3 +282,173 @@ def test_failures_endpoint_requires_auth(monkeypatch):
     monkeypatch.setattr(dependencies, "get_db_connection", lambda: conn)
     client = TestClient(app)
     assert client.get("/api/v1/events/failures").status_code == 401
+
+
+# ---------------------------------------------------------------------------
+# Attribution: identity headers, originating IP, transport-vs-parse reasons
+#
+# The failures view shipped unable to name a single device: identity lived
+# only in the body (so an unreadable body meant "unidentified"), the recorded
+# address was the Container Apps ingress rather than the device, and every
+# transport failure was labelled malformed_json. These cover all three.
+# ---------------------------------------------------------------------------
+
+IDENTITY_HEADERS = {
+    "X-Device-Serial": "TESTSERIAL0001",
+    "X-Device-Uuid": "11111111-2222-3333-4444-555555555555",
+    "X-Device-Name": "EXAMPLE-PC",
+    "X-Platform": "Windows",
+    "X-Client-Version": "2026.07.21",
+}
+
+
+def test_identity_headers_attribute_an_unreadable_body(monkeypatch):
+    """The whole point: a body that never parsed still names its device."""
+    conn = RecordingConnection(results=[(1,)])
+    monkeypatch.setattr(dependencies, "get_db_connection", lambda: conn)
+
+    client = TestClient(app)
+    resp = client.post(
+        "/api/v1/events",
+        content=b"{truncated",
+        headers={**AUTH, **IDENTITY_HEADERS, "Content-Type": "application/json"},
+    )
+    assert resp.status_code == 400
+
+    params = _inserts(conn)[0][1]
+    assert "TESTSERIAL0001" in params
+    assert "EXAMPLE-PC" in params
+    assert "Windows" in params
+
+
+def test_body_identity_wins_over_headers(monkeypatch):
+    """Headers are the fallback, not an override -- a spoofable header must
+    not relabel a check-in whose body says otherwise."""
+    conn = RecordingConnection(results=[(1,)])
+    monkeypatch.setattr(dependencies, "get_db_connection", lambda: conn)
+
+    client = TestClient(app)
+    resp = client.post(
+        "/api/v1/events",
+        json={"metadata": {**PAYLOAD["metadata"], "serialNumber": "-1"}},
+        headers={**AUTH, "X-Device-Serial": "HEADERSERIAL"},
+    )
+    assert resp.status_code == 400
+
+    params = _inserts(conn)[0][1]
+    assert "-1" in params
+    assert "HEADERSERIAL" not in params
+
+
+def test_headers_fill_only_the_gaps(monkeypatch):
+    """A body carrying a serial but no hostname still gets the hostname."""
+    conn = RecordingConnection(results=[(1,)])
+    monkeypatch.setattr(dependencies, "get_db_connection", lambda: conn)
+
+    client = TestClient(app)
+    resp = client.post(
+        "/api/v1/events",
+        json={
+            "metadata": {
+                "deviceId": "11111111-2222-3333-4444-555555555555",
+                "serialNumber": "-1",
+                "platform": "macOS",
+                "clientVersion": "2026.07.21",
+            }
+        },
+        headers={**AUTH, "X-Device-Name": "STUDIO-MAC"},
+    )
+    assert resp.status_code == 400
+
+    params = _inserts(conn)[0][1]
+    assert "STUDIO-MAC" in params
+    assert "macOS" in params
+
+
+def test_originating_ip_recorded_not_ingress(monkeypatch):
+    """Behind ingress every device shares a backend address; recording it
+    made all 455 rejected check-ins look like four machines."""
+    conn = RecordingConnection(results=[(1,)])
+    monkeypatch.setattr(dependencies, "get_db_connection", lambda: conn)
+
+    client = TestClient(app)
+    resp = client.post(
+        "/api/v1/events",
+        content=b"nope",
+        headers={
+            **AUTH,
+            "Content-Type": "application/json",
+            "X-Forwarded-For": "142.103.9.44, 100.100.1.25",
+        },
+    )
+    assert resp.status_code == 400
+
+    params = _inserts(conn)[0][1]
+    assert "142.103.9.44" in params
+    assert "100.100.1.25" not in params
+
+
+def test_empty_body_is_not_called_malformed_json(monkeypatch):
+    conn = RecordingConnection(results=[(1,)])
+    monkeypatch.setattr(dependencies, "get_db_connection", lambda: conn)
+
+    client = TestClient(app)
+    resp = client.post(
+        "/api/v1/events",
+        content=b"",
+        headers={**AUTH, "Content-Type": "application/json"},
+    )
+    assert resp.status_code == 400
+
+    params = _inserts(conn)[0][1]
+    assert "empty_body" in params
+    assert "malformed_json" not in params
+
+
+def test_malformed_json_detail_carries_byte_counts(monkeypatch):
+    """declared vs received is what separates a truncated upload from a
+    client that genuinely serialized garbage."""
+    conn = RecordingConnection(results=[(1,)])
+    monkeypatch.setattr(dependencies, "get_db_connection", lambda: conn)
+
+    client = TestClient(app)
+    resp = client.post(
+        "/api/v1/events",
+        content=b"{not json",
+        headers={**AUTH, "Content-Type": "application/json"},
+    )
+    assert resp.status_code == 400
+
+    detail = next(p for p in _inserts(conn)[0][1] if isinstance(p, str) and "declared=" in p)
+    assert "declared=9" in detail
+    assert "received=9" in detail
+
+
+def test_client_disconnect_recorded_as_upload_aborted(monkeypatch):
+    """An aborted upload is a network problem, not a serializer problem, and
+    must not be filed under malformed_json."""
+    from starlette.requests import ClientDisconnect
+
+    import routers.events as events_router
+
+    conn = RecordingConnection(results=[(1,)])
+    monkeypatch.setattr(dependencies, "get_db_connection", lambda: conn)
+
+    async def disconnecting_body(self):
+        raise ClientDisconnect()
+
+    monkeypatch.setattr(
+        events_router.Request, "body", disconnecting_body, raising=False
+    )
+
+    client = TestClient(app)
+    resp = client.post(
+        "/api/v1/events",
+        json=PAYLOAD,
+        headers={**AUTH, **IDENTITY_HEADERS},
+    )
+    assert resp.status_code == 400
+
+    params = _inserts(conn)[0][1]
+    assert "upload_aborted" in params
+    assert "TESTSERIAL0001" in params

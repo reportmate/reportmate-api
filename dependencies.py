@@ -488,6 +488,25 @@ def verify_api_key(presented: str, client_host=None):
     }
 
 
+def resolve_client_ip(request) -> Optional[str]:
+    """The originating client's address, not the ingress connection's.
+
+    Behind Front Door / Container Apps ingress, ``request.client.host`` is one
+    of a handful of backend addresses carrying the entire fleet -- a request
+    sent from an off-campus home connection arrives as 100.100.1.25. Recording
+    that address is worse than recording nothing, because it reads as a real
+    device: every rejected check-in in the estate appears to come from the
+    same four machines. The ingress appends the true client to
+    X-Forwarded-For, so its first hop is the address to use when present.
+    """
+    xff = request.headers.get("X-Forwarded-For")
+    if xff:
+        first = xff.split(",")[0].strip()
+        if first:
+            return first
+    return request.client.host if request.client else None
+
+
 def audit_api_key(key_id, action: str, actor=None, detail=None) -> None:
     """Append an api_key_audit row. Best-effort; never blocks the operation."""
     try:
@@ -563,6 +582,48 @@ def extract_ingest_identity(payload) -> Dict[str, Optional[str]]:
         k: (str(v)[:255] if v not in (None, "") else None)
         for k, v in identity.items()
     }
+
+
+# Clients mirror their identity into these headers on every ingest request.
+# The body stays authoritative when it parses; the headers exist for the case
+# it does NOT, which is precisely when a rejected check-in would otherwise be
+# unattributable -- and an unattributable rejection is not actionable.
+_INGEST_IDENTITY_HEADERS = {
+    "serial_number": "X-Device-Serial",
+    "device_uuid": "X-Device-Uuid",
+    "device_name": "X-Device-Name",
+    "platform": "X-Platform",
+    "client_version": "X-Client-Version",
+}
+
+
+def extract_ingest_identity_headers(request) -> Dict[str, Optional[str]]:
+    """Device identity as presented in request headers. Never raises.
+
+    Headers survive a body that could not be read at all: a truncated upload,
+    an aborted connection, a client serializing garbage.
+    """
+    identity: Dict[str, Optional[str]] = {f: None for f in _INGEST_IDENTITY_FIELDS}
+    try:
+        for field, header in _INGEST_IDENTITY_HEADERS.items():
+            value = request.headers.get(header)
+            if value and value.strip():
+                identity[field] = value.strip()[:255]
+    except Exception:
+        pass
+    return identity
+
+
+def merge_ingest_identity(*sources) -> Dict[str, Optional[str]]:
+    """First non-empty value per field, in the order the sources are given."""
+    merged: Dict[str, Optional[str]] = {f: None for f in _INGEST_IDENTITY_FIELDS}
+    for source in sources:
+        if not source:
+            continue
+        for field in _INGEST_IDENTITY_FIELDS:
+            if merged[field] is None and source.get(field) not in (None, ""):
+                merged[field] = source.get(field)
+    return merged
 
 
 def record_ingest_failure(
@@ -676,16 +737,24 @@ async def _record_auth_failure(
             return
         identity = None
         if is_ingest:
-            body = await request.body()
+            body_identity = None
+            try:
+                body = await request.body()
+            except Exception:
+                # Unreadable body is exactly when the headers have to carry it.
+                body = None
             if body:
-                identity = extract_ingest_identity(body)
+                body_identity = extract_ingest_identity(body)
+            identity = merge_ingest_identity(
+                body_identity, extract_ingest_identity_headers(request)
+            )
         record_ingest_failure(
             failure_type="auth",
             reason=reason,
             status_code=status_code,
             detail=detail,
             endpoint=request.url.path,
-            client_ip=request.client.host if request.client else None,
+            client_ip=resolve_client_ip(request),
             user_agent=user_agent,
             identity=identity,
         )
