@@ -715,32 +715,42 @@ def get_device_usage_history(
 
         cutoff = datetime.now(timezone.utc) - timedelta(days=days)
 
+        # active_seconds is the reportable metric (work item 4251); total_seconds
+        # is process lifetime summed over concurrent processes and routinely
+        # exceeds the wall clock. Both are selected so the device page can lead
+        # with active time the way the fleet report does.
         if app_name:
             cursor.execute("""
-                SELECT date::text, app_name, launches, total_seconds, users
+                SELECT date::text, app_name, launches, total_seconds,
+                       active_seconds, foreground_seconds, users
                 FROM usage_history
                 WHERE device_id = %s AND date >= %s AND app_name = %s
                 ORDER BY date DESC
             """, (serial_number, cutoff.date(), app_name))
         else:
             cursor.execute("""
-                SELECT date::text, app_name, launches, total_seconds, users
+                SELECT date::text, app_name, launches, total_seconds,
+                       active_seconds, foreground_seconds, users
                 FROM usage_history
                 WHERE device_id = %s AND date >= %s
-                ORDER BY date DESC, total_seconds DESC
+                ORDER BY date DESC, active_seconds DESC, total_seconds DESC
             """, (serial_number, cutoff.date()))
 
         rows = cursor.fetchall()
         conn.close()
 
         results = []
-        for date_str, name, launches, total_secs, users_json in rows:
+        for date_str, name, launches, total_secs, active_secs, fg_secs, users_json in rows:
             results.append({
                 "date": date_str,
                 "appName": name,
                 "launches": launches or 0,
                 "totalSeconds": float(total_secs or 0),
                 "totalHours": round(float(total_secs or 0) / 3600, 2),
+                "activeSeconds": float(active_secs or 0),
+                "activeHours": round(float(active_secs or 0) / 3600, 2),
+                "foregroundSeconds": float(fg_secs or 0),
+                "foregroundHours": round(float(fg_secs or 0) / 3600, 2),
                 "users": users_json if isinstance(users_json, list) else []
             })
 
