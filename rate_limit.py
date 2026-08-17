@@ -53,7 +53,7 @@ class GlobalRateLimitMiddleware(BaseHTTPMiddleware):
             cls._counts = {}
 
     async def dispatch(self, request, call_next):
-        from dependencies import API_INTERNAL_SECRET
+        from dependencies import API_INTERNAL_SECRET, resolve_client_ip
 
         presented = request.headers.get("X-Internal-Secret")
         if (
@@ -63,18 +63,11 @@ class GlobalRateLimitMiddleware(BaseHTTPMiddleware):
         ):
             return await call_next(request)
 
-        # Key on the ORIGINATING client, not the ingress connection. Behind
-        # Front Door / Container Apps ingress, request.client.host is one of
-        # a handful of backend IPs (observed 100.100.0.167 / 100.100.1.24
-        # carrying the entire fleet), so a per-connection-IP key collapsed
-        # ~370 devices into two shared 120/min buckets and mass-429'd device
-        # event submissions within hours of rollout. Front Door appends the
-        # real client to X-Forwarded-For; use its first hop when present.
-        xff = request.headers.get("X-Forwarded-For")
-        if xff:
-            client = xff.split(",")[0].strip()
-        else:
-            client = request.client.host if request.client else "unknown"
+        # Key on the ORIGINATING client, not the ingress connection: a
+        # per-connection-IP key collapsed ~370 devices into two shared 120/min
+        # buckets and mass-429'd device event submissions within hours of
+        # rollout. resolve_client_ip carries the reasoning.
+        client = resolve_client_ip(request) or "unknown"
         allowed, retry_after = self._allow(client, self.limit)
         if not allowed:
             return JSONResponse(
