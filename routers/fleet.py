@@ -15,6 +15,47 @@ from dependencies import (
 
 router = APIRouter(tags=["fleet"])
 
+# Well-known Windows service principals. Matched on the portion after the
+# domain separator so the localized authority names (NT-AUTORITAET, AUTORITE NT)
+# fall out too.
+_SERVICE_PRINCIPAL_NAMES = frozenset({
+    "system", "local service", "network service", "localsystem",
+    "trustedinstaller", "local system",
+})
+
+
+def is_human_principal(username: Optional[str]) -> bool:
+    """
+    True when a usage_history user entry plausibly names a person.
+
+    The Security Log path records the subject of event 4688, which is the
+    account that created the process -- for anything launched by a service, a
+    scheduled task or the machine itself that is DOMAIN\\COMPUTER$, not the
+    person at the keyboard. Lab and render machines therefore dominated both
+    uniqueUsers and topUsers: 253 of 513 principals in a 2-day fleet window
+    were computer accounts, and the three heaviest "users" of software on
+    campus were machines. Work item 4522.
+
+    Only unambiguous non-humans are excluded. Shared local accounts such as
+    `student` and service accounts such as `dl-worker` are real logins that
+    happen not to be one person, which is a policy question rather than a
+    detectable property, so they are left in and tracked separately.
+    """
+    if not username:
+        return False
+    name = username.strip()
+    if not name:
+        return False
+    # Computer accounts always end in $ in Windows.
+    if name.endswith("$"):
+        return False
+    leaf = name.split("\\")[-1].strip().lower()
+    if leaf in _SERVICE_PRINCIPAL_NAMES:
+        return False
+    if name.split("\\")[0].strip().lower() == "nt authority":
+        return False
+    return True
+
 @router.get("/applications/filters", dependencies=[Depends(verify_authentication)], tags=["fleet"])
 def get_applications_filters(
     include_archived: bool = Query(default=False, alias="includeArchived")
@@ -326,7 +367,9 @@ def get_fleet_applications_usage(
             entry["foregroundSeconds"] += float(foreground_secs or 0)
             entry["launchCount"] += int(launch_count or 0)
             entry["deviceSet"].update(devices or [])
-            entry["userSet"].update(u for u in users_by_app.get(app_name, []) if u)
+            entry["userSet"].update(
+                u for u in users_by_app.get(app_name, []) if is_human_principal(u)
+            )
             if first_used and (not entry["firstUsed"] or first_used < entry["firstUsed"]):
                 entry["firstUsed"] = first_used
             if last_used and (not entry["lastUsed"] or last_used > entry["lastUsed"]):
@@ -392,6 +435,12 @@ def get_fleet_applications_usage(
                     continue
 
             kept_device_set.update(devices)
+            # Now counts humans only, which is what this flag was always meant
+            # to mean: an application one *person* uses is a single-seat licence
+            # candidate. Counting machine accounts made it read "installed on
+            # one lab machine" instead, and that is the evidence the software
+            # value reviews depend on. Apps driven only by service or computer
+            # accounts land at zero users and are correctly not single-user.
             is_single_user = user_count == 1
             applications.append({
                 "name": canonical_name,
@@ -437,13 +486,22 @@ def get_fleet_applications_usage(
             CROSS JOIN LATERAL jsonb_array_elements_text(COALESCE(uh.users, '[]'::jsonb)) AS u
             WHERE {where_clause}
               AND u IS NOT NULL AND u <> ''
+              -- Computer accounts always end in $. Excluded here rather than
+              -- only in Python so the row cap below is spent on candidate
+              -- humans; the remaining service principals are rejected by
+              -- is_human_principal, which owns the full rule.
+              AND u NOT LIKE '%%$'
             GROUP BY u
             ORDER BY total_seconds DESC
-            LIMIT 50
+            LIMIT 200
         """
         cursor.execute(user_query, tuple(params))
         top_users = []
         for username, total_secs, launch_count, apps_used, devices_used in cursor.fetchall():
+            if not is_human_principal(username):
+                continue
+            if len(top_users) >= 50:
+                break
             total_secs = float(total_secs or 0)
             top_users.append({
                 "username": username,
@@ -685,7 +743,7 @@ def get_application_usage_by_device(
              first_used, last_used) in device_rows:
             total_secs = float(total_secs or 0)
             launch_count = int(launch_count or 0)
-            users = [u for u in users_by_device.get(serial, []) if u]
+            users = [u for u in users_by_device.get(serial, []) if is_human_principal(u)]
             raw_variants = [v for v in (variants or []) if v]
             # Collapse "Houdini Launcher" + "Houdini FX 21.0.440" + "hindie.exe"
             # to a single canonical entry per device.
