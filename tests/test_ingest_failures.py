@@ -452,3 +452,141 @@ def test_client_disconnect_recorded_as_upload_aborted(monkeypatch):
     params = _inserts(conn)[0][1]
     assert "upload_aborted" in params
     assert "TESTSERIAL0001" in params
+
+
+# ---------------------------------------------------------------------------
+# NUL sanitizing, throttle and server-error recording
+#
+# Postgres jsonb cannot hold a NUL code point anywhere in a string, and one
+# unstorable character aborted the whole module write while the device still
+# got a 200 -- 171 Windows machines carried a frozen identity module for a
+# month that way. Throttle and server-error rejections were absent from the
+# table entirely, which hid the largest rejection class from the view whose
+# whole purpose is showing rejected check-ins.
+# ---------------------------------------------------------------------------
+
+NUL = chr(0)
+
+
+def _tpm_payload(mfg="IFX"):
+    return {
+        "metadata": PAYLOAD["metadata"],
+        "identity": {"tpmOwnership": {"manufacturerIdTxt": mfg + NUL, "owned": True}},
+    }
+
+
+def test_nul_is_stripped_from_strings():
+    from routers.events import _strip_nul
+
+    cleaned = _strip_nul({"a": "IFX" + NUL, "b": [{"c": "NTC" + NUL}]})
+    assert cleaned == {"a": "IFX", "b": [{"c": "NTC"}]}
+
+
+def test_nul_is_stripped_from_keys():
+    from routers.events import _strip_nul
+
+    assert _strip_nul({"k" + NUL: "v"}) == {"k": "v"}
+
+
+def test_literal_backslash_u_text_is_not_mangled():
+    """A naive replace over serialized JSON would corrupt the escaped-backslash
+    form of this string; sanitizing the decoded values cannot."""
+    from routers.events import _strip_nul
+
+    assert _strip_nul({"x": "\\u0000"}) == {"x": "\\u0000"}
+
+
+def test_non_string_scalars_survive():
+    from routers.events import _strip_nul
+
+    assert _strip_nul({"a": 1, "b": None, "c": True, "d": 1.5}) == {
+        "a": 1, "b": None, "c": True, "d": 1.5,
+    }
+
+
+def test_tpm_nul_payload_is_accepted_and_recorded(monkeypatch):
+    """The check-in must succeed -- the NUL is padding, and rejecting it would
+    discard every other valid field alongside it."""
+    conn = RecordingConnection(results=[(1,)] * 12)
+    monkeypatch.setattr(dependencies, "get_db_connection", lambda: conn)
+    import routers.events as events_router
+
+    monkeypatch.setattr(events_router, "get_db_connection", lambda: conn)
+
+    client = TestClient(app)
+    resp = client.post("/api/v1/events", json=_tpm_payload(), headers=AUTH)
+    assert resp.status_code == 200
+
+    inserts = _inserts(conn)
+    assert len(inserts) == 1
+    params = inserts[0][1]
+    assert "nul_in_payload" in params
+    assert 200 in params
+    assert "TESTSERIAL0001" in params
+
+
+def test_no_nul_means_no_recording(monkeypatch):
+    """The sanitizer must not report on the overwhelming majority of check-ins
+    that carry no NUL at all."""
+    conn = RecordingConnection(results=[(1,)] * 12)
+    monkeypatch.setattr(dependencies, "get_db_connection", lambda: conn)
+    import routers.events as events_router
+
+    monkeypatch.setattr(events_router, "get_db_connection", lambda: conn)
+
+    client = TestClient(app)
+    clean = {
+        "metadata": PAYLOAD["metadata"],
+        "identity": {"tpmOwnership": {"manufacturerIdTxt": "INTC", "owned": True}},
+    }
+    resp = client.post("/api/v1/events", json=clean, headers=AUTH)
+    assert resp.status_code == 200
+    assert [q for q in _inserts(conn) if "nul_in_payload" in str(q[1])] == []
+
+
+def test_rate_limited_ingest_is_recorded(monkeypatch):
+    """Throttling was the largest rejection class and the only one the
+    failures view could not see."""
+    from rate_limit import GlobalRateLimitMiddleware
+
+    conn = RecordingConnection(results=[(1,)] * 5)
+    monkeypatch.setattr(dependencies, "get_db_connection", lambda: conn)
+    monkeypatch.setattr(dependencies, "DISABLE_AUTH", False)
+    GlobalRateLimitMiddleware.reset()
+    for _ in range(120):
+        GlobalRateLimitMiddleware._allow("dev:TESTSERIAL0001", 120)
+
+    client = TestClient(app)
+    resp = client.post(
+        "/api/v1/events",
+        json=PAYLOAD,
+        headers={**AUTH, "X-Device-Serial": "TESTSERIAL0001"},
+    )
+    assert resp.status_code == 429
+
+    inserts = _inserts(conn)
+    assert len(inserts) == 1
+    params = inserts[0][1]
+    assert "rate_limited" in params
+    assert "throttle" in params
+    assert "TESTSERIAL0001" in params
+    GlobalRateLimitMiddleware.reset()
+
+
+def test_rate_limited_dashboard_traffic_is_not_recorded(monkeypatch):
+    """Only devices belong in this table; dashboard throttling would bury them."""
+    from rate_limit import GlobalRateLimitMiddleware
+
+    conn = RecordingConnection()
+    monkeypatch.setattr(dependencies, "get_db_connection", lambda: conn)
+    GlobalRateLimitMiddleware.reset()
+    for _ in range(120):
+        GlobalRateLimitMiddleware._allow("dev:DASHBOARD1", 120)
+
+    client = TestClient(app)
+    resp = client.get(
+        "/api/v1/health/live", headers={"X-Device-Serial": "DASHBOARD1"}
+    )
+    assert resp.status_code == 429
+    assert _inserts(conn) == []
+    GlobalRateLimitMiddleware.reset()
