@@ -19,6 +19,31 @@ env:
 jobs:
   test:
     runs-on: ubuntu-latest
+
+    # The usage upsert and the migrations are SQL, and SQL only fails against a
+    # server. Mocking the cursor proved nothing: a statement-level type error
+    # shipped green through a full unit suite and silently dropped fleet-wide
+    # utilization data. These tests skip themselves when TEST_DATABASE_URL is
+    # unset, so without this service they would go on passing by not running.
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: reportmate
+          POSTGRES_PASSWORD: reportmate
+          POSTGRES_DB: reportmate
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    env:
+      TEST_DATABASE_URL: postgresql://reportmate:reportmate@localhost:5432/reportmate
+      DB_SSL: "false"
+
     steps:
       - uses: actions/checkout@v7
 
@@ -32,7 +57,7 @@ jobs:
         run: pip install -r requirements-dev.txt
 
       - name: Run tests
-        run: pytest
+        run: pytest -rs
 
   build:
     needs: test
