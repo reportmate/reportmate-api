@@ -64,13 +64,19 @@ def health_check():
 
 
 @router.get("/health/live", tags=["health"])
-def liveness():
+async def liveness():
     """
     Liveness probe -- the process is up and serving.
 
     **No authentication required. No dependencies checked.** Use this as the
     load-balancer/orchestrator liveness target so a transient database outage
     does not cause healthy replicas to be killed.
+
+    Deliberately `async def` with no I/O, so it is answered directly on the
+    event loop. A plain `def` would be dispatched to the threadpool and would
+    queue behind saturated worker threads -- which is exactly the condition a
+    liveness probe most needs to survive, and exactly how this service used to
+    fail its probes under ingest load.
     """
     return {"status": "ok"}
 
