@@ -346,6 +346,9 @@ def clear_stale_installs_errors(
 
             # Error/failed status values that the frontend flags as "Devices with Install Errors"
             error_statuses = {"error", "failed", "problem", "needs_reinstall", "install_failed"}
+            # The fleet warning count keys on currentStatus, not on lastWarning, so a
+            # cleared item left at "Warning" still counts. Reset it with the text.
+            warning_statuses = {"warning"}
 
             # Clear Cimian item errors, warnings, and error statuses
             cimian_items = data.get("cimian", {}).get("items", [])
@@ -357,15 +360,16 @@ def clear_stale_installs_errors(
                 has_loop = item.get("installLoopDetected", False) or item.get("hasInstallLoop", False)
                 status = (item.get("currentStatus") or "").lower()
                 has_error_status = status in error_statuses
+                has_warning_status = status in warning_statuses
 
-                if has_error or has_warning or has_failure or has_warn_count or has_loop or has_error_status:
+                if has_error or has_warning or has_failure or has_warn_count or has_loop or has_error_status or has_warning_status:
                     item["lastError"] = ""
                     item["lastWarning"] = ""
                     item["failureCount"] = 0
                     item["warningCount"] = 0
                     item["installLoopDetected"] = False
                     item["hasInstallLoop"] = False
-                    if has_error_status:
+                    if has_error_status or has_warning_status:
                         item["currentStatus"] = "Installed"
                         if item.get("mappedStatus"):
                             item["mappedStatus"] = "Installed"
