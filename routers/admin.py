@@ -305,8 +305,8 @@ def clear_stale_installs_errors(
     """
     Clear error and warning fields from installs data for stale devices.
 
-    Targets devices whose installs data hasn't been updated in the specified
-    number of days. Clears per-item error/warning fields in Cimian data and
+    Targets devices that have not checked in (devices.last_seen) for the
+    specified number of days. Clears per-item error/warning fields in Cimian data and
     error/warning strings in Munki data.
 
     This is a manual maintenance operation - not automated.
@@ -321,9 +321,17 @@ def clear_stale_installs_errors(
 
         cutoff = datetime.now(timezone.utc) - timedelta(days=days)
 
-        # Find stale installs records
+        # Stale means the device itself has not checked in. installs.updated_at
+        # is touched on every ingest for every device, so keying on it matched
+        # nothing in practice (0 of 300+ devices with dozens idle for weeks);
+        # devices.last_seen is the check-in watermark the rest of the API uses.
         cursor.execute(
-            "SELECT device_id, data FROM installs WHERE updated_at < %s",
+            """
+            SELECT i.device_id, i.data
+            FROM installs i
+            JOIN devices d ON d.id = i.device_id
+            WHERE COALESCE(d.last_seen, i.updated_at) < %s
+            """,
             (cutoff,)
         )
         rows = cursor.fetchall()
