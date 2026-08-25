@@ -130,7 +130,7 @@ def _transport_note(request: Request, received, error, decompressed=None):
     declared and received are always wire bytes, so they stay comparable on a
     compressed check-in; decompressed is reported separately rather than
     substituted for received, which would otherwise read as a body arriving
-    ten times larger than it was declared."""
+    eight times larger than it was declared."""
     declared = request.headers.get("content-length")
     parts = ["declared=" + (declared if declared is not None else "absent")]
     if received is not None:
@@ -147,7 +147,7 @@ def _transport_note(request: Request, received, error, decompressed=None):
 
 # A full collection serializes to a megabyte or more of highly repetitive
 # module JSON, and the fleet posts tens of thousands of them a day. Accepting a
-# compressed body cuts that roughly tenfold on the wire, and a body that spends
+# compressed body cuts that about eightfold on the wire, and a body that spends
 # less time in flight has a correspondingly smaller window in which the upload
 # can be interrupted -- which is the failure this endpoint records most often.
 # FastAPI's GZipMiddleware only ever compresses responses, so the request side
