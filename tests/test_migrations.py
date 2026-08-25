@@ -66,7 +66,19 @@ def test_upgrade_creates_app_tables_and_stamps_version(migrated):
     )
     cur = conn.cursor()
     cur.execute("SELECT version_num FROM alembic_version")
-    assert cur.fetchone()[0] == "0001"
+    # Resolve head from the script directory rather than naming a revision.
+    # This assertion said "0001" long after 0002 and 0003 were added: it never
+    # ran in CI (no database, so it skipped and reported as passing), so
+    # nothing forced it to keep up. Deriving head means adding a migration
+    # cannot silently stale it out again.
+    from alembic.config import Config
+    from alembic.script import ScriptDirectory
+
+    here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    cfg = Config(os.path.join(here, "alembic.ini"))
+    cfg.set_main_option("script_location", os.path.join(here, "alembic"))
+    expected_head = ScriptDirectory.from_config(cfg).get_current_head()
+    assert cur.fetchone()[0] == expected_head
     cur.execute(
         "SELECT count(*) FROM information_schema.tables "
         "WHERE table_name IN ('usage_history','api_keys','api_key_audit',"
