@@ -71,7 +71,21 @@ _log_handler.setFormatter(
     )
 )
 _log_handler.addFilter(_RequestIdFilter())
-logging.basicConfig(level=logging.INFO, handlers=[_log_handler])
+# LOG_LEVEL is the one knob for how much this process writes to stdout, and
+# stdout is billed: every line lands in ContainerAppConsoleLogs_CL. Measured
+# 2026-08-25 the API wrote 1.47M lines a day, 18.8 GB a month, of which the
+# azure.core HTTP-logging policy alone (one multi-line request/response dump
+# per Web PubSub broadcast, i.e. per ingest) was 55% and this module's
+# per-device INFO lines were most of the rest. The SDK loggers are pinned to
+# WARNING regardless of LOG_LEVEL because their INFO output is never ours to
+# want; everything else follows LOG_LEVEL, default WARNING in production
+# (Terraform sets it) and INFO when unset for local work.
+logging.basicConfig(
+    level=os.getenv("LOG_LEVEL", "INFO").upper(),
+    handlers=[_log_handler],
+)
+for _noisy in ("azure", "azure.core.pipeline.policies.http_logging_policy", "urllib3"):
+    logging.getLogger(_noisy).setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
