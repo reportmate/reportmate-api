@@ -191,6 +191,27 @@ def get_fleet_applications_usage(
     with optional inventory-based scoping (usages/catalogs/locations) and
     per-app filtering. Returns the shape consumed by the Generate Report ->
     Utilization view on /devices/applications.
+
+    Which number to quote, because two of them look interchangeable and are not:
+
+    - **activeHours** is the faculty-facing figure: foreground *and* user input
+      within the prior 300s. **totalHours** is summed process lifetime with no
+      wall-clock ceiling and is diagnostic only.
+    - **activeDeviceCount / activeUserCount** count only devices and users that
+      contributed non-zero active time. **deviceCount / userCount** count every
+      device and user that produced any usage row at all, including rows that
+      are pure background process time.
+
+    For a licence or seat question, use the active counts. The plain counts
+    describe installation footprint, which for a background service is close to
+    the whole managed fleet -- Houdini reported 184 devices and 229 users
+    against 0.5 active hours over 30 days, and Chrome 218 devices against 13
+    users. Both are returned because footprint is a legitimate question; it is
+    just not the same question, and the names are the only thing distinguishing
+    them.
+
+    `isSingleActiveUser` is the seat-relevant form of `isSingleUser`, which is
+    retained unchanged for existing callers.
     """
     conn = None
     try:
@@ -295,7 +316,9 @@ def get_fleet_applications_usage(
                 COUNT(DISTINCT uh.device_id)::int                                     AS device_count,
                 MIN(uh.date)::text                                                    AS first_used,
                 MAX(uh.date)::text                                                    AS last_used,
-                ARRAY_AGG(DISTINCT uh.device_id)                                      AS devices
+                ARRAY_AGG(DISTINCT uh.device_id)                                      AS devices,
+                ARRAY_AGG(DISTINCT uh.device_id)
+                    FILTER (WHERE COALESCE(uh.active_seconds, 0) > 0)                 AS active_devices
             FROM usage_history uh
             JOIN devices d ON d.serial_number = uh.device_id
             LEFT JOIN inventory inv ON inv.device_id = d.id
@@ -308,7 +331,10 @@ def get_fleet_applications_usage(
 
         # Per-app distinct user list. Single unnest pass over the same scope.
         users_by_app_query = f"""
-            SELECT uh.app_name, ARRAY_AGG(DISTINCT u) AS users
+            SELECT uh.app_name,
+                   ARRAY_AGG(DISTINCT u) AS users,
+                   ARRAY_AGG(DISTINCT u)
+                       FILTER (WHERE COALESCE(uh.active_seconds, 0) > 0) AS active_users
             FROM usage_history uh
             JOIN devices d ON d.serial_number = uh.device_id
             LEFT JOIN inventory inv ON inv.device_id = d.id
@@ -318,8 +344,14 @@ def get_fleet_applications_usage(
             GROUP BY uh.app_name
         """
         cursor.execute(users_by_app_query, tuple(params))
+        _user_rows = cursor.fetchall()
         users_by_app: Dict[str, List[str]] = {
-            row[0]: list(row[1] or []) for row in cursor.fetchall()
+            row[0]: list(row[1] or []) for row in _user_rows
+        }
+        # FILTER yields NULL rather than an empty array when nothing matches,
+        # which is the common case for a pure background service.
+        active_users_by_app: Dict[str, List[str]] = {
+            row[0]: list(row[2] or []) for row in _user_rows
         }
 
         # Group rows into report buckets. Behavior depends on whether the
@@ -346,7 +378,8 @@ def get_fleet_applications_usage(
                 picked_by_lower.setdefault(picked.lower(), picked)
 
         canonical_apps: Dict[str, Dict[str, Any]] = {}
-        for app_name, launch_count, total_secs, active_secs, foreground_secs, _device_count, first_used, last_used, devices in app_rows:
+        for (app_name, launch_count, total_secs, active_secs, foreground_secs,
+             _device_count, first_used, last_used, devices, active_devices) in app_rows:
             if app_name_list:
                 bucket_key = picked_by_lower.get((app_name or '').lower(), app_name)
             else:
@@ -358,6 +391,8 @@ def get_fleet_applications_usage(
                 "launchCount": 0,
                 "deviceSet": set(),
                 "userSet": set(),
+                "activeDeviceSet": set(),
+                "activeUserSet": set(),
                 "firstUsed": first_used,
                 "lastUsed": last_used,
                 "aliasedFrom": set(),
@@ -369,6 +404,10 @@ def get_fleet_applications_usage(
             entry["deviceSet"].update(devices or [])
             entry["userSet"].update(
                 u for u in users_by_app.get(app_name, []) if is_human_principal(u)
+            )
+            entry["activeDeviceSet"].update(active_devices or [])
+            entry["activeUserSet"].update(
+                u for u in active_users_by_app.get(app_name, []) if is_human_principal(u)
             )
             if first_used and (not entry["firstUsed"] or first_used < entry["firstUsed"]):
                 entry["firstUsed"] = first_used
@@ -392,6 +431,8 @@ def get_fleet_applications_usage(
                         "launchCount": 0,
                         "deviceSet": set(),
                         "userSet": set(),
+                        "activeDeviceSet": set(),
+                        "activeUserSet": set(),
                         "firstUsed": None,
                         "lastUsed": None,
                         "aliasedFrom": set(),
@@ -424,6 +465,19 @@ def get_fleet_applications_usage(
             users = sorted(agg["userSet"])
             device_count = len(devices)
             user_count = len(users)
+            # Devices and users that contributed real attention, not merely a
+            # process that ran. deviceCount/userCount answer "where is this
+            # installed and running", which for a background service is the
+            # whole managed fleet: Houdini read 184 devices and 229 users
+            # against 0.5 active hours over 30 days, and Chrome 218 devices
+            # against 13 users. Quoted as seats those numbers are simply wrong,
+            # and seats are what a licence review buys. Both are kept, because
+            # install footprint is a real question too -- it just is not this
+            # one.
+            active_devices = sorted(agg["activeDeviceSet"])
+            active_users = sorted(agg["activeUserSet"])
+            active_device_count = len(active_devices)
+            active_user_count = len(active_users)
             total_hours = round(total_secs / 3600, 2)
             active_hours = round(active_secs / 3600, 2)
             foreground_hours = round(foreground_secs / 3600, 2)
@@ -448,6 +502,11 @@ def get_fleet_applications_usage(
             # value reviews depend on. Apps driven only by service or computer
             # accounts land at zero users and are correctly not single-user.
             is_single_user = user_count == 1
+            # Deliberately a second field rather than a redefinition of
+            # isSingleUser. That one is load bearing for existing callers,
+            # and silently changing what it means would be worse than
+            # adding a field that says what it means in its name.
+            is_single_active_user = active_user_count == 1
             applications.append({
                 "name": canonical_name,
                 "totalSeconds": total_secs,
@@ -460,11 +519,16 @@ def get_fleet_applications_usage(
                 "launchCount": launch_count,
                 "deviceCount": device_count,
                 "userCount": user_count,
+                "activeDeviceCount": active_device_count,
+                "activeUserCount": active_user_count,
                 "lastUsed": agg["lastUsed"],
                 "firstUsed": agg["firstUsed"],
                 "devices": devices,
                 "users": users,
                 "isSingleUser": is_single_user,
+                "isSingleActiveUser": is_single_active_user,
+                "activeDevices": active_devices,
+                "activeUsers": active_users,
                 "aliasedFrom": sorted(agg["aliasedFrom"]),
             })
 
