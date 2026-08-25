@@ -6,6 +6,9 @@ credentials), while scanner probes of non-ingest endpoints stay out of the
 table. Recording is best-effort and must never change the rejection response.
 """
 
+import gzip
+import json
+import zlib
 from datetime import datetime, timezone
 
 import pytest
@@ -248,11 +251,12 @@ def test_failures_endpoint_lists_rows(monkeypatch):
         7, now, "auth", "invalid_passphrase", "Client passphrase did not match",
         401, "/api/v1/events", "10.1.2.3", "ReportMate/2026.07.21",
         "TESTSERIAL0001", "1111", "EXAMPLE-PC", "Windows", "2026.07.21",
+        False,
     )
     conn = RecordingConnection(
         results=[
             (3,),                                  # count fetchone
-            (3, 0),                                # outcome counts fetchone
+            (3, 0, 0),                             # outcome counts fetchone
             [("invalid_passphrase", 3, 1, now)],   # summary fetchall
             [row],                                 # list fetchall
         ]
@@ -288,7 +292,7 @@ def test_failures_endpoint_lists_rows(monkeypatch):
 # the recorded status so it reads correctly over rows written before it.
 # ---------------------------------------------------------------------------
 
-def _failures_conn(now, rows, count=None, counts=(0, 0), summary=None):
+def _failures_conn(now, rows, count=None, counts=(0, 0, 0), summary=None):
     return RecordingConnection(
         results=[
             (len(rows) if count is None else count,),
@@ -299,11 +303,12 @@ def _failures_conn(now, rows, count=None, counts=(0, 0), summary=None):
     )
 
 
-def _row(reason, status, serial="TESTSERIAL0001", ts=None):
+def _row(reason, status, serial="TESTSERIAL0001", ts=None, retried=False):
     return (
         7, ts, "validation", reason, "detail", status,
         "/api/v1/events", "10.1.2.3", "ReportMate/2026.08.16",
         serial, "1111", "EXAMPLE-PC", "Windows", "2026.08.16",
+        retried,
     )
 
 
@@ -319,7 +324,7 @@ def test_failures_default_to_rejected_only(monkeypatch):
 
     dependencies.invalidate_caches()
     now = datetime.now(timezone.utc)
-    conn = _failures_conn(now, [_row("malformed_json", 400, ts=now)], counts=(9, 300))
+    conn = _failures_conn(now, [_row("malformed_json", 400, ts=now)], counts=(9, 0, 300))
     monkeypatch.setattr(events_router, "get_db_connection", lambda: conn)
 
     resp = TestClient(app).get(
@@ -338,7 +343,7 @@ def test_accepted_outcome_is_reachable(monkeypatch):
 
     dependencies.invalidate_caches()
     now = datetime.now(timezone.utc)
-    conn = _failures_conn(now, [_row("nul_in_payload", 200, ts=now)], counts=(9, 300))
+    conn = _failures_conn(now, [_row("nul_in_payload", 200, ts=now)], counts=(9, 0, 300))
     monkeypatch.setattr(events_router, "get_db_connection", lambda: conn)
 
     resp = TestClient(app).get(
@@ -356,7 +361,7 @@ def test_outcome_all_drops_the_filter(monkeypatch):
 
     dependencies.invalidate_caches()
     now = datetime.now(timezone.utc)
-    conn = _failures_conn(now, [_row("malformed_json", 400, ts=now)], counts=(9, 300))
+    conn = _failures_conn(now, [_row("malformed_json", 400, ts=now)], counts=(9, 0, 300))
     monkeypatch.setattr(events_router, "get_db_connection", lambda: conn)
 
     TestClient(app).get(
@@ -372,14 +377,14 @@ def test_both_counts_are_always_present(monkeypatch):
 
     dependencies.invalidate_caches()
     now = datetime.now(timezone.utc)
-    conn = _failures_conn(now, [_row("malformed_json", 400, ts=now)], counts=(9, 2947))
+    conn = _failures_conn(now, [_row("malformed_json", 400, ts=now)], counts=(9, 0, 2947))
     monkeypatch.setattr(events_router, "get_db_connection", lambda: conn)
 
     body = TestClient(app).get(
         "/api/v1/events/failures?hours=24",
         headers={"X-Internal-Secret": "test-internal-secret"},
     ).json()
-    assert body["counts"] == {"rejected": 9, "accepted": 2947}
+    assert body["counts"] == {"rejected": 9, "retried": 0, "accepted": 2947}
 
 
 def test_outcome_rejects_unknown_values(monkeypatch):
@@ -402,7 +407,7 @@ def test_rows_are_classified_by_recorded_status(monkeypatch):
     now = datetime.now(timezone.utc)
     rows = [_row("nul_in_payload", 200, ts=now), _row("rate_limited", 429, ts=now),
             _row("upload_aborted", None, ts=now)]
-    conn = _failures_conn(now, rows, counts=(2, 1))
+    conn = _failures_conn(now, rows, counts=(2, 0, 1))
     monkeypatch.setattr(events_router, "get_db_connection", lambda: conn)
 
     body = TestClient(app).get(
@@ -418,14 +423,14 @@ def test_outcome_is_part_of_the_cache_key(monkeypatch):
 
     dependencies.invalidate_caches()
     now = datetime.now(timezone.utc)
-    rejected = _failures_conn(now, [_row("malformed_json", 400, ts=now)], counts=(1, 5))
+    rejected = _failures_conn(now, [_row("malformed_json", 400, ts=now)], counts=(1, 0, 5))
     monkeypatch.setattr(events_router, "get_db_connection", lambda: rejected)
     first = TestClient(app).get(
         "/api/v1/events/failures?hours=24",
         headers={"X-Internal-Secret": "test-internal-secret"},
     ).json()
 
-    accepted = _failures_conn(now, [_row("nul_in_payload", 200, ts=now)], counts=(1, 5))
+    accepted = _failures_conn(now, [_row("nul_in_payload", 200, ts=now)], counts=(1, 0, 5))
     monkeypatch.setattr(events_router, "get_db_connection", lambda: accepted)
     second = TestClient(app).get(
         "/api/v1/events/failures?hours=24&outcome=accepted",
@@ -750,3 +755,234 @@ def test_rate_limited_dashboard_traffic_is_not_recorded(monkeypatch):
     assert resp.status_code == 429
     assert _inserts(conn) == []
     GlobalRateLimitMiddleware.reset()
+
+
+# ---------------------------------------------------------------------------
+# Retried transport failures
+#
+# The clients retry three times with backoff, so a dropped upload is normally
+# resent down a fresh connection seconds later and the data lands. Counting
+# the dropped attempt as a device that was turned away describes an outage
+# that is not happening: 71 "rejected" check-ins in one 24h window were 71
+# uploads that all completed on retry, on machines whose data was current to
+# the minute. Only transport reasons qualify -- a malformed body or a bad
+# passphrase is resent identically, so a later success says nothing about it.
+# ---------------------------------------------------------------------------
+
+
+def test_retried_rows_are_not_reported_as_rejected(monkeypatch):
+    import routers.events as events_router
+
+    dependencies.invalidate_caches()
+    now = datetime.now(timezone.utc)
+    rows = [_row("upload_aborted", 400, ts=now, retried=True),
+            _row("upload_aborted", 400, ts=now, retried=False),
+            _row("invalid_passphrase", 401, ts=now, retried=False)]
+    conn = _failures_conn(now, rows, counts=(2, 1, 0))
+    monkeypatch.setattr(events_router, "get_db_connection", lambda: conn)
+
+    body = TestClient(app).get(
+        "/api/v1/events/failures?hours=24&outcome=all",
+        headers={"X-Internal-Secret": "test-internal-secret"},
+    ).json()
+    assert [f["outcome"] for f in body["failures"]] == [
+        "retried", "rejected", "rejected"
+    ]
+
+
+def test_retried_outcome_is_reachable(monkeypatch):
+    import routers.events as events_router
+
+    dependencies.invalidate_caches()
+    now = datetime.now(timezone.utc)
+    conn = _failures_conn(
+        now, [_row("upload_aborted", 400, ts=now, retried=True)], counts=(0, 1, 0)
+    )
+    monkeypatch.setattr(events_router, "get_db_connection", lambda: conn)
+
+    body = TestClient(app).get(
+        "/api/v1/events/failures?hours=24&outcome=retried",
+        headers={"X-Internal-Secret": "test-internal-secret"},
+    ).json()
+    assert body["outcome"] == "retried"
+    assert body["failures"][0]["outcome"] == "retried"
+    assert all(p["outcome"] == "retried" for p in _outcome_params(conn))
+
+
+def test_all_three_counts_are_always_present(monkeypatch):
+    """A number the caller did not ask for is how they learn the other side
+    exists; hiding retried would just move the misleading total."""
+    import routers.events as events_router
+
+    dependencies.invalidate_caches()
+    now = datetime.now(timezone.utc)
+    conn = _failures_conn(now, [_row("upload_aborted", 400, ts=now)], counts=(4, 71, 2947))
+    monkeypatch.setattr(events_router, "get_db_connection", lambda: conn)
+
+    body = TestClient(app).get(
+        "/api/v1/events/failures?hours=24",
+        headers={"X-Internal-Secret": "test-internal-secret"},
+    ).json()
+    assert body["counts"] == {"rejected": 4, "retried": 71, "accepted": 2947}
+
+
+def test_only_transport_reasons_can_be_retried():
+    """The predicate lives in SQL that no unit test can execute, and widening
+    it would silently retire real rejections -- a bad passphrase followed by a
+    successful check-in from the same machine is still a bad passphrase."""
+    from dependencies import load_sql
+
+    sql = load_sql("events/list_ingest_failures")
+    retried = sql.split("AS retried")[0].rsplit("AS accepted", 1)[1]
+    assert "upload_aborted" in retried
+    assert "body_unreadable" in retried
+    assert "empty_body" in retried
+    assert "d.last_seen > f.occurred_at" in retried
+    for still_a_failure in (
+        "malformed_json", "invalid_passphrase", "invalid_api_key",
+        "rate_limited", "invalid_payload", "internal_error",
+    ):
+        assert still_a_failure not in retried
+
+
+# ---------------------------------------------------------------------------
+# Compressed request bodies
+#
+# A full collection serializes to a megabyte or more of repetitive module
+# JSON and the fleet posts tens of thousands a day, so accepting a compressed
+# body is worth about eightfold on the wire -- and a body that spends less
+# time in flight has a correspondingly smaller window in which the upload can
+# be interrupted, which is the failure this endpoint records most often.
+# Uncompressed clients must keep working throughout: the fleet updates over
+# weeks, so both shapes are live at once for the whole rollout.
+# ---------------------------------------------------------------------------
+
+def _gzipped(raw: bytes) -> bytes:
+    return gzip.compress(raw)
+
+
+def test_gzipped_body_reaches_the_parser(monkeypatch):
+    """Proved by the rejection changing: an undecoded gzip stream cannot parse
+    as JSON, so reaching payload validation means the inflate ran first."""
+    conn = RecordingConnection(results=[(1,)])
+    monkeypatch.setattr(dependencies, "get_db_connection", lambda: conn)
+
+    resp = TestClient(app).post(
+        "/api/v1/events",
+        content=_gzipped(b'{"not": "an event submission"}'),
+        headers={**AUTH, "Content-Type": "application/json",
+                 "Content-Encoding": "gzip"},
+    )
+    assert resp.status_code == 422
+    params = _inserts(conn)[0][1]
+    assert "invalid_payload" in params
+    assert "malformed_json" not in params
+    assert "body_unreadable" not in params
+
+
+def test_uncompressed_body_still_works(monkeypatch):
+    """Both shapes are live for the whole rollout."""
+    conn = RecordingConnection(results=[(1,)])
+    monkeypatch.setattr(dependencies, "get_db_connection", lambda: conn)
+
+    resp = TestClient(app).post(
+        "/api/v1/events",
+        json={"not": "an event submission"},
+        headers={**AUTH},
+    )
+    assert resp.status_code == 422
+    assert "invalid_payload" in _inserts(conn)[0][1]
+
+
+def test_compressed_detail_separates_wire_bytes_from_decoded_bytes(monkeypatch):
+    """declared/received stay wire counts; substituting the decoded size would
+    read as a body arriving eight times larger than it was declared."""
+    conn = RecordingConnection(results=[(1,)])
+    monkeypatch.setattr(dependencies, "get_db_connection", lambda: conn)
+
+    raw = b"{not json" * 200
+    body = _gzipped(raw)
+    resp = TestClient(app).post(
+        "/api/v1/events",
+        content=body,
+        headers={**AUTH, "Content-Type": "application/json",
+                 "Content-Encoding": "gzip"},
+    )
+    assert resp.status_code == 400
+    detail = next(p for p in _inserts(conn)[0][1]
+                  if isinstance(p, str) and "declared=" in p)
+    assert f"declared={len(body)}" in detail
+    assert f"received={len(body)}" in detail
+    assert f"decompressed={len(raw)}" in detail
+    assert "encoding=gzip" in detail
+
+
+def test_zip_bomb_is_refused_during_the_inflate(monkeypatch):
+    """A few hundred KB of zeroes inflates to gigabytes. Refusing after the
+    fact would mean the container is already gone."""
+    import routers.events as events_router
+
+    conn = RecordingConnection(results=[(1,)])
+    monkeypatch.setattr(dependencies, "get_db_connection", lambda: conn)
+    monkeypatch.setattr(events_router, "MAX_DECOMPRESSED_BODY_BYTES", 1024)
+
+    resp = TestClient(app).post(
+        "/api/v1/events",
+        content=_gzipped(b"\0" * 200_000),
+        headers={**AUTH, "Content-Type": "application/json",
+                 "Content-Encoding": "gzip"},
+    )
+    assert resp.status_code == 400
+    params = _inserts(conn)[0][1]
+    assert "body_unreadable" in params
+    assert any(isinstance(p, str) and "ceiling" in p for p in params)
+
+
+def test_truncated_gzip_stream_is_refused(monkeypatch):
+    """A stream with no trailer is a dropped upload wearing a decode error's
+    clothes -- the same story as a short uncompressed body."""
+    conn = RecordingConnection(results=[(1,)])
+    monkeypatch.setattr(dependencies, "get_db_connection", lambda: conn)
+
+    whole = _gzipped(json.dumps(PAYLOAD).encode())
+    resp = TestClient(app).post(
+        "/api/v1/events",
+        content=whole[: len(whole) // 2],
+        headers={**AUTH, "Content-Type": "application/json",
+                 "Content-Encoding": "gzip"},
+    )
+    assert resp.status_code == 400
+    assert "body_unreadable" in _inserts(conn)[0][1]
+
+
+def test_unknown_content_encoding_is_refused(monkeypatch):
+    """Guessing at an encoding we cannot decode would file the result under
+    malformed_json and send whoever reads it after a serializer bug."""
+    conn = RecordingConnection(results=[(1,)])
+    monkeypatch.setattr(dependencies, "get_db_connection", lambda: conn)
+
+    resp = TestClient(app).post(
+        "/api/v1/events",
+        content=b'{"metadata": {}}',
+        headers={**AUTH, "Content-Type": "application/json",
+                 "Content-Encoding": "br"},
+    )
+    assert resp.status_code == 400
+    params = _inserts(conn)[0][1]
+    assert "body_unreadable" in params
+    assert any(isinstance(p, str) and "unsupported Content-Encoding" in p
+               for p in params)
+
+
+def test_deflate_is_accepted_too(monkeypatch):
+    conn = RecordingConnection(results=[(1,)])
+    monkeypatch.setattr(dependencies, "get_db_connection", lambda: conn)
+
+    resp = TestClient(app).post(
+        "/api/v1/events",
+        content=zlib.compress(b'{"not": "an event submission"}'),
+        headers={**AUTH, "Content-Type": "application/json",
+                 "Content-Encoding": "deflate"},
+    )
+    assert resp.status_code == 422
+    assert "invalid_payload" in _inserts(conn)[0][1]
