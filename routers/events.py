@@ -3,9 +3,11 @@
 import json
 import logging
 import math
+import os
 import re
 import threading
 import time as _time
+import zlib
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
 
@@ -116,14 +118,19 @@ def _strip_nul(value):
     return value
 
 
-def _transport_note(request: Request, received, error):
+def _transport_note(request: Request, received, error, decompressed=None):
     """How much of the body actually arrived, and what went wrong reading it.
 
     A rejection that only says "not valid JSON" cannot distinguish a client
     serializing garbage from an upload that died in flight, and those have
     opposite fixes. Declared vs received length plus the exception class
     separates them at a glance, so it rides along in the detail the failures
-    view already renders."""
+    view already renders.
+
+    declared and received are always wire bytes, so they stay comparable on a
+    compressed check-in; decompressed is reported separately rather than
+    substituted for received, which would otherwise read as a body arriving
+    ten times larger than it was declared."""
     declared = request.headers.get("content-length")
     parts = ["declared=" + (declared if declared is not None else "absent")]
     if received is not None:
@@ -131,9 +138,72 @@ def _transport_note(request: Request, received, error):
     encoding = request.headers.get("content-encoding")
     if encoding:
         parts.append(f"encoding={encoding}")
+    if decompressed is not None:
+        parts.append(f"decompressed={decompressed}")
     if error is not None:
         parts.append(f"error={type(error).__name__}")
     return "[" + " ".join(parts) + "]"
+
+
+# A full collection serializes to a megabyte or more of highly repetitive
+# module JSON, and the fleet posts tens of thousands of them a day. Accepting a
+# compressed body cuts that roughly tenfold on the wire, and a body that spends
+# less time in flight has a correspondingly smaller window in which the upload
+# can be interrupted -- which is the failure this endpoint records most often.
+# FastAPI's GZipMiddleware only ever compresses responses, so the request side
+# has to be undone here.
+_SUPPORTED_REQUEST_ENCODINGS = ("gzip", "deflate", "identity")
+
+# Ceiling on what a compressed body may inflate to. A few hundred KB of zeroes
+# expands to gigabytes, so the limit is enforced during the inflate rather than
+# after it: an unbounded one-shot decompress would exhaust the container before
+# any size check could run. Generous against the largest real payload observed
+# (~3 MB) so it only ever catches an attack or a corrupt stream.
+MAX_DECOMPRESSED_BODY_BYTES = int(
+    os.getenv("MAX_DECOMPRESSED_BODY_BYTES", str(64 * 1024 * 1024))
+)
+
+
+def _decompress_body(request: Request, raw_body: bytes) -> bytes:
+    """Undo Content-Encoding on an ingest body, bounded against a zip bomb.
+
+    Returns the body unchanged when the request carries no encoding, so an
+    uncompressed client stays supported indefinitely -- the fleet updates over
+    weeks, and both shapes have to work throughout. Raises ValueError with a
+    reason suitable for the failure detail when the stream cannot be inflated.
+    """
+    encoding = (request.headers.get("content-encoding") or "").strip().lower()
+    if not encoding or encoding == "identity":
+        return raw_body
+    if encoding not in _SUPPORTED_REQUEST_ENCODINGS:
+        raise ValueError(
+            f"unsupported Content-Encoding {encoding!r}; "
+            f"expected one of {', '.join(_SUPPORTED_REQUEST_ENCODINGS)}"
+        )
+
+    # 16 + MAX_WBITS selects gzip framing; bare MAX_WBITS is raw zlib/deflate.
+    wbits = 16 + zlib.MAX_WBITS if encoding == "gzip" else zlib.MAX_WBITS
+    decompressor = zlib.decompressobj(wbits)
+    try:
+        body = decompressor.decompress(raw_body, MAX_DECOMPRESSED_BODY_BYTES + 1)
+        if decompressor.unconsumed_tail or len(body) > MAX_DECOMPRESSED_BODY_BYTES:
+            raise ValueError(
+                f"decompressed body exceeds the "
+                f"{MAX_DECOMPRESSED_BODY_BYTES} byte ceiling"
+            )
+        body += decompressor.flush()
+    except zlib.error as zerr:
+        raise ValueError(f"{encoding} stream could not be inflated: {zerr}") from zerr
+    if len(body) > MAX_DECOMPRESSED_BODY_BYTES:
+        raise ValueError(
+            f"decompressed body exceeds the "
+            f"{MAX_DECOMPRESSED_BODY_BYTES} byte ceiling"
+        )
+    # A stream that never reached its end marker is a truncated upload wearing
+    # a decode error's clothes -- the same story as a short uncompressed body.
+    if not decompressor.eof:
+        raise ValueError(f"{encoding} stream ended before its trailer")
+    return body
 
 
 def _reject_ingest(request: Request, payload, *, reason: str, detail: str,
@@ -429,9 +499,11 @@ def get_ingest_failures(
     hours: int = Query(default=168, ge=1, le=2160, description="Look-back window in hours (default 7 days)"),
     outcome: str = Query(
         default="rejected",
-        pattern="^(rejected|accepted|all)$",
-        description="rejected (default) = the check-in was turned away; "
-                    "accepted = kept but repaired on the way in; all = both",
+        pattern="^(rejected|retried|accepted|all)$",
+        description="rejected (default) = turned away and nothing has arrived "
+                    "since; retried = the upload dropped but the client's "
+                    "retry landed; accepted = kept but repaired on the way in; "
+                    "all = every recorded row",
     ),
 ):
     """
@@ -460,20 +532,32 @@ def get_ingest_failures(
     seeing.
 
     Those two are therefore NOT failures, and ``outcome`` keeps them out of a
-    view whose whole promise is "these devices did not get through". The split
-    is derived from the recorded status rather than a stored flag, so it reads
-    correctly over history as well: outcome=rejected is status >= 400 (or
-    unrecorded), outcome=accepted is status < 400. A client defect that the
-    server repairs can be several thousand rows a day -- large enough to bury
-    the handful of genuinely rejected devices this page exists to surface --
-    while still being worth watching until the client-side fix rolls out.
-    counts.rejected / counts.accepted are always both present so the other
-    side is one click away rather than invisible.
+    view whose whole promise is "these devices did not get through". A client
+    defect that the server repairs can be several thousand rows a day -- large
+    enough to bury the handful of genuinely rejected devices this page exists
+    to surface -- while still being worth watching until the client-side fix
+    rolls out.
 
     upload_aborted / body_unreadable / empty_body are transport failures --
     the device reached the server but its payload did not arrive intact.
     malformed_json means a body that arrived and did not parse. The detail
     carries declared vs received byte counts so the two stay separable.
+
+    A transport failure is only a failed check-in if nothing arrived
+    afterwards. The clients retry three times with backoff, so a dropped
+    upload is normally resent down a fresh connection seconds later and the
+    data lands; counting the dropped attempt as a device that was turned away
+    describes an outage that is not happening. A transport row whose device
+    has a later successful check-in is therefore ``retried``, not
+    ``rejected``. Only transport reasons qualify: a malformed body or a bad
+    passphrase is resent identically, so a later success says nothing about
+    that check-in.
+
+    outcome is derived from the recorded status and devices.last_seen rather
+    than a stored flag, so it reads correctly over history as well, and a row
+    reclassifies on its own as soon as the device gets back in.
+    counts.rejected / counts.retried / counts.accepted are always all present
+    so the other sides are one click away rather than invisible.
     """
     try:
         _ckey = (limit, offset, serial or '', reason or '', hours, outcome)
@@ -500,7 +584,8 @@ def get_ingest_failures(
         _counts_row = cursor.fetchone()
         counts = {
             "rejected": _counts_row[0] if _counts_row else 0,
-            "accepted": _counts_row[1] if _counts_row else 0,
+            "retried": _counts_row[1] if _counts_row else 0,
+            "accepted": _counts_row[2] if _counts_row else 0,
         }
 
         cursor.execute(
@@ -528,7 +613,7 @@ def get_ingest_failures(
         for row in rows:
             (fid, occurred_at, failure_type, fail_reason, detail, status_code,
              endpoint, client_ip, user_agent, serial_number, device_uuid,
-             device_name, platform, client_version) = row
+             device_name, platform, client_version, retried) = row
             failures.append({
                 "id": fid,
                 "ts": occurred_at.isoformat() if occurred_at else None,
@@ -536,7 +621,11 @@ def get_ingest_failures(
                 "reason": fail_reason,
                 "detail": detail,
                 "statusCode": status_code,
-                "outcome": "accepted" if status_code is not None and status_code < 400 else "rejected",
+                "outcome": (
+                    "accepted" if status_code is not None and status_code < 400
+                    else "retried" if retried
+                    else "rejected"
+                ),
                 "endpoint": endpoint,
                 "clientIp": client_ip,
                 "userAgent": user_agent,
@@ -719,9 +808,24 @@ async def submit_events(request: Request):
                        + _transport_note(request, 0, None),
             )
 
+        # raw_body stays the bytes as they arrived; body is what the JSON
+        # parser sees. Keeping them separate is what lets the failure detail
+        # report wire bytes and decoded bytes as the different numbers they
+        # are when a client compresses.
+        body = raw_body
         try:
-            payload = json.loads(raw_body)
-            if _NUL_ESCAPE in raw_body:
+            body = _decompress_body(request, raw_body)
+        except Exception as decode_error:
+            _reject_ingest(
+                request, None,
+                reason="body_unreadable",
+                detail=f"Request body could not be decoded: {decode_error} "
+                       + _transport_note(request, len(raw_body), decode_error),
+            )
+
+        try:
+            payload = json.loads(body)
+            if _NUL_ESCAPE in body:
                 payload = _strip_nul(payload)
                 # Recorded at 200, exactly as usage_out_of_bounds is: the
                 # check-in is accepted and the data kept, but a client shipping
@@ -750,7 +854,12 @@ async def submit_events(request: Request):
                 request, None,
                 reason="malformed_json",
                 detail=f"Request body is not valid JSON: {parse_error} "
-                       + _transport_note(request, len(raw_body), parse_error),
+                       + _transport_note(
+                           request, len(raw_body), parse_error,
+                           decompressed=(
+                               len(body) if body is not raw_body else None
+                           ),
+                       ),
             )
 
         # Validate top-level structure via Pydantic
