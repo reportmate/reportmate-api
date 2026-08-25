@@ -71,21 +71,57 @@ _log_handler.setFormatter(
     )
 )
 _log_handler.addFilter(_RequestIdFilter())
-# LOG_LEVEL is the one knob for how much this process writes to stdout, and
-# stdout is billed: every line lands in ContainerAppConsoleLogs_CL. Measured
-# 2026-08-25 the API wrote 1.47M lines a day, 18.8 GB a month, of which the
-# azure.core HTTP-logging policy alone (one multi-line request/response dump
-# per Web PubSub broadcast, i.e. per ingest) was 55% and this module's
-# per-device INFO lines were most of the rest. The SDK loggers are pinned to
-# WARNING regardless of LOG_LEVEL because their INFO output is never ours to
-# want; everything else follows LOG_LEVEL, default WARNING in production
-# (Terraform sets it) and INFO when unset for local work.
+# Stdout is billed: every line this process writes lands in
+# ContainerAppConsoleLogs_CL. Measured against the workspace over 24h on
+# 2026-08-25 the API wrote 1,469,364 lines a day (~44M/30d, 18.8 GB), split:
+#
+#   azure.core HTTP-logging policy   814,847  55.5%   (multi-line request and
+#                                                      response header dumps,
+#                                                      one pair per Web PubSub
+#                                                      broadcast, i.e. per
+#                                                      check-in)
+#   this app's own INFO lines        558,477  38.0%   (of which ~456k were the
+#                                                      per-check-in ingest
+#                                                      chatter in routers/
+#                                                      events.py and ~128k the
+#                                                      per-device lines in the
+#                                                      /devices list)
+#   uvicorn access log                85,403   5.8%
+#   everything else (WARNING,         ~10,600   0.7%
+#   ERROR, alembic, startup)
+#
+# Two rules follow from that split, and they are deliberately independent of
+# each other so neither depends on an env var being set correctly:
+#
+# 1. Third-party and SDK loggers are pinned to WARNING unconditionally. Their
+#    INFO output is never something this service asked for, and the azure.core
+#    policy alone is over half the bill. Pinning is not conditional on
+#    LOG_LEVEL, so a developer raising verbosity locally does not reopen it.
+# 2. This app's own loggers follow LOG_LEVEL, default INFO. INFO is safe as a
+#    default because the per-check-in and per-device lines have been moved to
+#    DEBUG at the call sites -- the hot paths emit one INFO line per unit of
+#    work, not one per device, module or request. Set LOG_LEVEL=WARNING to
+#    drop even that summary line; set DEBUG to get the chatter back.
+#
+# force=True so the level applies even if something (a test harness, an
+# embedding server) attached a root handler before this import.
+_THIRD_PARTY_LOG_LEVEL = logging.WARNING
+_NOISY_LOGGERS = (
+    "azure",
+    "azure.core",
+    "azure.core.pipeline.policies.http_logging_policy",
+    "azure.identity",
+    "azure.messaging",
+    "urllib3",
+    "asyncio",
+)
 logging.basicConfig(
     level=os.getenv("LOG_LEVEL", "INFO").upper(),
     handlers=[_log_handler],
+    force=True,
 )
-for _noisy in ("azure", "azure.core.pipeline.policies.http_logging_policy", "urllib3"):
-    logging.getLogger(_noisy).setLevel(logging.WARNING)
+for _noisy in _NOISY_LOGGERS:
+    logging.getLogger(_noisy).setLevel(_THIRD_PARTY_LOG_LEVEL)
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
@@ -201,7 +237,7 @@ def load_sql(name: str) -> str:
         raise OSError(f"Cannot read SQL file: {sql_path}") from e
 
     SQL_QUERIES[name] = query
-    logger.info(f"Loaded SQL query: {name}")
+    logger.debug(f"Loaded SQL query: {name}")
     return query
 
 
@@ -1644,7 +1680,7 @@ async def broadcast_event(event_data: dict):
         return
     try:
         service.send_to_all(message=event_data, content_type="application/json")
-        logger.info(
+        logger.debug(
             f"Broadcast event to WebPubSub: {event_data.get('kind', 'unknown')} for {event_data.get('device', 'unknown')}"
         )
     except Exception as e:
