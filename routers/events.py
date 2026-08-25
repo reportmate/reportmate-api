@@ -174,6 +174,32 @@ _USAGE_DATE_MIN = "2020-01-01"
 _USAGE_DATE_FUTURE_SKEW = timedelta(days=2)
 
 
+USAGE_UPSERT_SQL = """
+INSERT INTO usage_history (device_id, date, app_name, publisher, launches, total_seconds, active_seconds, foreground_seconds, users, updated_at)
+VALUES (%s, %s, %s, %s, %s, %s,
+        LEAST(%s::double precision, %s::double precision),
+        LEAST(%s::double precision, %s::double precision),
+        %s::jsonb, NOW())
+ON CONFLICT (device_id, date, app_name) DO UPDATE SET
+    publisher = COALESCE(NULLIF(EXCLUDED.publisher, ''), usage_history.publisher),
+    launches = usage_history.launches + EXCLUDED.launches,
+    total_seconds = usage_history.total_seconds + EXCLUDED.total_seconds,
+    active_seconds = LEAST(usage_history.active_seconds + EXCLUDED.active_seconds, %s),
+    foreground_seconds = LEAST(usage_history.foreground_seconds + EXCLUDED.foreground_seconds, %s),
+    users = COALESCE((
+        SELECT jsonb_agg(DISTINCT u)
+        FROM (
+            SELECT u FROM jsonb_array_elements_text(COALESCE(usage_history.users, '[]'::jsonb)) AS u
+            UNION
+            SELECT u FROM jsonb_array_elements_text(COALESCE(EXCLUDED.users, '[]'::jsonb)) AS u
+        ) merged
+        WHERE u IS NOT NULL AND u <> ''
+    ), '[]'::jsonb),
+    updated_at = NOW()
+RETURNING (active_seconds >= %s OR foreground_seconds >= %s)
+"""
+
+
 def _usage_entry_numbers(entry):
     """Coerce the numeric fields of one dailyUsageHistory entry.
 
@@ -423,10 +449,13 @@ def get_ingest_failures(
     empty_body, malformed_json, invalid_payload, empty_serial,
     sentinel_serial, short_serial, hostname_serial, serial_equals_hostname,
     nul_in_payload, usage_out_of_bounds; throttle -> rate_limited;
-    server_error -> internal_error.
+    server_error -> internal_error, usage_write_failed.
 
     rate_limited and internal_error are recorded at the status the caller
-    actually received. nul_in_payload and usage_out_of_bounds are recorded at
+    actually received. usage_write_failed is recorded at 500 even though the
+    check-in returned 200: the device was not turned away, but its usage rows
+    were lost server-side, and data loss belongs in the default view rather
+    than filed under repairs. nul_in_payload and usage_out_of_bounds are recorded at
     200 -- the check-in was accepted, but it carried a client defect worth
     seeing.
 
@@ -1026,27 +1055,19 @@ async def submit_events(request: Request):
                                     # never again inflate a day past physical reality. RETURNING
                                     # reports rows sitting at the ceiling so the anomaly is
                                     # surfaced instead of silently absorbed.
-                                    cursor.execute("""
-                                        INSERT INTO usage_history (device_id, date, app_name, publisher, launches, total_seconds, active_seconds, foreground_seconds, users, updated_at)
-                                        VALUES (%s, %s, %s, %s, %s, %s, LEAST(%s, %s), LEAST(%s, %s), %s::jsonb, NOW())
-                                        ON CONFLICT (device_id, date, app_name) DO UPDATE SET
-                                            publisher = COALESCE(NULLIF(EXCLUDED.publisher, ''), usage_history.publisher),
-                                            launches = usage_history.launches + EXCLUDED.launches,
-                                            total_seconds = usage_history.total_seconds + EXCLUDED.total_seconds,
-                                            active_seconds = LEAST(usage_history.active_seconds + EXCLUDED.active_seconds, %s),
-                                            foreground_seconds = LEAST(usage_history.foreground_seconds + EXCLUDED.foreground_seconds, %s),
-                                            users = COALESCE((
-                                                SELECT jsonb_agg(DISTINCT u)
-                                                FROM (
-                                                    SELECT u FROM jsonb_array_elements_text(COALESCE(usage_history.users, '[]'::jsonb)) AS u
-                                                    UNION
-                                                    SELECT u FROM jsonb_array_elements_text(COALESCE(EXCLUDED.users, '[]'::jsonb)) AS u
-                                                ) merged
-                                                WHERE u IS NOT NULL AND u <> ''
-                                            ), '[]'::jsonb),
-                                            updated_at = NOW()
-                                        RETURNING (active_seconds >= %s OR foreground_seconds >= %s)
-                                    """, (
+                                    #
+                                    # The ::double precision casts inside LEAST() are load
+                                    # bearing, not decoration. A bare %s placeholder is sent
+                                    # untyped, and Postgres normally infers the type from the
+                                    # INSERT target column -- which is why the plain
+                                    # total_seconds placeholder needs no cast. Inside a function
+                                    # call that inference does not happen: function resolution
+                                    # runs first, LEAST(unknown, unknown) has nothing to resolve
+                                    # against and falls back to text, and the whole statement
+                                    # then dies with 42804 "column active_seconds is of type
+                                    # double precision but expression is of type text". That is
+                                    # every row of every check-in, not an edge case.
+                                    cursor.execute(USAGE_UPSERT_SQL, (
                                         serial_number,
                                         date_val,
                                         app_name,
@@ -1089,6 +1110,29 @@ async def submit_events(request: Request):
                             except Exception as usage_err:
                                 logger.error(f"Failed to store daily usage history for {serial_number}: {usage_err}")
                                 conn.rollback()
+                                # Surface the loss. The check-in itself still
+                                # returns 200 and every other module is already
+                                # committed, so without this row a broken usage
+                                # write is invisible outside container logs --
+                                # which is exactly how a statement-level type
+                                # error silently dropped fleet-wide utilization
+                                # for eight days. Recorded as a server_error at
+                                # 500 (not 200 like usage_out_of_bounds) because
+                                # nothing was stored and nothing was repaired:
+                                # the measurement is gone, and that belongs in
+                                # the default view rather than behind
+                                # outcome=accepted.
+                                record_ingest_failure(
+                                    failure_type="server_error",
+                                    reason="usage_write_failed",
+                                    status_code=500,
+                                    detail=(f"{len(daily_history)} usage rows dropped: "
+                                            f"{type(usage_err).__name__}: {usage_err}"),
+                                    endpoint=request.url.path,
+                                    client_ip=resolve_client_ip(request),
+                                    user_agent=request.headers.get("user-agent"),
+                                    identity=extract_ingest_identity(payload),
+                                )
                     
                     # Update devices table with OS info if system module
                     if module_name == 'system':
