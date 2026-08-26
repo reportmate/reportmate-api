@@ -1869,10 +1869,17 @@ def get_installs_filters(
             error_count = 0
             warning_count = 0
             removed_count = 0
+            # Items that completed an install in the MOST RECENT run, as opposed
+            # to the much larger set that is merely installed. Munki reports
+            # these from InstallResults, Cimian from the session that ran them.
+            success_count = 0
 
             for item in items:
                 status = (item.get('currentStatus') or item.get('status') or '').lower()
-                if status in ('installed', 'install-of-', 'install_of', 'present'):
+                if status in ('install_succeeded', 'install-succeeded', 'completed'):
+                    success_count += 1
+                    installed_count += 1
+                elif status in ('installed', 'install-of-', 'install_of', 'present'):
                     installed_count += 1
                 elif status in ('will-be-installed', 'will_be_installed', 'pending', 'downloading', 'installing'):
                     pending_count += 1
@@ -1918,13 +1925,29 @@ def get_installs_filters(
             # the /installs report endpoint.
             ITEM_KEEP_FIELDS = ('itemName', 'displayName', 'name',
                                 'currentStatus', 'status', 'lastError', 'lastWarning')
-            
+
+            # Errors and warnings carry their own message text; successes and
+            # pending items do not, and a version plus a time is the only thing
+            # that makes those drill-downs readable. Carried ONLY for items in a
+            # notable state — plain 'installed' is ~99% of the ~113k items in
+            # this payload and has no drill-down, so widening the field list for
+            # every item would put back the megabytes the slimming removed.
+            ITEM_DETAIL_FIELDS = ('installedVersion', 'version', 'latestVersion',
+                                  'endTime', 'lastUpdate', 'lastAttemptTime', 'pendingReason')
+            PLAIN_INSTALLED_STATUSES = {'installed', 'present', ''}
+
+            def slim_item(item):
+                slim = {k: item.get(k) for k in ITEM_KEEP_FIELDS
+                        if item.get(k) is not None and item.get(k) != ''}
+                status = (item.get('currentStatus') or item.get('status') or '').lower()
+                if status not in PLAIN_INSTALLED_STATUSES:
+                    slim.update({k: item.get(k) for k in ITEM_DETAIL_FIELDS
+                                 if item.get(k) is not None and item.get(k) != ''})
+                return slim
+
             cimian_slim = None
             if cimian_data:
-                slim_items = [
-                    {k: item.get(k) for k in ITEM_KEEP_FIELDS if item.get(k) is not None and item.get(k) != ''}
-                    for item in cimian_data.get('items', [])
-                ]
+                slim_items = [slim_item(item) for item in cimian_data.get('items', [])]
                 cimian_slim = {
                     'config': config,
                     'version': cimian_data.get('version'),
@@ -1936,6 +1959,7 @@ def get_installs_filters(
                     'itemCounts': {
                         'total': len(cimian_data.get('items', [])),
                         'installed': installed_count,
+                        'success': success_count,
                         'pending': pending_count,
                         'error': error_count,
                         'warning': warning_count,
@@ -1945,10 +1969,7 @@ def get_installs_filters(
             
             munki_slim = None
             if munki_data:
-                slim_munki_items = [
-                    {k: item.get(k) for k in ITEM_KEEP_FIELDS if item.get(k) is not None and item.get(k) != ''}
-                    for item in munki_data.get('items', [])
-                ]
+                slim_munki_items = [slim_item(item) for item in munki_data.get('items', [])]
                 munki_slim = {
                     'version': munki_data.get('version'),
                     'status': munki_data.get('status'),
@@ -1960,6 +1981,7 @@ def get_installs_filters(
                     'itemCounts': {
                         'total': len(munki_data.get('items', [])),
                         'installed': installed_count,
+                        'success': success_count,
                         'pending': pending_count,
                         'error': error_count,
                         'warning': warning_count,
