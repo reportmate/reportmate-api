@@ -3071,6 +3071,15 @@ def get_bulk_system(
                 time_zone = os_info.get('timeZone') or os_info.get('time_zone', '')
                 install_date = os_info.get('installDate') or os_info.get('install_date', '')
                 feature_update = os_info.get('featureUpdate') or os_info.get('feature_update', '')
+                # In-place upgrade markers (HKLM\SYSTEM\Setup\"Source OS (Updated on ...)").
+                # installDate moves for a wipe and for a feature update alike; these say
+                # which. None means the client has not reported the field yet, and is not
+                # the same claim as 0, which means the OS has never been upgraded over.
+                last_in_place_upgrade = (os_info.get('lastInPlaceUpgrade')
+                                         or os_info.get('last_in_place_upgrade'))
+                in_place_upgrade_count = os_info.get('inPlaceUpgradeCount')
+                if in_place_upgrade_count is None:
+                    in_place_upgrade_count = os_info.get('in_place_upgrade_count')
                 uptime_string = system_data.get('uptimeString') or system_data.get('uptime_string', '') if system_data else ''
                 
                 # Check systemDetails for Mac locale/timezone/keyboard if not on os_info
@@ -3136,6 +3145,8 @@ def get_bulk_system(
                     'keyboardLayout': keyboard_layouts or None,
                     'installDate': install_date or None,
                     'featureUpdate': feature_update or None,
+                    'lastInPlaceUpgrade': last_in_place_upgrade or None,
+                    'inPlaceUpgradeCount': in_place_upgrade_count,
                     'activationStatus': activation_status,
                     'licenseType': license_type or None,
                     'licenseSource': license_source or None,
