@@ -29,7 +29,10 @@ def make_row(index: int):
         serial,
         f"uuid-{index}",
         datetime.datetime(2026, 8, 27, 12, 0, 0),
-        {"operating_system": {"name": "Windows 11", "displayVersion": "25H2"}},
+        {"operating_system": {"name": "Windows 11", "displayVersion": "25H2",
+                              "installDate": "2026-08-25T20:07:17",
+                              "lastInPlaceUpgrade": "2024-07-23T09:12:33",
+                              "inPlaceUpgradeCount": 1}},
         datetime.datetime(2026, 8, 27, 11, 0, 0),
         f"Device {index}",
         f"device-{index}",
@@ -165,3 +168,45 @@ def test_total_count_lets_a_client_detect_a_short_read(client):
     cached = client.get("/api/v1/system?limit=5&offset=5", headers=AUTH)
     assert cached.headers["X-Total-Count"] == str(FLEET)
     assert 'rel="prev"' in cached.headers["Link"]
+
+
+def test_the_in_place_upgrade_marker_is_projected(client):
+    """installDate moves for a wipe and a feature update alike; this says which."""
+    device = client.get("/api/v1/system", headers=AUTH).json()[0]
+    assert device["lastInPlaceUpgrade"] == "2024-07-23T09:12:33"
+    assert device["inPlaceUpgradeCount"] == 1
+
+
+def test_a_never_upgraded_machine_is_zero_not_missing(client, monkeypatch):
+    """0 means the OS has never been upgraded over. None means the client has not
+    reported the field yet. Collapsing the two would read an old client as proof of a
+    clean install."""
+    import routers.fleet as fleet_router
+
+    def row_without_markers(index):
+        row = list(make_row(index))
+        row[3] = {"operating_system": {"name": "Windows 11", "inPlaceUpgradeCount": 0}}
+        return tuple(row)
+
+    monkeypatch.setattr(fleet_router, "get_db_connection",
+                        lambda: FakeConnection([row_without_markers(0)]))
+    invalidate_caches()
+    device = client.get("/api/v1/system", headers=AUTH).json()[0]
+    assert device["inPlaceUpgradeCount"] == 0
+    assert device["lastInPlaceUpgrade"] is None
+
+
+def test_a_client_that_has_not_reported_the_field_yet_is_null(client, monkeypatch):
+    import routers.fleet as fleet_router
+
+    def legacy_row(index):
+        row = list(make_row(index))
+        row[3] = {"operating_system": {"name": "Windows 11"}}
+        return tuple(row)
+
+    monkeypatch.setattr(fleet_router, "get_db_connection",
+                        lambda: FakeConnection([legacy_row(0)]))
+    invalidate_caches()
+    device = client.get("/api/v1/system", headers=AUTH).json()[0]
+    assert device["inPlaceUpgradeCount"] is None
+    assert device["lastInPlaceUpgrade"] is None
