@@ -5,7 +5,9 @@ import time as _time
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
 
-from fastapi import APIRouter, Depends, HTTPException, Query, Request
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
+
+from pagination import add_pagination_headers
 
 from dependencies import (
     cache_get, cache_set, get_db_connection, load_sql, logger,
@@ -2929,8 +2931,10 @@ def get_bulk_inventory(
 
 @router.get("/system", dependencies=[Depends(verify_authentication)], tags=["fleet"])
 def get_bulk_system(
+    request: Request,
+    response: Response,
     include_archived: bool = Query(default=False, alias="includeArchived", description="Include archived devices in results"),
-    limit: int = Query(default=1000, le=5000, description="Maximum number of devices to return (default 1000, max 5000)"),
+    limit: Optional[int] = Query(default=None, ge=1, le=5000, description="Maximum items to return"),
     offset: int = Query(default=0, ge=0, description="Number of items to skip"),
 ):
     """
@@ -2940,7 +2944,9 @@ def get_bulk_system(
     Used by /devices/system page for fleet-wide system visibility.
     By default, archived devices are excluded. Use includeArchived=true to include them.
     
-    Supports limit parameter for performance (defaults to 1000 devices, max 5000).
+    limit/offset page the response, matching /management and /installs/full. Omitting
+    limit returns every device; a fixed default would truncate the fleet silently once
+    it grew past that number, which is the failure this endpoint already had.
     
     **Response includes:**
     - Device identifiers and inventory
@@ -2949,20 +2955,27 @@ def get_bulk_system(
     - Pending updates and service status (in raw field)
     """
     try:
-        _ckey = (include_archived, limit)
+        # Cache the whole result set and slice it per request, the way the other
+        # bulk endpoints do. Keying the cache on limit and passing limit into the
+        # query meant offset was applied to an already-truncated page, so a caller
+        # paging at any size below the fleet total got one page and then empty
+        # results - indistinguishable, to that caller, from having read everything.
+        _ckey = (include_archived,)
         _cached = cache_get("system", _ckey)
         if _cached is not None:
+            add_pagination_headers(response, request, total=len(_cached),
+                                   limit=limit, offset=offset)
             return paginate(_cached, limit, offset)
         _t0 = _time.monotonic()
-        logger.info(f"Fetching bulk system data (limit: {limit})")
+        logger.info("Fetching bulk system data")
         
         conn = get_db_connection()
         cursor = conn.cursor()
         
-        # Load SQL from external file - uses parameterized archive filter and limit
+        # Load SQL from external file - uses a parameterized archive filter
         query = load_sql("devices/bulk_system")
         
-        cursor.execute(query, {"include_archived": include_archived, "limit": limit})
+        cursor.execute(query, {"include_archived": include_archived})
         rows = cursor.fetchall()
         conn.close()
         
@@ -3141,6 +3154,11 @@ def get_bulk_system(
         logger.info(f"Processed {len(devices)} devices with system data")
         cache_set("system", devices, _ckey)
         logger.info(f"[PERF] /api/devices/system: {_time.monotonic()-_t0:.3f}s ({len(devices)} devices)")
+        # X-Total-Count is how a paging client tells a short page from a truncated
+        # one. Without it, a caller that reads fewer devices than exist has no way
+        # to know, which is how the fleet came to be reported at half its size.
+        add_pagination_headers(response, request, total=len(devices),
+                               limit=limit, offset=offset)
         return paginate(devices, limit, offset)
         
     except Exception as e:
