@@ -738,18 +738,48 @@ def get_application_usage_by_device(
         conn = get_db_connection()
         cursor = conn.cursor()
 
-        # Exact (case-insensitive) match on app name. Substring + alias was
-        # conflating distinct inventory products in the multi-app endpoint
-        # and the same risk applies here -- a drill-down on "Motion" should
-        # not silently include MotionBuilder per-device rows.
+        # Match the same set of rows the fleet report rolled into this name.
+        #
+        # This used to be an exact match on app_name, to stop a substring
+        # drill-down on "Motion" silently including MotionBuilder. It did stop
+        # that, but it also returned NOTHING for every app whose report row is
+        # a canonical alias bucket: no usage_history row is literally named
+        # "Houdini" -- they are "Houdini 21.0.440", "Houdini Launcher", and so
+        # on -- so the drill-down behind such a row was always empty.
+        #
+        # Resolving through canonicalize_app_name() keeps the guarantee that
+        # made exact-match attractive (Motion and MotionBuilder canonicalize
+        # differently, so they still cannot mix) while making the drill-down
+        # show the rows the report actually counted. Passing a raw variant
+        # name still works: it resolves to its own bucket.
+        target_canonical = (canonicalize_app_name(app) or app).lower()
+
+        cursor.execute(
+            "SELECT DISTINCT app_name FROM usage_history WHERE date >= %s AND app_name IS NOT NULL",
+            (cutoff_date,),
+        )
+        member_names = sorted({
+            name.lower()
+            for (name,) in cursor.fetchall()
+            if name
+            and (
+                name.lower() == app.lower()
+                or (canonicalize_app_name(name) or name).lower() == target_canonical
+            )
+        })
+
+        # An unknown name matches nothing rather than everything.
+        if not member_names:
+            member_names = [app.lower()]
+
         where = [
             "uh.date >= %s",
-            "LOWER(uh.app_name) = %s",
+            "LOWER(uh.app_name) = ANY(%s)",
             "d.serial_number IS NOT NULL",
             "d.serial_number NOT LIKE 'TEST-%%'",
             "d.serial_number != 'localhost'",
         ]
-        params: List[Any] = [cutoff_date, app.lower()]
+        params: List[Any] = [cutoff_date, member_names]
 
         if not include_archived:
             where.append("d.archived = FALSE")
@@ -824,8 +854,9 @@ def get_application_usage_by_device(
             launch_count = int(launch_count or 0)
             users = [u for u in users_by_device.get(serial, []) if is_human_principal(u)]
             raw_variants = [v for v in (variants or []) if v]
-            # Collapse "Houdini Launcher" + "Houdini FX 21.0.440" + "hindie.exe"
-            # to a single canonical entry per device.
+            # Collapse "Houdini 21.0.440" + "Houdini 22.0.368" + "hindie.exe"
+            # to a single canonical entry per device. "Houdini Launcher" is a
+            # separate product and keeps its own entry.
             canonical_variants = sorted({canonicalize_app_name(v) or v for v in raw_variants})
             total_seconds_sum += total_secs
             total_launches_sum += launch_count
