@@ -28,7 +28,7 @@ def _client():
 
     @app.get("/not-found")
     def not_found():
-        raise HTTPException(status_code=404, detail="Device 0F33V9G2 not found")
+        raise HTTPException(status_code=404, detail="Device TESTSERIAL not found")
 
     @app.get("/bad-request")
     def bad_request():
@@ -62,7 +62,7 @@ def test_404_detail_is_preserved():
     resp = _client().get("/not-found")
     assert resp.status_code == 404
     # Client-error detail is intended for the caller.
-    assert "0F33V9G2" in resp.json()["detail"]
+    assert "TESTSERIAL" in resp.json()["detail"]
     assert "reference" not in resp.json()
 
 

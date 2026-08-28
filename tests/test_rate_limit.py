@@ -33,7 +33,7 @@ def test_per_device_limit_enforced(monkeypatch):
     """One device burst past its own allowance is still throttled."""
     GlobalRateLimitMiddleware.reset()
     client = TestClient(app)
-    headers = {"X-Device-Serial": "0F33V9G25083XX"}
+    headers = {"X-Device-Serial": "TESTSERIAL0001"}
     codes = [
         client.get("/api/v1/health/live", headers=headers).status_code
         for _ in range(121)
@@ -125,7 +125,7 @@ def test_wrong_internal_secret_still_limited(monkeypatch):
     GlobalRateLimitMiddleware.reset()
     monkeypatch.setattr(dependencies, "API_INTERNAL_SECRET", "test-internal-secret")
     client = TestClient(app)
-    headers = {"X-Internal-Secret": "not-the-secret", "X-Device-Serial": "0F33V9G250"}
+    headers = {"X-Internal-Secret": "not-the-secret", "X-Device-Serial": "TESTSERIAL0001"}
     codes = [
         client.get("/api/v1/health/live", headers=headers).status_code
         for _ in range(121)
@@ -136,7 +136,7 @@ def test_wrong_internal_secret_still_limited(monkeypatch):
 def test_429_carries_retry_information():
     GlobalRateLimitMiddleware.reset()
     client = TestClient(app)
-    headers = {"X-Device-Serial": "0F33V9G25083XX"}
+    headers = {"X-Device-Serial": "TESTSERIAL0001"}
     for _ in range(120):
         client.get("/api/v1/health/live", headers=headers)
     resp = client.get("/api/v1/health/live", headers=headers)

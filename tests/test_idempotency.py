@@ -7,7 +7,7 @@ from main import app
 PAYLOAD = {
     "metadata": {
         "deviceId": "11111111-2222-3333-4444-555555555555",
-        "serialNumber": "0F33V9G25083XX",
+        "serialNumber": "TESTSERIAL0001",
         "platform": "Windows",
         "collectionType": "Full",
     }
@@ -61,7 +61,7 @@ def test_replayed_key_is_acknowledged_without_reprocessing(monkeypatch):
     body = resp.json()
     assert body["status"] == "duplicate"
     assert body["idempotent"] is True
-    assert body["serialNumber"] == "0F33V9G25083XX"
+    assert body["serialNumber"] == "TESTSERIAL0001"
 
     assert len(conn.cur.queries) == 1
     assert "idempotency_keys" in conn.cur.queries[0]

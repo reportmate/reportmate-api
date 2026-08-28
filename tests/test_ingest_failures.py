@@ -21,10 +21,10 @@ from main import app
 PAYLOAD = {
     "metadata": {
         "deviceId": "11111111-2222-3333-4444-555555555555",
-        "serialNumber": "0F33V9G25083XX",
+        "serialNumber": "TESTSERIAL0001",
         "platform": "Windows",
         "clientVersion": "2026.07.21",
-        "additional": {"deviceName": "LILYANNA-PC"},
+        "additional": {"deviceName": "EXAMPLE-PC"},
     }
 }
 
@@ -80,9 +80,9 @@ def _inserts(conn):
 
 def test_identity_from_dict():
     ident = extract_ingest_identity(PAYLOAD)
-    assert ident["serial_number"] == "0F33V9G25083XX"
+    assert ident["serial_number"] == "TESTSERIAL0001"
     assert ident["device_uuid"] == "11111111-2222-3333-4444-555555555555"
-    assert ident["device_name"] == "LILYANNA-PC"
+    assert ident["device_name"] == "EXAMPLE-PC"
     assert ident["platform"] == "Windows"
     assert ident["client_version"] == "2026.07.21"
 
@@ -91,7 +91,7 @@ def test_identity_from_bytes():
     import json
 
     ident = extract_ingest_identity(json.dumps(PAYLOAD).encode())
-    assert ident["serial_number"] == "0F33V9G25083XX"
+    assert ident["serial_number"] == "TESTSERIAL0001"
 
 
 def test_identity_from_garbage_never_raises():
@@ -140,8 +140,8 @@ def test_wrong_passphrase_on_ingest_records_identity(monkeypatch):
     assert len(inserts) == 1
     params = inserts[0][1]
     assert "invalid_passphrase" in params
-    assert "0F33V9G25083XX" in params
-    assert "LILYANNA-PC" in params
+    assert "TESTSERIAL0001" in params
+    assert "EXAMPLE-PC" in params
     assert conn.committed
 
 
@@ -250,7 +250,7 @@ def test_failures_endpoint_lists_rows(monkeypatch):
     row = (
         7, now, "auth", "invalid_passphrase", "Client passphrase did not match",
         401, "/api/v1/events", "10.1.2.3", "ReportMate/2026.07.21",
-        "0F33V9G25083XX", "1111", "LILYANNA-PC", "Windows", "2026.07.21",
+        "TESTSERIAL0001", "1111", "EXAMPLE-PC", "Windows", "2026.07.21",
         False,
     )
     conn = RecordingConnection(
@@ -274,8 +274,8 @@ def test_failures_endpoint_lists_rows(monkeypatch):
     assert body["summary"][0]["reason"] == "invalid_passphrase"
     assert body["summary"][0]["devices"] == 1
     f = body["failures"][0]
-    assert f["serialNumber"] == "0F33V9G25083XX"
-    assert f["deviceName"] == "LILYANNA-PC"
+    assert f["serialNumber"] == "TESTSERIAL0001"
+    assert f["deviceName"] == "EXAMPLE-PC"
     assert f["reason"] == "invalid_passphrase"
     assert f["statusCode"] == 401
     assert f["ts"] == now.isoformat()
@@ -303,11 +303,11 @@ def _failures_conn(now, rows, count=None, counts=(0, 0, 0), summary=None):
     )
 
 
-def _row(reason, status, serial="0F33V9G25083XX", ts=None, retried=False):
+def _row(reason, status, serial="TESTSERIAL0001", ts=None, retried=False):
     return (
         7, ts, "validation", reason, "detail", status,
         "/api/v1/events", "10.1.2.3", "ReportMate/2026.08.16",
-        serial, "1111", "LILYANNA-PC", "Windows", "2026.08.16",
+        serial, "1111", "EXAMPLE-PC", "Windows", "2026.08.16",
         retried,
     )
 
@@ -459,9 +459,9 @@ def test_failures_endpoint_requires_auth(monkeypatch):
 # ---------------------------------------------------------------------------
 
 IDENTITY_HEADERS = {
-    "X-Device-Serial": "0F33V9G25083XX",
+    "X-Device-Serial": "TESTSERIAL0001",
     "X-Device-Uuid": "11111111-2222-3333-4444-555555555555",
-    "X-Device-Name": "LILYANNA-PC",
+    "X-Device-Name": "EXAMPLE-PC",
     "X-Platform": "Windows",
     "X-Client-Version": "2026.07.21",
 }
@@ -481,8 +481,8 @@ def test_identity_headers_attribute_an_unreadable_body(monkeypatch):
     assert resp.status_code == 400
 
     params = _inserts(conn)[0][1]
-    assert "0F33V9G25083XX" in params
-    assert "LILYANNA-PC" in params
+    assert "TESTSERIAL0001" in params
+    assert "EXAMPLE-PC" in params
     assert "Windows" in params
 
 
@@ -616,7 +616,7 @@ def test_client_disconnect_recorded_as_upload_aborted(monkeypatch):
 
     params = _inserts(conn)[0][1]
     assert "upload_aborted" in params
-    assert "0F33V9G25083XX" in params
+    assert "TESTSERIAL0001" in params
 
 
 # ---------------------------------------------------------------------------
@@ -687,7 +687,7 @@ def test_tpm_nul_payload_is_accepted_and_recorded(monkeypatch):
     params = inserts[0][1]
     assert "nul_in_payload" in params
     assert 200 in params
-    assert "0F33V9G25083XX" in params
+    assert "TESTSERIAL0001" in params
 
 
 def test_no_nul_means_no_recording(monkeypatch):
@@ -719,13 +719,13 @@ def test_rate_limited_ingest_is_recorded(monkeypatch):
     monkeypatch.setattr(dependencies, "DISABLE_AUTH", False)
     GlobalRateLimitMiddleware.reset()
     for _ in range(120):
-        GlobalRateLimitMiddleware._allow("dev:0F33V9G25083XX", 120)
+        GlobalRateLimitMiddleware._allow("dev:TESTSERIAL0001", 120)
 
     client = TestClient(app)
     resp = client.post(
         "/api/v1/events",
         json=PAYLOAD,
-        headers={**AUTH, "X-Device-Serial": "0F33V9G25083XX"},
+        headers={**AUTH, "X-Device-Serial": "TESTSERIAL0001"},
     )
     assert resp.status_code == 429
 
@@ -734,7 +734,7 @@ def test_rate_limited_ingest_is_recorded(monkeypatch):
     params = inserts[0][1]
     assert "rate_limited" in params
     assert "throttle" in params
-    assert "0F33V9G25083XX" in params
+    assert "TESTSERIAL0001" in params
     GlobalRateLimitMiddleware.reset()
 
 
