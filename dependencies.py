@@ -1463,11 +1463,32 @@ def normalize_app_name(app_name: str) -> str:
 
 
 # Explicit alias map for fleet utilization rollups. Collapses vendor product
-# families (launcher + main app + executable filename + version suffixes)
-# into a single canonical name. Order matters — more specific patterns first.
+# families (main app + executable filename + version suffixes) into a single
+# canonical name. Order matters — more specific patterns first.
 # Patterns match case-insensitively against the raw app_name (substring).
+#
+# A vendor's launcher, updater or embedded runtime is NOT the product and must
+# keep its own canonical name (see the Deadline and Unity Hub rules below,
+# which have always done this). Folding one in makes the product's row a sum
+# of two different things, and the launcher is the one that runs constantly at
+# every logon, so it dominates:
+#
+#   "Houdini Launcher" folded into "Houdini" supplied roughly 70% of the
+#   combined row's hours, over 80% of its launches, and all but a handful of
+#   its unique users. It produces a row that reads as "many users, almost no
+#   use": the launcher books every account that has ever logged into a machine
+#   with the product installed, while the product itself is typically driven
+#   headlessly by a service account whose principal is filtered as non-human.
+#
+#   "Microsoft Edge WebView2 Runtime" is an embedded rendering runtime other
+#   applications host, not the browser; folded in, it supplied roughly a third
+#   of the browser row's hours and a large majority of its unique users.
+#
+# Version-suffixed editions of the same product (Houdini 20.5.278, Autodesk
+# Maya 2022) SHOULD still fold -- that is what this map is for.
 _APP_NAME_ALIAS_RULES: List[tuple] = [
-    # SideFX Houdini family
+    # SideFX Houdini family. Launcher first: it is the updater, not the app.
+    (r"\bhoudini\s*launcher\b", "Houdini Launcher"),
     (r"\bhoudini\b", "Houdini"),
     (r"\bhindie\b", "Houdini"),
     (r"\bhython\b", "Houdini"),
@@ -1551,6 +1572,11 @@ _APP_NAME_ALIAS_RULES: List[tuple] = [
     (r"\bdeadline\s*slave\b", "Deadline Worker"),
     (r"\bdeadline\s*client\b", "Deadline Client"),
     (r"\bdeadline\b", "Deadline"),
+    # Embedded runtimes. WebView2 is the control other applications host to
+    # render HTML (Teams, Office, installers); it is not the browser, and
+    # normalize_app_name() would otherwise strip "WebView2 Runtime" and leave
+    # it indistinguishable from "Microsoft Edge".
+    (r"\bwebview2\b", "Microsoft Edge WebView2 Runtime"),
     # Review / playback (Autodesk Shotgrid)
     (r"\bshotgrid\s*rv\b", "Shotgrid RV"),
     (r"\bshotgun\s*rv\b", "Shotgrid RV"),
