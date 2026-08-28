@@ -276,6 +276,128 @@ def delete_device(serial_number: str, confirm: bool = Query(False)):
         logger.error(f"Failed to delete device {serial_number}: {e}")
         raise HTTPException(status_code=500, detail=f"Failed to delete device: {str(e)}")
 
+@router.get("/admin/usage-history/date-anomalies", dependencies=[Depends(verify_authentication)], tags=["admin"])
+def usage_history_date_anomalies(
+    floor: Optional[str] = Query(None, description="Rows dated before this YYYY-MM-DD are implausible (default: 548 days ago, the API's own lookback ceiling)"),
+    limit: int = Query(100, ge=1, le=1000, description="Maximum sample rows returned per bucket"),
+):
+    """
+    Rows in usage_history whose `date` could not have been produced by a
+    healthy client.
+
+    Read-only. Exists because neither the fleet nor the per-device usage
+    endpoint can see these rows: both clamp their lookback to 548 days, so a
+    row dated 1976 is invisible to every normal query while still being
+    counted by aggregates that scan the whole table.
+
+    Two buckets, each a different defect:
+
+    - **tooOld** - a date below the floor. A client cannot have observed usage
+      before it existed, so this is a parsing or conversion fault.
+    - **inFuture** - a date after today. Usually a device clock, but it also
+      lands rows in windows that have not happened yet, where they will be
+      silently included the moment the window arrives.
+
+    `updated_at` is the field that matters when reading the result: it is when
+    the row was last written, so it separates a historical mess that a baseline
+    reset will clear from a fault that is still occurring and will simply
+    repopulate.
+    """
+    conn = None
+    try:
+        if floor:
+            try:
+                floor_date = datetime.strptime(floor, "%Y-%m-%d").date()
+            except ValueError:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Invalid 'floor' date {floor!r}; expected YYYY-MM-DD",
+                )
+        else:
+            floor_date = (datetime.now(timezone.utc) - timedelta(days=548)).date()
+
+        today = datetime.now(timezone.utc).date()
+
+        conn = get_db_connection()
+        cursor = conn.cursor()
+
+        def bucket(where: str, param) -> Dict[str, Any]:
+            cursor.execute(
+                f"""
+                SELECT COUNT(*), COUNT(DISTINCT device_id), COUNT(DISTINCT app_name),
+                       MIN(date)::text, MAX(date)::text,
+                       MIN(updated_at)::text, MAX(updated_at)::text
+                FROM usage_history WHERE {where}
+                """,
+                (param,),
+            )
+            c = cursor.fetchone() or (0, 0, 0, None, None, None, None)
+
+            cursor.execute(
+                f"""
+                SELECT device_id, date::text, app_name, launches,
+                       total_seconds, active_seconds, updated_at::text
+                FROM usage_history WHERE {where}
+                ORDER BY date, device_id, app_name
+                LIMIT %s
+                """,
+                (param, limit),
+            )
+            rows = [
+                {
+                    "deviceId": r[0],
+                    "date": r[1],
+                    "appName": r[2],
+                    "launches": int(r[3] or 0),
+                    "totalSeconds": float(r[4] or 0),
+                    "activeSeconds": float(r[5] or 0),
+                    "updatedAt": r[6],
+                }
+                for r in cursor.fetchall()
+            ]
+
+            return {
+                "rows": int(c[0] or 0),
+                "devices": int(c[1] or 0),
+                "applications": int(c[2] or 0),
+                "earliestDate": c[3],
+                "latestDate": c[4],
+                "firstWritten": c[5],
+                "lastWritten": c[6],
+                "sample": rows,
+            }
+
+        too_old = bucket("date < %s", floor_date)
+        in_future = bucket("date > %s", today)
+
+        conn.close()
+        conn = None
+
+        return {
+            "status": "ok",
+            "floorDate": str(floor_date),
+            "today": str(today),
+            "tooOld": too_old,
+            "inFuture": in_future,
+        }
+
+    except HTTPException:
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
+        raise
+    except Exception as e:
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
+        logger.error(f"usage_history date anomaly probe failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @router.post("/admin/usage-history/reset-baseline", dependencies=[Depends(verify_authentication)], tags=["admin"])
 def reset_usage_history_baseline(
     before: str = Query(..., description="Archive and remove rows dated before this YYYY-MM-DD (exclusive)"),
