@@ -276,6 +276,176 @@ def delete_device(serial_number: str, confirm: bool = Query(False)):
         logger.error(f"Failed to delete device {serial_number}: {e}")
         raise HTTPException(status_code=500, detail=f"Failed to delete device: {str(e)}")
 
+@router.post("/admin/usage-history/reset-baseline", dependencies=[Depends(verify_authentication)], tags=["admin"])
+def reset_usage_history_baseline(
+    before: str = Query(..., description="Archive and remove rows dated before this YYYY-MM-DD (exclusive)"),
+    confirm: bool = Query(False, description="Must be true to execute; otherwise a preview is returned"),
+    reason: str = Query("", description="Recorded on the archived rows so a batch can be identified later"),
+):
+    """
+    Archive and remove usage_history rows before a cutoff date.
+
+    **This is a DESTRUCTIVE operation on the live reporting table.**
+
+    Why it exists: usage_history accumulates client-sent window deltas, so a
+    client-side counting defect is written into the table permanently and
+    cannot be recomputed from anything the server still holds. Correcting one
+    means removing the affected rows. Every row is copied verbatim into
+    usage_history_archive first, so the reset is recoverable and "what did we
+    report before" stays answerable.
+
+    Not the same as /admin/usage-history/cleanup, which enforces a minimum
+    retention of one month and exists for routine ageing-out. This takes an
+    explicit cutoff so a term baseline can start clean, and it archives rather
+    than discards.
+
+    Without ``confirm=true`` this returns a preview of exactly what would be
+    affected and changes nothing. Run the preview first.
+    """
+    conn = None
+    try:
+        try:
+            cutoff = datetime.strptime(before, "%Y-%m-%d").date()
+        except ValueError:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Invalid 'before' date {before!r}; expected YYYY-MM-DD",
+            )
+
+        conn = get_db_connection()
+        cursor = conn.cursor()
+
+        # Preview and execute report the same shape, so what the caller
+        # approved is what they can compare the result against.
+        cursor.execute(
+            """
+            SELECT COUNT(*), COUNT(DISTINCT device_id), COUNT(DISTINCT app_name),
+                   MIN(date)::text, MAX(date)::text
+            FROM usage_history
+            WHERE date < %s
+            """,
+            (cutoff,),
+        )
+        row = cursor.fetchone() or (0, 0, 0, None, None)
+        affected = {
+            "rows": int(row[0] or 0),
+            "devices": int(row[1] or 0),
+            "applications": int(row[2] or 0),
+            "earliestDate": row[3],
+            "latestDate": row[4],
+        }
+
+        # What survives the reset, so the caller can see the resulting baseline
+        # rather than inferring it.
+        cursor.execute(
+            "SELECT COUNT(*), MIN(date)::text, MAX(date)::text FROM usage_history WHERE date >= %s",
+            (cutoff,),
+        )
+        kept = cursor.fetchone() or (0, None, None)
+        remaining = {
+            "rows": int(kept[0] or 0),
+            "earliestDate": kept[1],
+            "latestDate": kept[2],
+        }
+
+        if not confirm:
+            conn.close()
+            return {
+                "status": "preview",
+                "executed": False,
+                "cutoffDate": str(cutoff),
+                "wouldArchiveAndDelete": affected,
+                "wouldRemain": remaining,
+                "detail": "Nothing was changed. Re-send with confirm=true to execute.",
+            }
+
+        if affected["rows"] == 0:
+            conn.close()
+            return {
+                "status": "ok",
+                "executed": True,
+                "cutoffDate": str(cutoff),
+                "archived": 0,
+                "deleted": 0,
+                "remaining": remaining,
+                "detail": "No rows before the cutoff; nothing to do.",
+            }
+
+        # Copy first, then delete, in one transaction: a failure between the
+        # two would otherwise destroy rows with no archived copy.
+        cursor.execute(
+            """
+            INSERT INTO usage_history_archive (
+                id, device_id, date, app_name, publisher, launches,
+                total_seconds, active_seconds, foreground_seconds, users,
+                updated_at, reason
+            )
+            SELECT id, device_id, date, app_name, publisher, launches,
+                   total_seconds, active_seconds, foreground_seconds, users,
+                   updated_at, %s
+            FROM usage_history
+            WHERE date < %s
+            """,
+            (reason, cutoff),
+        )
+        archived = cursor.rowcount
+
+        cursor.execute("DELETE FROM usage_history WHERE date < %s", (cutoff,))
+        deleted = cursor.rowcount
+
+        # Refuse to commit a partial copy rather than leave rows unrecoverable.
+        if archived != deleted:
+            conn.rollback()
+            conn.close()
+            raise HTTPException(
+                status_code=500,
+                detail=(
+                    f"Archived {archived} rows but would delete {deleted}; "
+                    "rolled back without changing anything."
+                ),
+            )
+
+        conn.commit()
+        conn.close()
+        conn = None
+
+        # The fleet usage endpoints cache their results; without this the
+        # report keeps serving the pre-reset numbers.
+        invalidate_caches()
+
+        logger.warning(
+            "usage_history baseline reset: archived and deleted %s rows before %s (reason=%r)",
+            deleted, cutoff, reason,
+        )
+
+        return {
+            "status": "ok",
+            "executed": True,
+            "cutoffDate": str(cutoff),
+            "archived": archived,
+            "deleted": deleted,
+            "remaining": remaining,
+        }
+
+    except HTTPException:
+        if conn is not None:
+            try:
+                conn.rollback()
+                conn.close()
+            except Exception:
+                pass
+        raise
+    except Exception as e:
+        if conn is not None:
+            try:
+                conn.rollback()
+                conn.close()
+            except Exception:
+                pass
+        logger.error(f"usage_history baseline reset failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @router.delete("/admin/usage-history/cleanup", dependencies=[Depends(verify_authentication)], tags=["admin"])
 def cleanup_usage_history(
     months: int = Query(default=18, ge=1, le=36, description="Retain data for this many months")
