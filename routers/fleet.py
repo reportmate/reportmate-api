@@ -1629,8 +1629,10 @@ def _is_on_campus(active_ip, dns_servers) -> bool:
 
 @router.get("/hardware", dependencies=[Depends(verify_authentication)], tags=["fleet"])
 def get_bulk_hardware(
+    request: Request,
+    response: Response,
     include_archived: bool = Query(default=False, alias="includeArchived", description="Include archived devices in results"),
-    limit: int = Query(default=2000, ge=1, le=5000, description="Maximum devices to return (default 2000, max 5000)"),
+    limit: Optional[int] = Query(default=None, ge=1, le=5000, description="Maximum items to return"),
     offset: int = Query(default=0, ge=0, description="Number of items to skip"),
 ):
     """
@@ -1646,22 +1648,40 @@ def get_bulk_hardware(
     - Attached displays, normalized across both clients, keyed for asset inventory
     - Network position: active IP, DNS servers, a physically-on-campus flag,
       and a campus-DNS flag (the two differ over VPN)
+
+    **Pagination:** limit and offset are both applied in Python, over the full
+    result set. Pushing limit into the SQL instead -- which this endpoint used
+    to do -- silently breaks offset: the query returns the first N rows and the
+    slice then takes offset..offset+N *of those*, so any offset >= N answers an
+    empty list. A caller paging with a fixed page size sees that empty second
+    page, reads it as the end of the list, and stops with a partial result and
+    no error. Measured against a live deployment: a page size of 500 returned
+    500 records and every offset at or above 500 returned nothing.
     """
     try:
-        _ckey = (include_archived, limit)
+        # Keyed on the filter alone, not on limit: the cached value is the whole
+        # result set and paginate() takes the caller's window out of it. Keying
+        # on limit as well cached a *truncated* set under a key that said
+        # nothing about the truncation.
+        _ckey = (include_archived,)
         _cached = cache_get("hardware", _ckey)
         if _cached is not None:
+            add_pagination_headers(response, request, total=len(_cached),
+                                   limit=limit, offset=offset)
             return paginate(_cached, limit, offset)
         _t0 = _time.monotonic()
-        logger.info(f"Fetching bulk hardware data (limit={limit}, includeArchived={include_archived})")
+        logger.info(f"Fetching bulk hardware data (includeArchived={include_archived})")
 
         conn = get_db_connection()
         cursor = conn.cursor()
 
-        # Load SQL from external file - uses parameterized archive filter
+        # Load SQL from external file - uses parameterized archive filter.
+        # The query deliberately does not LIMIT: pagination is applied to the
+        # full set by paginate(), which is the only place that also honours
+        # offset.
         query = load_sql("devices/bulk_hardware")
 
-        cursor.execute(query, {"include_archived": include_archived, "limit": limit})
+        cursor.execute(query, {"include_archived": include_archived})
         rows = cursor.fetchall()
         conn.close()
         
@@ -1794,6 +1814,11 @@ def get_bulk_hardware(
         logger.info(f"Processed {len(all_hardware)} hardware records")
         cache_set("hardware", all_hardware, _ckey)
         logger.info(f"[PERF] /api/devices/hardware: {_time.monotonic()-_t0:.3f}s ({len(all_hardware)} devices)")
+        # X-Total-Count is how a paging client tells a short page from a truncated
+        # one. Without it, a caller that reads fewer devices than exist has no way
+        # to know.
+        add_pagination_headers(response, request, total=len(all_hardware),
+                               limit=limit, offset=offset)
         return paginate(all_hardware, limit, offset)
         
     except Exception as e:

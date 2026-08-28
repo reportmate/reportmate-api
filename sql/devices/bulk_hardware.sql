@@ -31,5 +31,4 @@ WHERE d.serial_number IS NOT NULL
     AND d.serial_number NOT LIKE 'TEST-%%'
     AND h.data IS NOT NULL
     AND (%(include_archived)s = TRUE OR d.archived = FALSE)
-ORDER BY d.serial_number, h.updated_at DESC
-LIMIT %(limit)s;
+ORDER BY d.serial_number, h.updated_at DESC;
