@@ -1,5 +1,5 @@
 """
-usage_history baseline reset ([tracked internally]).
+usage_history baseline reset.
 
 usage_history accumulates client-sent window deltas, so a client-side counting
 defect is written into the table permanently and cannot be recomputed from
