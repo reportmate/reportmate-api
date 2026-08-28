@@ -928,7 +928,7 @@ async def submit_events(request: Request):
         # random suffix is padded to the 15-char NetBIOS limit, so the prefix
         # fixes its length and nothing resembles a hardware serial.
         hostname_patterns = [
-            r'^DESKTOP-[A-Z0-9]{7}$',  # e.g. DESKTOP-DUMMY01
+            r'^DESKTOP-[A-Z0-9]{7}$',  # e.g. DESKTOP-A1B2C3D
             r'^LAPTOP-[A-Z0-9]{8}$',   # e.g. LAPTOP-1A7GKLCD
             r'^WIN-[A-Z0-9]{11}$',     # Windows Server default
         ]

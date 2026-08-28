@@ -10,7 +10,7 @@ machines.
 These cases pin the boundary: what is unambiguously not a person, and -- just
 as important -- what must keep counting as one. Over-filtering here silently
 deletes real people from the licence evidence, which is the failure mode that
-costs more than the one being fixed. Work item 4522.
+costs more than the one being fixed.
 """
 
 import pytest
@@ -19,13 +19,13 @@ from routers.fleet import is_human_principal
 
 
 @pytest.mark.parametrize("name", [
-    "ECUAD\\jsmith12345",
-    "ECUAD\\mgarciasantos",
-    "ECUAD\\akowalskilopez",
+    "CAMPUS\\jsmith12345",
+    "CAMPUS\\mgarciasantos",
+    "CAMPUS\\akowalskilopez",
     "student",                      # shared local account, still a login
     "EDIT-02\\dl-worker",      # service account, but a policy call not a
-                                    # detectable one -- see work item 4261
-    "ECUAD\\release",
+                                    # detectable one
+    "CAMPUS\\release",
     "WORKGROUP\\someone",
     "a",
 ])
@@ -34,7 +34,7 @@ def test_people_are_kept(name):
 
 
 @pytest.mark.parametrize("name", [
-    "ECUAD\\LAB-A-04-1$",
+    "CAMPUS\\LAB-A-04-1$",
     "WORKGROUP\\STD-16$",
     "WORKGROUP\\EDIT-02$",
     "WORKGROUP\\REMOTE-26$",
@@ -67,12 +67,12 @@ def test_empty_is_not_a_person(name):
 def test_surrounding_whitespace_does_not_defeat_the_rule():
     # usage_history users come from a JSONB array assembled on the client, so
     # padding survives to here. A padded machine account is still a machine.
-    assert is_human_principal("  ECUAD\\LAB-A-04-1$  ") is False
+    assert is_human_principal("  CAMPUS\\LAB-A-04-1$  ") is False
     assert is_human_principal("  NT AUTHORITY\\SYSTEM  ") is False
-    assert is_human_principal("  ECUAD\\jsmith12345  ") is True
+    assert is_human_principal("  CAMPUS\\jsmith12345  ") is True
 
 
 def test_dollar_inside_the_name_is_not_a_computer_account():
     # Only a trailing $ marks a computer account. A name that merely contains
     # one is a person with an awkward username.
-    assert is_human_principal("ECUAD\\ke$ha") is True
+    assert is_human_principal("CAMPUS\\ke$ha") is True
