@@ -3480,9 +3480,23 @@ def get_bulk_identity(
                     'users': users_preview,
                     'adminUsernames': admin_usernames,
                     'loggedInUsernames': logged_in_usernames,
+                    # The full health record, not just size and status. The
+                    # consumer of this field is a fleet alert that has to decide
+                    # severity and say why: statusMessage is the client's own
+                    # explanation, jetsamKills is the evidence the daemon is
+                    # actually being killed rather than merely large, and
+                    # localUserCount is what predicts growth. Projecting only two
+                    # fields forced that alert to re-fetch every Mac device
+                    # individually to recover the other three.
                     'btmdbHealth': {
                         'status': btmdb.get('status') or btmdb.get('health_status'),
                         'sizeMB': btmdb.get('sizeMB') or btmdb.get('size_mb'),
+                        'statusMessage': (btmdb.get('statusMessage')
+                                          or btmdb.get('status_message')),
+                        'jetsamKillsLast7Days': (btmdb.get('jetsamKillsLast7Days')
+                                                 or btmdb.get('jetsam_kills_last_7_days')),
+                        'localUserCount': (btmdb.get('localUserCount')
+                                           or btmdb.get('local_user_count')),
                     } if btmdb else None,
                     'secureTokenUsers': {
                         'tokenGrantedCount': (
