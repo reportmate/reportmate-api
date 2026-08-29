@@ -592,7 +592,7 @@ def cleanup_usage_history(
 
 @router.delete("/admin/installs/clear-errors", dependencies=[Depends(verify_authentication)], tags=["admin"])
 def clear_stale_installs_errors(
-    days: int = Query(default=10, ge=1, le=365, description="Clear errors/warnings from devices that haven't reported in this many days")
+    days: int = Query(default=10, ge=0, le=365, description="Clear errors/warnings from devices that have not reported in this many days; 0 clears every device (they re-report their true state on the next check-in)")
 ):
     """
     Clear error and warning fields from installs data for stale devices.
