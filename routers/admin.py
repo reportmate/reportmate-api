@@ -667,9 +667,28 @@ def clear_stale_installs_errors(
                             item["mappedStatus"] = "Installed"
                     modified = True
 
-            # Clear Munki errors and warnings
+            # Clear Munki errors and warnings. The fleet counters key on the
+            # per-item status (install_failed etc.), not only on the top-level
+            # errors/warnings strings, so both have to be reset or a Mac keeps
+            # counting after a clear.
             munki = data.get("munki", {})
             if munki:
+                for item in munki.get("items", []) or []:
+                    status = (item.get("status") or item.get("currentStatus") or "").lower()
+                    has_error_status = status in error_statuses or status == "install-failed"
+                    has_warning_status = status in warning_statuses
+                    has_error = bool((item.get("lastError") or "").strip())
+                    has_warning = bool((item.get("lastWarning") or "").strip())
+                    if has_error_status or has_warning_status or has_error or has_warning:
+                        item["lastError"] = ""
+                        item["lastWarning"] = ""
+                        if has_error_status or has_warning_status:
+                            item["status"] = "installed"
+                            if item.get("currentStatus"):
+                                item["currentStatus"] = "Installed"
+                            if item.get("pendingReason"):
+                                item["pendingReason"] = ""
+                        modified = True
                 if munki.get("errors", "").strip():
                     munki["errors"] = ""
                     modified = True
