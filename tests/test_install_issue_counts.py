@@ -62,3 +62,23 @@ def test_mixed_sources_counted_independently():
         "munki": {"items": [{"status": "warning"}]},
     }
     assert _install_issue_counts(data) == (1, 0, 0, 1)
+
+
+def test_munki_item_warning_and_error_fields_count():
+    data = {"munki": {"items": [
+        {"name": "FleetMate", "status": "installed", "currentStatus": "Warning", "lastWarning": "Will not attempt to remove FleetMate"},
+        {"name": "Chrome", "status": "installed", "lastError": "Installer returned 1"},
+        {"name": "Slack", "status": "installed"},
+    ]}}
+    assert _install_issue_counts(data) == (0, 0, 1, 1)
+
+
+def test_munki_run_level_warnings_count_when_no_item_is_named():
+    structured = {"munki": {"items": [{"name": "Slack", "status": "installed"}],
+                            "warningItems": [{"message": "Could not download catalog Production"}],
+                            "errorItems": []}}
+    assert _install_issue_counts(structured) == (0, 0, 0, 1)
+    legacy = {"munki": {"items": [{"name": "Slack", "status": "installed"}],
+                        "warnings": "Download of Excel failed; Download of Word failed",
+                        "errors": "Could not retrieve manifest"}}
+    assert _install_issue_counts(legacy) == (0, 0, 1, 2)

@@ -48,12 +48,44 @@ def _install_issue_counts(module_data):
         return str(item.get(key) or '').lower() if isinstance(item, dict) else ''
 
     cimian = [_status(i, 'currentStatus') for i in _items('cimian')]
-    munki = [_status(i, 'status') for i in _items('munki')]
+
+    # Munki items carry a MunkiReport-style status (installed, pending_install,
+    # install_failed) that never says "warning"; a Munki warning lives on the
+    # item as lastWarning / currentStatus (newer clients) or on the run as
+    # warningItems / the semicolon-joined warnings string. Count an item once
+    # whichever way it arrived, and fall back to the run-level list when no item
+    # is named so the device still registers.
+    munki_items = _items('munki')
+    munki_run = (module_data or {}).get('munki') or {}
+
+    def _text(item, key):
+        return str(item.get(key) or '').strip() if isinstance(item, dict) else ''
+
+    def _run_list(key, legacy_key):
+        entries = munki_run.get(key)
+        if isinstance(entries, list):
+            return [e for e in entries if isinstance(e, dict) and (e.get('message') or e.get('name'))]
+        legacy = munki_run.get(legacy_key)
+        if isinstance(legacy, str) and legacy.strip():
+            return [{'message': part.strip()} for part in legacy.split(';') if part.strip()]
+        return []
+
+    munki_error_items = sum(
+        1 for i in munki_items
+        if _MUNKI_ERROR_RE.search(_status(i, 'status')) or _status(i, 'currentStatus') == 'error' or _text(i, 'lastError')
+    )
+    munki_warning_items = sum(
+        1 for i in munki_items
+        if 'warning' in _status(i, 'status') or _status(i, 'currentStatus') == 'warning'
+        or (_text(i, 'lastWarning') and not _text(i, 'lastError'))
+    )
+    munki_errors = munki_error_items or len(_run_list('errorItems', 'errors'))
+    munki_warnings = munki_warning_items or len(_run_list('warningItems', 'warnings'))
     return (
         sum(1 for s in cimian if _CIMIAN_ERROR_RE.search(s) or s == 'needs_reinstall'),
         sum(1 for s in cimian if _CIMIAN_WARNING_RE.search(s)),
-        sum(1 for s in munki if _MUNKI_ERROR_RE.search(s)),
-        sum(1 for s in munki if 'warning' in s),
+        munki_errors,
+        munki_warnings,
     )
 
 
