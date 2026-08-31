@@ -985,8 +985,8 @@ async def submit_events(request: Request):
                 detail=f"Invalid serial number: '{serial_number}' is the device's own hostname, not a hardware serial. Device must provide the BIOS/chassis serial number.",
             )
         
-        logger.info(f"Processing unified payload for device {serial_number} (UUID: {device_uuid})")
-        logger.info(f"Collection type: {collection_type}, Enabled modules: {enabled_modules}")
+        logger.debug(f"Processing unified payload for device {serial_number} (UUID: {device_uuid})")
+        logger.debug(f"Collection type: {collection_type}, Enabled modules: {enabled_modules}")
         
         # Connect to database
         conn = get_db_connection()
@@ -1034,7 +1034,7 @@ async def submit_events(request: Request):
                     SET device_id = %s, last_seen = %s, updated_at = %s, client_version = %s, platform = %s
                     WHERE serial_number = %s
                 """, (device_uuid, collected_at, datetime.now(timezone.utc), client_version, platform, serial_number))
-                logger.info(f"Updated existing device: {serial_number} (client v{client_version}, platform: {platform})")
+                logger.debug(f"Updated existing device: {serial_number} (client v{client_version}, platform: {platform})")
             else:
                 # Insert new device
                 # NOTE: devices.id is VARCHAR and equals serial_number (per schema design)
@@ -1080,7 +1080,7 @@ async def submit_events(request: Request):
         
         # Debug: Log available modules in payload
         available_modules = [k for k in modules_data.keys() if k in module_tables]
-        logger.info(f"Available modules in payload for {serial_number}: {available_modules}")
+        logger.debug(f"Available modules in payload for {serial_number}: {available_modules}")
         
         for module_name, table_name in module_tables.items():
             if module_name in modules_data and modules_data[module_name]:
@@ -1140,7 +1140,7 @@ async def submit_events(request: Request):
 
                     conn.commit()
                     modules_processed.append(module_name)
-                    logger.info(f"Stored {module_name} module for device {serial_number}")
+                    logger.debug(f"Stored {module_name} module for device {serial_number}")
                     
                     # Extract daily usage history from applications module and UPSERT.
                     #
@@ -1228,7 +1228,7 @@ async def submit_events(request: Request):
                                         capped.append(f"{app_name}@{date_val}")
                                     stored += 1
                                 conn.commit()
-                                logger.info(f"Accumulated {stored} daily usage entries for device {serial_number}")
+                                logger.debug(f"Accumulated {stored} daily usage entries for device {serial_number}")
                                 if rejected or capped or clamped:
                                     # The payload is still accepted — only the offending rows
                                     # were dropped, clamped, or held at the ceiling — but the
@@ -1292,7 +1292,7 @@ async def submit_events(request: Request):
                                         WHERE serial_number = %s
                                     """, (os_name, os_version, os_name, serial_number))
                                     conn.commit()
-                                    logger.info(f"Updated OS info for device {serial_number}: {os_name} {os_version}")
+                                    logger.debug(f"Updated OS info for device {serial_number}: {os_name} {os_version}")
                         except Exception as os_update_error:
                             logger.error(f"Failed to update OS info for device {serial_number}: {os_update_error}")
                             conn.rollback()
@@ -1359,7 +1359,7 @@ async def submit_events(request: Request):
                 """, (device_name.strip(), serial_number, serial_number))
                 conn.commit()
                 if cursor.rowcount > 0:
-                    logger.info(f"Updated device name for {serial_number}: {device_name.strip()}")
+                    logger.debug(f"Updated device name for {serial_number}: {device_name.strip()}")
         except Exception as name_error:
             logger.error(f"Failed to update device name for {serial_number}: {name_error}")
             conn.rollback()
@@ -1407,7 +1407,7 @@ async def submit_events(request: Request):
                                       created_at = EXCLUDED.created_at
                         RETURNING id
                     """, (serial_number, event_type, module_id, message, details_json, collected_at, datetime.now(timezone.utc)))
-                    logger.info(f"Upserted os_update event for device {serial_number}: {message}")
+                    logger.debug(f"Upserted os_update event for device {serial_number}: {message}")
                 else:
                     # NOTE: events.device_id references devices.id which equals serial_number
                     cursor.execute("""
@@ -1468,7 +1468,7 @@ async def submit_events(request: Request):
                 event_id = event_row[0] if event_row else None
                 
                 events_stored += 1
-                logger.info(f"Created fallback system event for device {serial_number}")
+                logger.debug(f"Created fallback system event for device {serial_number}")
                 
                 # Broadcast fallback event to connected WebSocket clients
                 # Include message field for proper display
@@ -1489,7 +1489,7 @@ async def submit_events(request: Request):
         elif has_installs_module and events_stored == 0:
             logger.warning(f"[WARN] INSTALLS MODULE PRESENT but NO events sent - this should not happen! Device: {serial_number}")
         else:
-            logger.info(f"Skipped system event creation - {events_stored} events already in payload")
+            logger.debug(f"Skipped system event creation - {events_stored} events already in payload")
         
         conn.commit()
 
@@ -1511,7 +1511,12 @@ async def submit_events(request: Request):
         # and settings writes (which must be visible immediately) still call
         # invalidate_caches().
         
-        logger.info(f"[SUCCESS] Successfully processed device {serial_number}: {len(modules_processed)} modules, {events_stored} events")
+        # The single INFO line per check-in. Everything above it is DEBUG: at
+        # ~48k check-ins a day each extra INFO line is another 48k billed
+        # stdout lines a day, and this summary already carries the device,
+        # the module count and the event count. Failures log at WARNING or
+        # ERROR from their own handlers and are unaffected.
+        logger.info(f"Processed device {serial_number}: {len(modules_processed)} modules, {events_stored} events")
         
         return {
             "success": True,

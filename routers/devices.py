@@ -198,7 +198,7 @@ def get_all_devices(
             hostname: Optional[str] = None
             network_summary: Optional[Dict[str, Any]] = None
             if network_data_raw:
-                logger.info(f"Found network data for device {serial}")
+                logger.debug(f"Found network data for device {serial}")
                 try:
                     raw_network = network_data_raw
                     if isinstance(raw_network, str):
@@ -207,7 +207,7 @@ def get_all_devices(
                         raw_network = raw_network[0]
                     if isinstance(raw_network, dict):
                         hostname = raw_network.get("hostname")
-                        logger.info(f"Extracted hostname for {serial}: {hostname}")
+                        logger.debug(f"Extracted hostname for {serial}: {hostname}")
                         # Build network summary with key fields
                         network_summary = {
                             "hostname": hostname,
@@ -240,7 +240,7 @@ def get_all_devices(
             }
             
             # DEBUG: Log what we're actually adding to device_info
-            logger.info(f"[HOSTNAME_TEST_v2] Device {serial}: hostname_var={hostname}, network_summary_exists={bool(network_summary)}")
+            logger.debug(f"Device {serial}: hostname={hostname}, network_summary={bool(network_summary)}")
 
             if inventory_summary:
                 device_info["inventory"] = inventory_summary
@@ -266,7 +266,7 @@ def get_all_devices(
         # DEBUG: Check first device in response
         if devices:
             first_dev = devices[0]
-            logger.info(f"[FINAL_RESPONSE_CHECK] First device: serial={first_dev.get('serialNumber')}, hostname={first_dev.get('hostname')}, has_modules_network={'network' in first_dev.get('modules', {})}")
+            logger.debug(f"First device: serial={first_dev.get('serialNumber')}, hostname={first_dev.get('hostname')}, has_modules_network={'network' in first_dev.get('modules', {})}")
 
         page_size = limit or len(devices) or total_devices or 1
         page = (offset // page_size) + 1 if page_size else 1
