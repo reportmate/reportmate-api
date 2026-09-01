@@ -211,7 +211,7 @@ def delete_device(serial_number: str, confirm: bool = Query(False)):
         
         # Get module counts for logging
         module_tables = ["system", "hardware", "applications", "installs", "network", "security",
-                        "inventory", "management", "peripherals", "identity", "logs"]
+                        "inventory", "management", "peripherals", "identity"]
         module_counts = {}
         
         for table in module_tables:
@@ -750,7 +750,7 @@ def debug_database():
         
         # 1. Check for duplicate records in module tables (MAJOR ISSUE)
         module_tables = ['inventory', 'system', 'hardware', 'applications', 'network', 
-                        'security', 'profiles', 'installs', 'management', 'displays', 'printers', 'peripherals', 'identity', 'logs']
+                        'security', 'profiles', 'installs', 'management', 'displays', 'printers', 'peripherals', 'identity']
         duplicates = {}
         total_duplicate_rows = 0
         

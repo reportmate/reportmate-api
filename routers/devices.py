@@ -419,7 +419,6 @@ def get_device_by_serial(serial_number: str):
             "management",
             "peripherals",
             "identity",
-            "logs",
         ]
         for table in module_tables:
             try:
@@ -443,7 +442,7 @@ def get_device_by_serial(serial_number: str):
                         if isinstance(module_row[0], str)
                         else module_row[0]
                     )
-                    if table == "logs":
+                    if table == "management":
                         # Log tails are served per tool from /device/{serial}/logs/{tool}
                         module_data = strip_log_tails(module_data)
                     modules[table] = module_data
@@ -550,17 +549,17 @@ def get_device_installs_log(serial_number: str):
 )
 def get_device_log_root(serial_number: str, tool: str):
     """
-    Get one management tool's log root, tail included.
+    Get one management tool's log root, tails included.
 
     The device and module endpoints strip every root's tail because the tails
-    are the bulk of the logs module and only one is wanted at a time. This
+    are the bulk of the management module's logs section and only one is wanted at a time. This
     endpoint returns the single root for ``tool`` (installs, bootstrap,
-    reports, state, encryption, users, utilities) with its tail intact.
+    reports, state, encryption, users, utilities) with its tails intact.
     """
     try:
         conn = get_db_connection()
         cursor = conn.cursor()
-        cursor.execute("SELECT data FROM logs WHERE device_id = %s", (serial_number,))
+        cursor.execute("SELECT data FROM management WHERE device_id = %s", (serial_number,))
         row = cursor.fetchone()
         conn.close()
 
@@ -764,7 +763,7 @@ def get_device_info_fast(serial_number: str):
             "SELECT data FROM management WHERE device_id = %s", (serial_num,)
         )
         if row := cursor.fetchone():
-            info_modules["management"] = (
+            info_modules["management"] = strip_log_tails(
                 json.loads(row[0]) if isinstance(row[0], str) else row[0]
             )
 
@@ -826,7 +825,7 @@ def get_device_module(serial_number: str, module_name: str):
 
     Supported modules:
     - applications, hardware, identity, installs, inventory
-    - management, network, peripherals, security, system, logs
+    - management, network, peripherals, security, system
 
     Note: displays and printers are collected as part of peripherals.
     Profile data is collected as part of management/security.
@@ -848,7 +847,6 @@ def get_device_module(serial_number: str, module_name: str):
             "peripherals",
             "security",
             "system",
-            "logs",
         ]
 
         if module_name not in valid_modules:
@@ -899,7 +897,7 @@ def get_device_module(serial_number: str, module_name: str):
             and len(module_data) > 0
         ):
             module_data = module_data[0]
-        if module_name == "logs":
+        if module_name == "management":
             # Log tails are served per tool from /device/{serial}/logs/{tool}
             module_data = strip_log_tails(module_data)
 
