@@ -27,6 +27,7 @@ COPY etag.py .
 COPY metrics.py .
 COPY pagination.py .
 COPY rate_limit.py .
+COPY log_tails.py .
 COPY routers/ ./routers/
 COPY sql/ ./sql/
 

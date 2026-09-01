@@ -6,10 +6,11 @@ on macOS), the file inventory, the latest session summary and a capped tail
 of the primary log. It is stored like every other module: one JSONB row per
 device, replaced on each check-in.
 
-The table is shaped exactly like ``management`` so the shared ingest loop in
-``routers/events.py`` needs no special case. The foreign key matches the
-other module tables (defined in the infrastructure schema, not here), so a
-device delete cascades into this table too.
+The table is shaped like ``management`` so the shared ingest loop in
+``routers/events.py`` needs no special case. Like ``ingest_failures`` it
+carries no foreign key: ``devices`` is created by the infrastructure schema,
+not by Alembic, so a fresh database (CI, a new deployment) migrates before
+that table exists. The admin delete path removes module rows explicitly.
 
 Revision ID: 0006
 Revises: 0005
@@ -28,7 +29,7 @@ def upgrade() -> None:
     op.execute(
         """CREATE TABLE IF NOT EXISTS logs (
             id SERIAL PRIMARY KEY,
-            device_id VARCHAR(255) NOT NULL REFERENCES devices(id) ON DELETE CASCADE,
+            device_id VARCHAR(255) NOT NULL,
             data JSONB NOT NULL,
             collected_at TIMESTAMPTZ DEFAULT NOW(),
             created_at TIMESTAMPTZ DEFAULT NOW(),
