@@ -1295,6 +1295,7 @@ VALID_MODULE_NAMES = frozenset(
         "management",
         "peripherals",
         "identity",
+        "logs",
     }
 )
 
