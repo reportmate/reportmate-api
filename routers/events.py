@@ -738,7 +738,7 @@ def get_event_payload(event_id: int):
                 table_name = module_name.lower()
                 # Validate table name to prevent SQL injection
                 valid_tables = ['applications', 'hardware', 'installs', 'inventory', 
-                               'management', 'network', 'peripherals', 'security', 'system', 'identity', 'logs']
+                               'management', 'network', 'peripherals', 'security', 'system', 'identity']
                 if table_name not in valid_tables:
                     continue
                 
@@ -1072,8 +1072,7 @@ async def submit_events(request: Request):
             'inventory': 'inventory',
             'management': 'management',
             'peripherals': 'peripherals',
-            'identity': 'identity',
-            'logs': 'logs'
+            'identity': 'identity'
         }
         
         # Get modules from payload (could be at top level or nested under 'modules' key)
