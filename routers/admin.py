@@ -878,6 +878,81 @@ def cleanup_usage_history(
         logger.error(f"Usage history cleanup failed: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
+def _item_attempt_age_days(item, now) -> float | None:
+    """Age in days of the last thing that actually happened to this item.
+
+    An error's age is the age of the attempt that produced it, not the age of the
+    device's last check-in. A machine that phones home hourly but has not run a
+    managed-install session for a week still carries week-old failures, and
+    keying the cleanup on device check-in leaves them on the board forever - one
+    lab machine held 45 records dated six days earlier while reporting in daily.
+    """
+    if not isinstance(item, dict):
+        return None
+    for key in ("lastAttemptTime", "lastUpdate", "endTime"):
+        raw = item.get(key)
+        if not raw:
+            continue
+        try:
+            text = str(raw).replace("Z", "+00:00")
+            parsed = datetime.fromisoformat(text)
+        except (ValueError, TypeError):
+            continue
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return (now - parsed.astimezone(timezone.utc)).total_seconds() / 86400.0
+    return None
+
+
+def _clear_stale_items_by_age(data, now, max_age_days: float) -> bool:
+    """Clear only the flagged items whose own last attempt is older than the cutoff.
+
+    Deliberately narrower than _clear_install_issue_fields: items that were
+    attempted recently keep their errors, because those are live.
+    """
+    if not isinstance(data, dict):
+        return False
+
+    modified = False
+    error_statuses = {"error", "failed", "problem", "needs_reinstall", "install_failed"}
+    warning_statuses = {"warning"}
+
+    for item in (data.get("cimian", {}) or {}).get("items", []) or []:
+        if not isinstance(item, dict):
+            continue
+        status = (item.get("currentStatus") or "").lower()
+        flagged = (
+            bool((item.get("lastError") or "").strip())
+            or bool((item.get("lastWarning") or "").strip())
+            or (item.get("failureCount", 0) or 0) > 0
+            or (item.get("warningCount", 0) or 0) > 0
+            or item.get("installLoopDetected", False)
+            or item.get("hasInstallLoop", False)
+            or status in error_statuses
+            or status in warning_statuses
+        )
+        if not flagged:
+            continue
+
+        age = _item_attempt_age_days(item, now)
+        if age is None or age < max_age_days:
+            continue
+
+        item["lastError"] = ""
+        item["lastWarning"] = ""
+        item["failureCount"] = 0
+        item["warningCount"] = 0
+        item["installLoopDetected"] = False
+        item["hasInstallLoop"] = False
+        if status in error_statuses or status in warning_statuses:
+            item["currentStatus"] = "Installed"
+            if item.get("mappedStatus"):
+                item["mappedStatus"] = "Installed"
+        modified = True
+
+    return modified
+
+
 def _clear_install_issue_fields(data) -> bool:
     """Blank the error/warning fields of one installs payload in place.
 
@@ -953,7 +1028,11 @@ def _clear_install_issue_fields(data) -> bool:
 
 @router.delete("/admin/installs/clear-errors", dependencies=[Depends(verify_authentication)], tags=["admin"])
 def clear_stale_installs_errors(
-    days: int = Query(default=10, ge=0, le=365, description="Clear errors/warnings from devices that have not reported in this many days; 0 clears every device (they re-report their true state on the next check-in)")
+    days: int = Query(default=10, ge=0, le=365, description="Clear errors/warnings from devices that have not reported in this many days; 0 clears every device (they re-report their true state on the next check-in)"),
+    item_age_days: float | None = Query(
+        default=None, ge=0, le=365,
+        description="Also clear individual errors/warnings whose own last attempt is older than this many days, on devices that ARE still checking in. Keying only on device check-in leaves week-old failures on machines that phone home daily."
+    )
 ):
     """
     Clear error and warning fields from installs data for stale devices.
@@ -990,6 +1069,29 @@ def clear_stale_installs_errors(
         rows = cursor.fetchall()
 
         cleared_devices = []
+        aged_devices = []
+
+        # Devices that ARE checking in but carry stale individual failures. The
+        # query above cannot see these: their last_seen is current, so nothing
+        # about the device is stale - only the errors are.
+        if item_age_days is not None:
+            cursor.execute("SELECT device_id, data FROM installs")
+            for device_id, data in cursor.fetchall():
+                if not isinstance(data, dict):
+                    continue
+                if _clear_stale_items_by_age(data, datetime.now(timezone.utc), item_age_days):
+                    ce, cw, me, mw = _install_issue_counts(data)
+                    cursor.execute(
+                        """
+                        UPDATE installs
+                        SET data = %s::jsonb,
+                            cimian_errors = %s, cimian_warnings = %s,
+                            munki_errors = %s, munki_warnings = %s
+                        WHERE device_id = %s
+                        """,
+                        (json.dumps(data), ce, cw, me, mw, device_id)
+                    )
+                    aged_devices.append(device_id)
 
         for device_id, data in rows:
             if not isinstance(data, dict):
@@ -1024,7 +1126,7 @@ def clear_stale_installs_errors(
         conn.commit()
         conn.close()
 
-        if cleared_devices:
+        if cleared_devices or aged_devices:
             invalidate_caches()
 
         logger.info(
@@ -1035,6 +1137,9 @@ def clear_stale_installs_errors(
         return {
             "success": True,
             "cleared": len(cleared_devices),
+            "clearedByItemAge": len(aged_devices),
+            "itemAgeDays": item_age_days,
+            "clearedByItemAgeDevices": aged_devices,
             "totalStale": len(rows),
             "days": days,
             "cutoffDate": cutoff.isoformat(),
