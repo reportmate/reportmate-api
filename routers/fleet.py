@@ -2777,6 +2777,30 @@ def search_fleet_certificates(
         logger.error(f"Failed to search fleet certificates: {e}")
         raise HTTPException(status_code=500, detail=f"Failed to search certificates: {str(e)}")
 
+def _management_reports_intune(management_data) -> bool:
+    """True when the management module carries data only an Intune-managed
+    device produces: the Intune policy, configuration and diagnostics
+    structures the Windows client collects, or an ``mdm`` log root named
+    Intune in the logs section (the Intune Management Extension logs on
+    Windows, the Intune daemon logs on a Mac)."""
+    if not isinstance(management_data, dict):
+        return False
+    intune_keys = ('intunePolicies', 'recentIntuneLogs',
+                   'mdmConfigurations', 'mdmDiagnostics')
+    if any(management_data.get(k) for k in intune_keys):
+        return True
+    logs = management_data.get('logs')
+    roots = logs.get('roots') if isinstance(logs, dict) else None
+    if not isinstance(roots, list):
+        return False
+    for root in roots:
+        if not isinstance(root, dict):
+            continue
+        if str(root.get('tool') or '').lower() == 'mdm' and 'intune' in str(root.get('name') or '').lower():
+            return True
+    return False
+
+
 def _detect_mdm_provider_from_url(url: str) -> str:
     """Detect the MDM provider from the active enrollment server/check-in URL.
 
@@ -2913,10 +2937,7 @@ def get_bulk_management(
                     # explicit provider field. The Windows client collects these
                     # structures only under Intune, so their presence is a
                     # reliable signal.
-                    intune_keys = ('intunePolicies', 'recentIntuneLogs',
-                                   'mdmConfigurations', 'mdmDiagnostics')
-                    has_intune_data = bool(management_data) and any(
-                        management_data.get(k) for k in intune_keys)
+                    has_intune_data = _management_reports_intune(management_data)
                     enrollment_type_raw = (mdm_enrollment.get('enrollmentType')
                                            or mdm_enrollment.get('enrollment_type') or '')
                     if has_intune_data or 'entra' in enrollment_type_raw.lower():
