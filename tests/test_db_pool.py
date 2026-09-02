@@ -196,3 +196,23 @@ def test_open_transaction_is_reset_on_return(pooled):
     assert cur2.fetchone()[0] is None
     cur2.close()
     conn2.close()
+
+
+@integration
+def test_maintenance_connection_gets_long_timeout(pooled):
+    # The baseline reset timed out in production because a pooled connection's
+    # 120s statement_timeout applied to a table-wide archive. The maintenance
+    # connection must carry its own, longer timeout without touching the pool.
+    conn = pooled.get_maintenance_db_connection(statement_timeout_seconds=900)
+    cur = conn.cursor()
+    cur.execute("SHOW statement_timeout")
+    assert cur.fetchone()[0] == "15min"
+    cur.close()
+    conn.close()
+
+    pooled_conn = pooled.get_db_connection()
+    cur = pooled_conn.cursor()
+    cur.execute("SHOW statement_timeout")
+    assert cur.fetchone()[0] == "2min"
+    cur.close()
+    pooled_conn.close()

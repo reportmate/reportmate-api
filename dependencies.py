@@ -1195,6 +1195,35 @@ def get_db_connection():
         raise HTTPException(status_code=500, detail="Database connection failed")
 
 
+def get_maintenance_db_connection(statement_timeout_seconds: int = 900):
+    """Open a dedicated, unpooled connection for long-running maintenance.
+
+    Pooled connections pin statement_timeout at 120s and their sockets at 130s
+    — right for request traffic, fatal for table-wide work: the usage_history
+    baseline reset hit the 120s ceiling on its first production run before it
+    ever reached the destructive statements. The longer timeout must not live
+    on a pooled connection either, since SET is session-level and survives the
+    return to the pool, where an ordinary request would inherit it.
+
+    Callers own the connection: close() here really closes the socket.
+    """
+    seconds = int(statement_timeout_seconds)
+    kwargs = _parse_database_url(DATABASE_URL)
+    kwargs["timeout"] = seconds + 60  # socket must outlive the server timeout
+    try:
+        conn = pg8000.connect(**kwargs)
+    except Exception as e:
+        logger.error(f"Maintenance database connection failed: {e}")
+        raise HTTPException(status_code=500, detail="Database connection failed")
+    _enable_tcp_keepalive(conn)
+    conn.autocommit = True
+    cur = conn.cursor()
+    cur.execute(f"SET statement_timeout TO '{seconds}s'")
+    cur.close()
+    conn.autocommit = False
+    return conn
+
+
 # ---------------------------------------------------------------------------
 # Pydantic models
 # ---------------------------------------------------------------------------

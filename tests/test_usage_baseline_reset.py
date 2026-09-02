@@ -79,7 +79,8 @@ class FakeConn:
 
 def _patch_db(cursor):
     conn = FakeConn(cursor)
-    return conn, patch("routers.admin.get_db_connection", return_value=conn)
+    # The reset runs on the dedicated maintenance connection, not the pool.
+    return conn, patch("routers.admin.get_maintenance_db_connection", return_value=conn)
 
 
 COUNTS = (1200, 300, 440, "2026-07-01", "2026-08-31")

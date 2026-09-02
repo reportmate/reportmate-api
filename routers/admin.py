@@ -8,7 +8,8 @@ from typing import Any, Dict, List, Optional
 from fastapi import APIRouter, Depends, HTTPException, Query
 
 from dependencies import (
-    get_db_connection, invalidate_caches, load_sql, logger,
+    get_db_connection, get_maintenance_db_connection, invalidate_caches,
+    load_sql, logger,
     verify_authentication,
 )
 
@@ -434,7 +435,9 @@ def reset_usage_history_baseline(
                 detail=f"Invalid 'before' date {before!r}; expected YYYY-MM-DD",
             )
 
-        conn = get_db_connection()
+        # A pooled connection's 120s statement_timeout is too short for the
+        # table-wide aggregates and the archive copy; use a dedicated one.
+        conn = get_maintenance_db_connection()
         cursor = conn.cursor()
 
         # Preview and execute report the same shape, so what the caller
@@ -833,8 +836,10 @@ def debug_database():
                 n_dead_tup,
                 pg_size_pretty(pg_total_relation_size(relid)) as total_size
             FROM pg_stat_user_tables 
-            WHERE relname IN ('devices', 'events', 'inventory', 'system', 'hardware', 
-                             'applications', 'profiles', 'network', 'security')
+            WHERE relname IN ('devices', 'events', 'inventory', 'system', 'hardware',
+                             'applications', 'profiles', 'network', 'security',
+                             'usage_history', 'usage_history_archive', 'installs',
+                             'management', 'peripherals', 'identity')
             ORDER BY pg_total_relation_size(relid) DESC
         """)
             table_sizes = []
