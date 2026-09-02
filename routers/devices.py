@@ -19,7 +19,7 @@ from typing import Any, Dict, List, Optional
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
 
 from pagination import add_pagination_headers
-from log_tails import find_log_root, strip_log_tails
+from log_tails import strip_log_tails
 
 from dependencies import (
     logger,
@@ -559,15 +559,29 @@ def get_device_log_root(serial_number: str, tool: str):
     try:
         conn = get_db_connection()
         cursor = conn.cursor()
-        cursor.execute("SELECT data FROM management WHERE device_id = %s", (serial_number,))
+        # Pull only the requested root out of the JSONB in Postgres. The
+        # management row can run to several megabytes (policies, profiles and
+        # every tool's tails), and shipping the whole document to Python to
+        # pick one root took tens of seconds on a busy Windows device.
+        cursor.execute(
+            """
+            SELECT root
+            FROM management, jsonb_array_elements(data->'logs'->'roots') AS root
+            WHERE device_id = %s
+              AND jsonb_typeof(data->'logs'->'roots') = 'array'
+              AND lower(root->>'tool') = lower(%s)
+            LIMIT 1
+            """,
+            (serial_number, tool),
+        )
         row = cursor.fetchone()
         conn.close()
 
         if not row:
             return {"tool": tool, "root": None}
 
-        module_data = json.loads(row[0]) if isinstance(row[0], str) else row[0]
-        return {"tool": tool, "root": find_log_root(module_data, tool)}
+        root = json.loads(row[0]) if isinstance(row[0], str) else row[0]
+        return {"tool": tool, "root": root if isinstance(root, dict) else None}
 
     except Exception as e:
         logger.error(f"Failed to get log root {tool} for {serial_number}: {e}")
