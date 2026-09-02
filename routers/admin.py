@@ -7,6 +7,7 @@ from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 
+from routers.events import _install_issue_counts
 from dependencies import (
     get_db_connection, get_maintenance_db_connection, invalidate_caches,
     load_sql, logger,
@@ -779,6 +780,79 @@ def cleanup_usage_history(
         logger.error(f"Usage history cleanup failed: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
+def _clear_install_issue_fields(data) -> bool:
+    """Blank the error/warning fields of one installs payload in place.
+
+    Returns True when anything changed. Kept as a function so the cleanup
+    endpoint and its tests exercise the same rules - a test that restates these
+    conditions drifts from them silently, which is how the currentStatus half of
+    this cleanup stayed broken once already.
+    """
+    if not isinstance(data, dict):
+        return False
+
+    modified = False
+
+    error_statuses = {"error", "failed", "problem", "needs_reinstall", "install_failed"}
+    # The fleet warning count keys on currentStatus, not on lastWarning, so a
+    # cleared item left at "Warning" still counts. Reset it with the text.
+    warning_statuses = {"warning"}
+
+    for item in (data.get("cimian", {}) or {}).get("items", []) or []:
+        if not isinstance(item, dict):
+            continue
+        has_error = bool((item.get("lastError") or "").strip())
+        has_warning = bool((item.get("lastWarning") or "").strip())
+        has_failure = (item.get("failureCount", 0) or 0) > 0
+        has_warn_count = (item.get("warningCount", 0) or 0) > 0
+        has_loop = item.get("installLoopDetected", False) or item.get("hasInstallLoop", False)
+        status = (item.get("currentStatus") or "").lower()
+        has_error_status = status in error_statuses
+        has_warning_status = status in warning_statuses
+
+        if (has_error or has_warning or has_failure or has_warn_count
+                or has_loop or has_error_status or has_warning_status):
+            item["lastError"] = ""
+            item["lastWarning"] = ""
+            item["failureCount"] = 0
+            item["warningCount"] = 0
+            item["installLoopDetected"] = False
+            item["hasInstallLoop"] = False
+            if has_error_status or has_warning_status:
+                item["currentStatus"] = "Installed"
+                if item.get("mappedStatus"):
+                    item["mappedStatus"] = "Installed"
+            modified = True
+
+    munki = data.get("munki", {}) or {}
+    if munki:
+        for key in ("errors", "warnings", "problemInstalls"):
+            value = munki.get(key)
+            if isinstance(value, str) and value.strip():
+                munki[key] = ""
+                modified = True
+            elif isinstance(value, list) and value:
+                munki[key] = []
+                modified = True
+        for item in munki.get("items", []) or []:
+            if not isinstance(item, dict):
+                continue
+            status = (item.get("status") or "").lower()
+            cur = (item.get("currentStatus") or "").lower()
+            if ((item.get("lastError") or "").strip() or (item.get("lastWarning") or "").strip()
+                    or "fail" in status or "error" in status or "warning" in status
+                    or cur in ("error", "warning")):
+                item["lastError"] = ""
+                item["lastWarning"] = ""
+                if "fail" in status or "error" in status or "warning" in status:
+                    item["status"] = "installed"
+                if cur in ("error", "warning"):
+                    item["currentStatus"] = "Installed"
+                modified = True
+
+    return modified
+
+
 @router.delete("/admin/installs/clear-errors", dependencies=[Depends(verify_authentication)], tags=["admin"])
 def clear_stale_installs_errors(
     days: int = Query(default=10, ge=0, le=365, description="Clear errors/warnings from devices that have not reported in this many days; 0 clears every device (they re-report their true state on the next check-in)")
@@ -826,72 +900,26 @@ def clear_stale_installs_errors(
             modified = False
 
             # Error/failed status values that the frontend flags as "Devices with Install Errors"
-            error_statuses = {"error", "failed", "problem", "needs_reinstall", "install_failed"}
-            # The fleet warning count keys on currentStatus, not on lastWarning, so a
-            # cleared item left at "Warning" still counts. Reset it with the text.
-            warning_statuses = {"warning"}
-
-            # Clear Cimian item errors, warnings, and error statuses
-            cimian_items = data.get("cimian", {}).get("items", [])
-            for item in cimian_items:
-                has_error = bool(item.get("lastError", "").strip())
-                has_warning = bool(item.get("lastWarning", "").strip())
-                has_failure = (item.get("failureCount", 0) or 0) > 0
-                has_warn_count = (item.get("warningCount", 0) or 0) > 0
-                has_loop = item.get("installLoopDetected", False) or item.get("hasInstallLoop", False)
-                status = (item.get("currentStatus") or "").lower()
-                has_error_status = status in error_statuses
-                has_warning_status = status in warning_statuses
-
-                if has_error or has_warning or has_failure or has_warn_count or has_loop or has_error_status or has_warning_status:
-                    item["lastError"] = ""
-                    item["lastWarning"] = ""
-                    item["failureCount"] = 0
-                    item["warningCount"] = 0
-                    item["installLoopDetected"] = False
-                    item["hasInstallLoop"] = False
-                    if has_error_status or has_warning_status:
-                        item["currentStatus"] = "Installed"
-                        if item.get("mappedStatus"):
-                            item["mappedStatus"] = "Installed"
-                    modified = True
-
-            # Clear Munki errors and warnings. The fleet counters key on the
-            # per-item status (install_failed etc.), not only on the top-level
-            # errors/warnings strings, so both have to be reset or a Mac keeps
-            # counting after a clear.
-            munki = data.get("munki", {})
-            if munki:
-                for item in munki.get("items", []) or []:
-                    status = (item.get("status") or item.get("currentStatus") or "").lower()
-                    has_error_status = status in error_statuses or status == "install-failed"
-                    has_warning_status = status in warning_statuses
-                    has_error = bool((item.get("lastError") or "").strip())
-                    has_warning = bool((item.get("lastWarning") or "").strip())
-                    if has_error_status or has_warning_status or has_error or has_warning:
-                        item["lastError"] = ""
-                        item["lastWarning"] = ""
-                        if has_error_status or has_warning_status:
-                            item["status"] = "installed"
-                            if item.get("currentStatus"):
-                                item["currentStatus"] = "Installed"
-                            if item.get("pendingReason"):
-                                item["pendingReason"] = ""
-                        modified = True
-                if munki.get("errors", "").strip():
-                    munki["errors"] = ""
-                    modified = True
-                if munki.get("warnings", "").strip():
-                    munki["warnings"] = ""
-                    modified = True
-                if munki.get("problemInstalls"):
-                    munki["problemInstalls"] = ""
-                    modified = True
-
+            modified = _clear_install_issue_fields(data)
             if modified:
+                # The dashboard does not read this JSONB. It sums the
+                # precomputed cimian_errors/cimian_warnings/munki_errors/
+                # munki_warnings columns that ingest maintains, so rewriting
+                # data alone cleared the record everywhere except the place
+                # people actually look: /installs/full went clean while the
+                # dashboard cards did not move at all. Recompute the counters
+                # from the cleared payload with the same helper ingest uses, in
+                # the same statement, so the two can never disagree.
+                ce, cw, me, mw = _install_issue_counts(data)
                 cursor.execute(
-                    "UPDATE installs SET data = %s::jsonb WHERE device_id = %s",
-                    (json.dumps(data), device_id)
+                    """
+                    UPDATE installs
+                    SET data = %s::jsonb,
+                        cimian_errors = %s, cimian_warnings = %s,
+                        munki_errors = %s, munki_warnings = %s
+                    WHERE device_id = %s
+                    """,
+                    (json.dumps(data), ce, cw, me, mw, device_id)
                 )
                 cleared_devices.append(device_id)
 
