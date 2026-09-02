@@ -399,6 +399,192 @@ def usage_history_date_anomalies(
         raise HTTPException(status_code=500, detail=str(e))
 
 
+PLATFORM_CASE = """CASE
+                WHEN LOWER(COALESCE(d.platform, '')) LIKE '%%mac%%'
+                  OR LOWER(COALESCE(d.platform, '')) LIKE '%%darwin%%' THEN 'macOS'
+                WHEN LOWER(COALESCE(d.platform, '')) LIKE '%%win%%' THEN 'Windows'
+                ELSE 'Other'
+            END"""
+
+# One second of slack on the ordering checks: the clients round each counter
+# independently, so a session can legitimately carry foreground one second
+# above total after rounding. Anything past that is a defect.
+ORDERING_SLACK_SECONDS = 1
+DAY_SECONDS = 86400
+
+
+@router.get("/admin/usage-history/integrity", dependencies=[Depends(verify_authentication)], tags=["admin"])
+def usage_history_integrity(
+    days: int = Query(7, ge=1, le=90, description="Lookback window in days, by row date"),
+    sample: int = Query(20, ge=1, le=200, description="Maximum offending device-days returned"),
+):
+    """
+    Physical-plausibility check over recent usage_history rows, per platform.
+
+    The accuracy checks that gated September collection were run by hand
+    against the fleet endpoints and per-device histories. This is the same
+    check as one query so a timer can run it every day through the term and
+    say out loud when a client regression starts inflating the record again.
+
+    Everything here is a hard physical bound, not a heuristic:
+
+    - a duration cannot be negative;
+    - foreground cannot exceed total, and active cannot exceed foreground,
+      beyond one second of rounding slack;
+    - a device cannot accumulate more than 24 hours of foreground or active
+      time in one calendar day, summed across its applications.
+
+    The per-platform block for the last complete day gives the day's shape
+    (devices with rows, foreground and active hours per device, launches) so
+    a check that passes the bounds still shows whether the fleet moved.
+    total_seconds is process lifetime with no wall-clock ceiling and is not
+    checked against the day; see the usage endpoint for why it is not a
+    reportable figure.
+    """
+    conn = None
+    try:
+        today = datetime.now(timezone.utc).date()
+        cutoff = today - timedelta(days=days)
+        # Clients date rows on their local calendar day, so the newest
+        # complete day is the one before today everywhere the fleet lives.
+        last_complete = today - timedelta(days=1)
+        floor_date = today - timedelta(days=548)
+
+        conn = get_db_connection()
+        cursor = conn.cursor()
+
+        cursor.execute(
+            f"""
+            SELECT {PLATFORM_CASE} AS platform,
+                   COUNT(*)                                                    AS rows,
+                   COUNT(DISTINCT uh.device_id)                                AS devices,
+                   COUNT(*) FILTER (WHERE uh.total_seconds < 0
+                                       OR uh.active_seconds < 0
+                                       OR uh.foreground_seconds < 0)           AS negative_rows,
+                   COUNT(*) FILTER (WHERE uh.foreground_seconds
+                                          > uh.total_seconds + %s)             AS foreground_over_total,
+                   COUNT(*) FILTER (WHERE uh.active_seconds
+                                          > uh.foreground_seconds + %s)        AS active_over_foreground,
+                   COUNT(*) FILTER (WHERE uh.foreground_seconds > %s
+                                       OR uh.active_seconds > %s)              AS rows_over_day
+            FROM usage_history uh
+            JOIN devices d ON d.serial_number = uh.device_id
+            WHERE uh.date >= %s
+            GROUP BY 1
+            """,
+            (ORDERING_SLACK_SECONDS, ORDERING_SLACK_SECONDS, DAY_SECONDS, DAY_SECONDS, cutoff),
+        )
+        platforms: Dict[str, Dict[str, Any]] = {}
+        for row in cursor.fetchall():
+            platforms[row[0]] = {
+                "rows": int(row[1] or 0),
+                "devices": int(row[2] or 0),
+                "negativeRows": int(row[3] or 0),
+                "foregroundOverTotal": int(row[4] or 0),
+                "activeOverForeground": int(row[5] or 0),
+                "rowsOverDay": int(row[6] or 0),
+            }
+
+        cursor.execute(
+            f"""
+            SELECT {PLATFORM_CASE} AS platform,
+                   uh.device_id, uh.date::text,
+                   SUM(uh.foreground_seconds) AS fg, SUM(uh.active_seconds) AS act
+            FROM usage_history uh
+            JOIN devices d ON d.serial_number = uh.device_id
+            WHERE uh.date >= %s
+            GROUP BY 1, uh.device_id, uh.date
+            HAVING SUM(uh.foreground_seconds) > %s OR SUM(uh.active_seconds) > %s
+            ORDER BY GREATEST(SUM(uh.foreground_seconds), SUM(uh.active_seconds)) DESC
+            LIMIT %s
+            """,
+            (cutoff, DAY_SECONDS, DAY_SECONDS, sample),
+        )
+        over = [
+            {
+                "platform": r[0],
+                "deviceId": r[1],
+                "date": r[2],
+                "foregroundHours": round(float(r[3] or 0) / 3600, 2),
+                "activeHours": round(float(r[4] or 0) / 3600, 2),
+            }
+            for r in cursor.fetchall()
+        ]
+        for entry in over:
+            platforms.setdefault(entry["platform"], {})
+            platforms[entry["platform"]]["deviceDaysOverCeiling"] = (
+                platforms[entry["platform"]].get("deviceDaysOverCeiling", 0) + 1
+            )
+        for stats in platforms.values():
+            stats.setdefault("deviceDaysOverCeiling", 0)
+
+        cursor.execute(
+            f"""
+            SELECT {PLATFORM_CASE} AS platform,
+                   COUNT(DISTINCT uh.device_id)          AS devices,
+                   SUM(uh.foreground_seconds)            AS fg,
+                   SUM(uh.active_seconds)                AS act,
+                   SUM(uh.launches)                      AS launches
+            FROM usage_history uh
+            JOIN devices d ON d.serial_number = uh.device_id
+            WHERE uh.date = %s
+            GROUP BY 1
+            """,
+            (last_complete,),
+        )
+        for row in cursor.fetchall():
+            devices = int(row[1] or 0)
+            fg_hours = float(row[2] or 0) / 3600
+            act_hours = float(row[3] or 0) / 3600
+            platforms.setdefault(row[0], {})["lastCompleteDay"] = {
+                "date": str(last_complete),
+                "devices": devices,
+                "foregroundHours": round(fg_hours, 1),
+                "activeHours": round(act_hours, 1),
+                "foregroundHoursPerDevice": round(fg_hours / devices, 2) if devices else 0.0,
+                "activeHoursPerDevice": round(act_hours / devices, 2) if devices else 0.0,
+                "launches": int(row[4] or 0),
+            }
+
+        cursor.execute(
+            """
+            SELECT COUNT(*) FILTER (WHERE date < %s) AS too_old,
+                   COUNT(*) FILTER (WHERE date > %s) AS in_future
+            FROM usage_history
+            """,
+            (floor_date, today),
+        )
+        anomalies = cursor.fetchone() or (0, 0)
+
+        conn.close()
+        conn = None
+
+        breaches = sum(
+            p.get("negativeRows", 0) + p.get("foregroundOverTotal", 0)
+            + p.get("activeOverForeground", 0) + p.get("deviceDaysOverCeiling", 0)
+            for p in platforms.values()
+        ) + int(anomalies[0] or 0) + int(anomalies[1] or 0)
+
+        return {
+            "status": "ok",
+            "days": days,
+            "cutoffDate": str(cutoff),
+            "lastCompleteDay": str(last_complete),
+            "clean": breaches == 0,
+            "platforms": platforms,
+            "deviceDaysOverCeiling": over,
+            "dateAnomalies": {"tooOld": int(anomalies[0] or 0), "inFuture": int(anomalies[1] or 0)},
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"usage_history integrity probe failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        if conn:
+            conn.close()
+
+
 @router.post("/admin/usage-history/reset-baseline", dependencies=[Depends(verify_authentication)], tags=["admin"])
 def reset_usage_history_baseline(
     before: str = Query(..., description="Archive and remove rows dated before this YYYY-MM-DD (exclusive)"),
