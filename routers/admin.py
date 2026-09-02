@@ -621,37 +621,58 @@ def usage_history_export(
     if end_date <= start_date:
         raise HTTPException(status_code=400, detail="'to' must be after 'from'")
 
-    def rows():
-        import csv
-        import io
+    import csv
+    import io
 
-        conn = get_db_connection()
+    # Keyset pagination on the ordering key rather than a server-side
+    # cursor: the connection is pg8000, which has no named cursors, and
+    # a client-side cursor would hold the whole month in memory. Each
+    # batch is a bounded query that resumes after the last row sent, so
+    # the export is deterministic and the process never holds more than
+    # one batch.
+    batch_sql = """
+        SELECT device_id, date::text, app_name, publisher, launches,
+               total_seconds, active_seconds, foreground_seconds,
+               COALESCE(users::text, '[]'), updated_at::text
+        FROM usage_history
+        WHERE date >= %s AND date < %s
+          AND (date, device_id, app_name) > (%s, %s, %s)
+        ORDER BY date, device_id, app_name
+        LIMIT %s
+    """
+
+    def fetch_batch(cursor, after):
+        cursor.execute(batch_sql, (start_date, end_date, after[0], after[1], after[2], EXPORT_BATCH))
+        return cursor.fetchall()
+
+    def encode(batch):
+        buf = io.StringIO()
+        csv.writer(buf).writerows(batch)
+        return buf.getvalue()
+
+    # The first batch is read before the response starts so a database
+    # error is a 500, not a 200 with an empty body.
+    conn = get_db_connection()
+    try:
+        cursor = conn.cursor()
+        first = fetch_batch(cursor, (start_date, "", ""))
+    except Exception as e:
+        conn.close()
+        logger.error(f"usage_history export failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+    def rows():
         try:
-            cursor = conn.cursor(name="usage_history_export")
-            cursor.itersize = EXPORT_BATCH
-            cursor.execute(
-                """
-                SELECT device_id, date::text, app_name, publisher, launches,
-                       total_seconds, active_seconds, foreground_seconds,
-                       COALESCE(users::text, '[]'), updated_at::text
-                FROM usage_history
-                WHERE date >= %s AND date < %s
-                ORDER BY date, device_id, app_name
-                """,
-                (start_date, end_date),
-            )
-            buf = io.StringIO()
-            writer = csv.writer(buf)
-            writer.writerow(EXPORT_COLUMNS)
-            yield buf.getvalue()
-            while True:
-                batch = cursor.fetchmany(EXPORT_BATCH)
-                if not batch:
+            header = io.StringIO()
+            csv.writer(header).writerow(EXPORT_COLUMNS)
+            yield header.getvalue()
+            batch = first
+            while batch:
+                yield encode(batch)
+                if len(batch) < EXPORT_BATCH:
                     break
-                buf = io.StringIO()
-                writer = csv.writer(buf)
-                writer.writerows(batch)
-                yield buf.getvalue()
+                last = batch[-1]
+                batch = fetch_batch(cursor, (last[1], last[0], last[2]))
         finally:
             conn.close()
 
