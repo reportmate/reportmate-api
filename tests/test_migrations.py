@@ -29,6 +29,11 @@ def test_baseline_renders_offline():
     assert "usage_history" in sql
     assert "api_keys" in sql
     assert "idempotency_keys" in sql
+    # 0008 drops the module GIN indexes the baseline created; both sides must
+    # render so the drop is versioned and reversible rather than ad hoc.
+    assert "CREATE INDEX IF NOT EXISTS idx_applications_data_gin" in sql
+    assert "DROP INDEX IF EXISTS idx_applications_data_gin" in sql
+    assert "DROP INDEX IF EXISTS idx_printers_data_gin" in sql
 
 
 _TEST_DB = os.getenv("TEST_DATABASE_URL")
