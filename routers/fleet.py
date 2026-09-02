@@ -170,6 +170,33 @@ def get_applications_filters(
         raise HTTPException(status_code=500, detail=f"Failed to retrieve applications filters: {str(e)}")
 
 
+def fold_installed_devices(rows, picked_by_lower: Dict[str, str]) -> Dict[str, set]:
+    """
+    Fold (installed app name, [serials]) rows into device sets keyed by the
+    lowercased usage bucket name.
+
+    With an explicit pick list the usage buckets are the caller's raw names,
+    so an installed name counts only when it matches a pick exactly (case-
+    insensitively). Fleet-wide, the same canonical alias map that folds usage
+    rows folds the inventory, so "Adobe Illustrator 2025" lands on the
+    "Adobe Illustrator" bucket and "Adobe Acrobat (64-bit)" on "Adobe Acrobat".
+    A device with several matching entries counts once per bucket.
+    """
+    folded: Dict[str, set] = {}
+    for raw_name, serials in rows:
+        raw = (raw_name or "").strip()
+        if not raw:
+            continue
+        if picked_by_lower:
+            key = picked_by_lower.get(raw.lower())
+            if key is None:
+                continue
+        else:
+            key = canonicalize_app_name(raw) or raw
+        folded.setdefault(key.lower(), set()).update(serials or [])
+    return folded
+
+
 @router.get("/applications/usage", dependencies=[Depends(verify_authentication)], tags=["fleet"])
 def get_fleet_applications_usage(
     request: Request,
@@ -203,6 +230,9 @@ def get_fleet_applications_usage(
       contributed non-zero active time. **deviceCount / userCount** count every
       device and user that produced any usage row at all, including rows that
       are pure background process time.
+    - **installedDeviceCount** is the number of in-scope devices whose
+      applications inventory lists the app, folded with the same alias rules.
+      It is the only install figure here; deviceCount is not one.
 
     For a licence or seat question, use the active counts. The plain counts
     describe installation footprint, which for a background service is close to
@@ -260,32 +290,37 @@ def get_fleet_applications_usage(
             where.append("LOWER(uh.app_name) = ANY(%s)")
             params.append([n.lower() for n in app_name_list])
 
+        # Inventory and platform scope is kept apart from the usage_history
+        # conditions because the installed-footprint query below has to
+        # apply the same scope to the applications table.
+        scope_where: List[str] = []
+        scope_params: List[Any] = []
         if usage_list:
-            where.append("LOWER(inv.data->>'usage') = ANY(%s)")
-            params.append([s.lower() for s in usage_list])
+            scope_where.append("LOWER(inv.data->>'usage') = ANY(%s)")
+            scope_params.append([s.lower() for s in usage_list])
 
         if catalog_list:
-            where.append("LOWER(inv.data->>'catalog') = ANY(%s)")
-            params.append([s.lower() for s in catalog_list])
+            scope_where.append("LOWER(inv.data->>'catalog') = ANY(%s)")
+            scope_params.append([s.lower() for s in catalog_list])
 
         if location_list:
-            where.append("LOWER(inv.data->>'location') = ANY(%s)")
-            params.append([s.lower() for s in location_list])
+            scope_where.append("LOWER(inv.data->>'location') = ANY(%s)")
+            scope_params.append([s.lower() for s in location_list])
 
         if area_list:
-            where.append("LOWER(inv.data->>'department') = ANY(%s)")
-            params.append([s.lower() for s in area_list])
+            scope_where.append("LOWER(inv.data->>'department') = ANY(%s)")
+            scope_params.append([s.lower() for s in area_list])
 
         if fleet_list:
-            where.append("LOWER(inv.data->>'fleet') = ANY(%s)")
-            params.append([s.lower() for s in fleet_list])
+            scope_where.append("LOWER(inv.data->>'fleet') = ANY(%s)")
+            scope_params.append([s.lower() for s in fleet_list])
 
         if room_list:
             # Filter-options endpoint exposes "rooms" populated from
             # inv.data->>'location', so match against the same field with
             # 'room' as a fallback for clients that send both keys.
-            where.append("LOWER(COALESCE(inv.data->>'location', inv.data->>'room')) = ANY(%s)")
-            params.append([s.lower() for s in room_list])
+            scope_where.append("LOWER(COALESCE(inv.data->>'location', inv.data->>'room')) = ANY(%s)")
+            scope_params.append([s.lower() for s in room_list])
 
         if platform_list:
             # Expand user-facing labels into the raw platform tokens we store
@@ -300,9 +335,11 @@ def get_fleet_applications_usage(
             patterns: list[str] = []
             for p in platform_list:
                 patterns.extend(_expand_platform(p))
-            where.append("LOWER(COALESCE(d.platform, '')) ILIKE ANY(%s)")
-            params.append(patterns)
+            scope_where.append("LOWER(COALESCE(d.platform, '')) ILIKE ANY(%s)")
+            scope_params.append(patterns)
 
+        where.extend(scope_where)
+        params.extend(scope_params)
         where_clause = " AND ".join(where)
 
         # Per-app aggregate. Avoid correlated subqueries — they balloon cost
@@ -440,6 +477,51 @@ def get_fleet_applications_usage(
                         "aliasedFrom": set(),
                     }
 
+        # Installed footprint from the applications inventory, folded with the
+        # same alias rules as the usage buckets. deviceCount above is the set
+        # of devices that produced a usage row in the window, which the web
+        # used to label "installed": on macOS the watcher only records GUI
+        # sessions, and on both platforms the window bottoms out at the last
+        # baseline reset, so it undercounts installs by most of the fleet
+        # (Chrome read 105 devices against 847 installs the day after the
+        # 2026-09-01 reset). Installs are a different question with a direct
+        # answer in the inventory, and the April active-vs-installed gap
+        # needs that answer as its denominator.
+        installed_where = [
+            "d.serial_number IS NOT NULL",
+            "d.serial_number NOT LIKE 'TEST-%%'",
+            "d.serial_number != 'localhost'",
+            "a.data IS NOT NULL",
+        ] + scope_where
+        if not include_archived:
+            installed_where.append("d.archived = FALSE")
+        installed_query = f"""
+            WITH device_base AS (
+                SELECT DISTINCT ON (d.serial_number)
+                    d.serial_number AS serial,
+                    CASE
+                        WHEN a.data ? 'installedApplications' THEN a.data->'installedApplications'
+                        WHEN a.data ? 'InstalledApplications' THEN a.data->'InstalledApplications'
+                        WHEN a.data ? 'installed_applications' THEN a.data->'installed_applications'
+                        WHEN jsonb_typeof(a.data) = 'array' THEN a.data
+                        ELSE '[]'::jsonb
+                    END AS apps_array
+                FROM devices d
+                JOIN applications a ON d.id = a.device_id
+                LEFT JOIN inventory inv ON inv.device_id = d.id
+                WHERE {" AND ".join(installed_where)}
+                ORDER BY d.serial_number, a.updated_at DESC
+            )
+            SELECT COALESCE(elem->>'name', elem->>'displayName', '') AS app_name,
+                   ARRAY_AGG(DISTINCT db.serial)                      AS devices
+            FROM device_base db
+            CROSS JOIN LATERAL jsonb_array_elements(db.apps_array) AS elem
+            WHERE COALESCE(elem->>'name', elem->>'displayName', '') <> ''
+            GROUP BY 1
+        """
+        cursor.execute(installed_query, tuple(scope_params))
+        installed_by_bucket = fold_installed_devices(cursor.fetchall(), picked_by_lower)
+
         applications: List[Dict[str, Any]] = []
         total_seconds_sum = 0.0
         # Summed separately from total_seconds because the two answer different
@@ -480,6 +562,7 @@ def get_fleet_applications_usage(
             active_users = sorted(agg["activeUserSet"])
             active_device_count = len(active_devices)
             active_user_count = len(active_users)
+            installed_device_count = len(installed_by_bucket.get(canonical_name.lower(), ()))
             total_hours = round(total_secs / 3600, 2)
             active_hours = round(active_secs / 3600, 2)
             foreground_hours = round(foreground_secs / 3600, 2)
@@ -523,6 +606,7 @@ def get_fleet_applications_usage(
                 "userCount": user_count,
                 "activeDeviceCount": active_device_count,
                 "activeUserCount": active_user_count,
+                "installedDeviceCount": installed_device_count,
                 "lastUsed": agg["lastUsed"],
                 "firstUsed": agg["firstUsed"],
                 "devices": devices,
