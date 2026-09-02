@@ -185,6 +185,12 @@ def fold_installed_devices(rows, picked_by_lower: Dict[str, str]) -> Dict[str, s
     folded: Dict[str, set] = {}
     for raw_name, serials in rows:
         raw = (raw_name or "").strip()
+        # macOS inventories the bundle filename ("Microsoft Outlook.app");
+        # the watcher reports the bundle name. Without this only the names an
+        # alias regex happens to catch (Chrome, Firefox) fold, and every other
+        # Mac app reads 0 installed.
+        if raw.lower().endswith(".app"):
+            raw = raw[:-4].strip()
         if not raw:
             continue
         if picked_by_lower:
