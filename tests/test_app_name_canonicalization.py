@@ -101,6 +101,32 @@ class TestDistinctProductsNeverMix:
         assert canonicalize_app_name("Substance 3D Designer") == "Substance 3D Designer"
 
 
+class TestCrossPlatformNamesFold:
+    """The same product registers under different names per platform; both
+    fold to one row, but only on an exact whole-name match."""
+
+    @pytest.mark.parametrize("raw", ["Acrobat", "Adobe Acrobat", "Adobe Acrobat (64-bit)"])
+    def test_acrobat_names_fold_to_adobe_acrobat(self, raw):
+        assert canonicalize_app_name(raw) == "Adobe Acrobat"
+
+    @pytest.mark.parametrize("raw", ["Microsoft Outlook", "Outlook for Windows", "OUTLOOK"])
+    def test_outlook_names_fold_to_microsoft_outlook(self, raw):
+        assert canonicalize_app_name(raw) == "Microsoft Outlook"
+
+    @pytest.mark.parametrize(
+        "raw",
+        [
+            "Acrobat Notification Client",
+            "Acrobat NUL Self-Manage",
+            "Acrobat-SDL",
+            "Adobe Acrobat Reader",
+            "Zoom Outlook Plugin",
+        ],
+    )
+    def test_adjacent_products_are_not_swallowed(self, raw):
+        assert canonicalize_app_name(raw) not in ("Adobe Acrobat", "Microsoft Outlook")
+
+
 class TestDegenerateInput:
     @pytest.mark.parametrize("raw", ["", "   ", None, 123])
     def test_empty_and_non_string_input_is_empty(self, raw):
