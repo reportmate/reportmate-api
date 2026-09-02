@@ -1620,6 +1620,14 @@ _APP_NAME_ALIAS_RULES: List[tuple] = [
     # Apple Pro Apps
     (r"\bfinal\s*cut\s*pro\b", "Final Cut Pro"),
     (r"\bcompressor\b", "Compressor"),
+    # Cross-platform product names. macOS registers the bare product name
+    # ("Acrobat", "OUTLOOK") where Windows registers the branded one, so the
+    # same product reports as two rows. Anchored to the whole string: a
+    # substring match would swallow distinct products ("Acrobat Notification
+    # Client", "Zoom Outlook Plugin", "Adobe Acrobat Reader").
+    (r"^acrobat$", "Adobe Acrobat"),
+    (r"^outlook$", "Microsoft Outlook"),
+    (r"^outlook\s*for\s*windows$", "Microsoft Outlook"),
 ]
 
 _APP_NAME_ALIAS_COMPILED = [
