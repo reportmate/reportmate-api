@@ -6,6 +6,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi.responses import StreamingResponse
 
 from dependencies import (
     get_db_connection, get_maintenance_db_connection, invalidate_caches,
@@ -583,6 +584,82 @@ def usage_history_integrity(
     finally:
         if conn:
             conn.close()
+
+
+EXPORT_COLUMNS = [
+    "device_id", "date", "app_name", "publisher", "launches",
+    "total_seconds", "active_seconds", "foreground_seconds", "users", "updated_at",
+]
+EXPORT_BATCH = 5000
+
+
+@router.get("/admin/usage-history/export", dependencies=[Depends(verify_authentication)], tags=["admin"])
+def usage_history_export(
+    start: str = Query(..., alias="from", description="First row date to include, YYYY-MM-DD"),
+    end: str = Query(..., alias="to", description="First row date to exclude, YYYY-MM-DD"),
+):
+    """
+    Stream usage_history rows for a date range as CSV.
+
+    usage_history is the one table a device cannot re-report: every other
+    module row is a current-state snapshot that self-heals on the next
+    check-in. This is the read side of its archive -- the alerts app pulls
+    each closed month through here and writes it to blob storage, so the
+    record outlives the database's backup window.
+
+    Half-open range ``[from, to)`` on the row date, ordered by date, device
+    and application so two exports of the same range are byte-identical.
+    Rows stream from a server-side cursor in batches; a month of the current
+    fleet is a few hundred thousand rows and never sits in memory at once.
+    """
+    try:
+        start_date = datetime.strptime(start, "%Y-%m-%d").date()
+        end_date = datetime.strptime(end, "%Y-%m-%d").date()
+    except ValueError:
+        raise HTTPException(status_code=400, detail="from/to must be YYYY-MM-DD")
+    if end_date <= start_date:
+        raise HTTPException(status_code=400, detail="'to' must be after 'from'")
+
+    def rows():
+        import csv
+        import io
+
+        conn = get_db_connection()
+        try:
+            cursor = conn.cursor(name="usage_history_export")
+            cursor.itersize = EXPORT_BATCH
+            cursor.execute(
+                """
+                SELECT device_id, date::text, app_name, publisher, launches,
+                       total_seconds, active_seconds, foreground_seconds,
+                       COALESCE(users::text, '[]'), updated_at::text
+                FROM usage_history
+                WHERE date >= %s AND date < %s
+                ORDER BY date, device_id, app_name
+                """,
+                (start_date, end_date),
+            )
+            buf = io.StringIO()
+            writer = csv.writer(buf)
+            writer.writerow(EXPORT_COLUMNS)
+            yield buf.getvalue()
+            while True:
+                batch = cursor.fetchmany(EXPORT_BATCH)
+                if not batch:
+                    break
+                buf = io.StringIO()
+                writer = csv.writer(buf)
+                writer.writerows(batch)
+                yield buf.getvalue()
+        finally:
+            conn.close()
+
+    filename = f"usage_history-{start_date}-{end_date}.csv"
+    return StreamingResponse(
+        rows(),
+        media_type="text/csv",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
 
 
 @router.post("/admin/usage-history/reset-baseline", dependencies=[Depends(verify_authentication)], tags=["admin"])
