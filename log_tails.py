@@ -85,8 +85,26 @@ _SQL_PATTERNS = {
 }
 
 
+_STAMPED_RE = re.compile(r'^\[[^\]]+\]\s+(DEBUG|INFO|WARN|WARNING|ERROR|FATAL|CRITICAL)\b')
+
+
 def classify_line(line: str) -> str:
-    """Return ``error``, ``warning``, ``debug`` or ``info`` for one log line."""
+    """Return ``error``, ``warning``, ``debug`` or ``info`` for one log line.
+
+    A line in the convention's shape, ``[yyyy-MM-dd HH:mm:ss] LEVEL  message``,
+    is classified by its level token alone, so an INFO line that mentions
+    CRITICAL stays INFO. Other shapes fall back to the word patterns.
+    """
+    stamped = _STAMPED_RE.match(line)
+    if stamped:
+        token = stamped.group(1)
+        if token in ("ERROR", "FATAL", "CRITICAL"):
+            return "error"
+        if token in ("WARN", "WARNING"):
+            return "warning"
+        if token == "DEBUG":
+            return "debug"
+        return "info"
     if _ERROR_RE.search(line):
         return "error"
     if _WARNING_RE.search(line):
