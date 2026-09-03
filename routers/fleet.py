@@ -26,6 +26,101 @@ _SERVICE_PRINCIPAL_NAMES = frozenset({
 })
 
 
+# A managed-software agent that has stopped running is invisible in every
+# per-item metric, because the device keeps re-uploading the last report it
+# managed to produce. Its records stay whatever they were on the day the agent
+# died -- overwhelmingly "installed" -- so it contributes nothing to error or
+# warning counts and reads as one of the healthiest machines in the fleet while
+# receiving no software updates at all.
+#
+# The tell is the gap between a device still checking in and its agent's last
+# completed session. Measured against lastSeen rather than now on purpose: a
+# device that is simply powered off has BOTH timestamps old and is not stale,
+# it is just absent. Only a device reporting in while its agent is silent is
+# actually broken, and that is what this measures.
+STALE_AGENT_THRESHOLD_DAYS = 1.0
+
+
+def _parse_iso(raw: Any) -> Optional[datetime]:
+    """Parse an ISO-8601 timestamp to an aware UTC datetime, or None.
+
+    Mirrors the parsing already used for install-item timestamps in the admin
+    router: tolerate a trailing Z, and treat a naive timestamp as UTC so that
+    comparisons against tz-aware check-in times cannot raise.
+    """
+    if not raw:
+        return None
+    try:
+        parsed = datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
+    except (ValueError, TypeError):
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+# The two agents record their last run in different shapes, and reading only
+# one of them yields None for every device on the other platform -- parity in
+# code and a silent no-op in practice. Cimian carries a sessions[] list with
+# per-session end_time/start_time; Munki reports a single endTime/startTime on
+# the module itself and has no sessions[] at all.
+_RUN_TIME_KEYS = ("end_time", "endTime", "start_time", "startTime")
+
+
+def _newest_run_time(record: Dict[str, Any]) -> Optional[datetime]:
+    """Best available run timestamp from one session or module record.
+
+    Prefers an end time and falls back to a start time, so a run that was cut
+    short still counts as evidence the agent ran.
+    """
+    for key in _RUN_TIME_KEYS:
+        parsed = _parse_iso(record.get(key))
+        if parsed is not None:
+            return parsed
+    return None
+
+
+def agent_last_run(agent: Optional[Dict[str, Any]]) -> Optional[datetime]:
+    """Newest completed-run timestamp for a management agent, either shape.
+
+    Sessions arrive newest-first, but that is the producer's ordering rather
+    than a guarantee, so take the maximum instead of the first element. When
+    an agent reports no sessions[], fall back to the run timestamps on the
+    module itself.
+    """
+    if not isinstance(agent, dict) or not agent:
+        return None
+
+    sessions = agent.get("sessions")
+    newest = None
+    if isinstance(sessions, list):
+        for session in sessions:
+            if not isinstance(session, dict):
+                continue
+            parsed = _newest_run_time(session)
+            if parsed is not None and (newest is None or parsed > newest):
+                newest = parsed
+    if newest is not None:
+        return newest
+
+    return _newest_run_time(agent)
+
+
+def agent_stale_days(
+    last_run: Optional[datetime], last_seen: Optional[datetime]
+) -> Optional[float]:
+    """Days a device kept checking in after its agent last completed a run.
+
+    None when either timestamp is missing -- a device with no session history
+    has nothing to compare and must not be reported as stale. Negative drift
+    (a run recorded after the last check-in) clamps to 0.0 rather than
+    surfacing as a nonsensical negative age.
+    """
+    if last_run is None or last_seen is None:
+        return None
+    return max(0.0, (last_seen - last_run).total_seconds() / 86400.0)
+
+
 def is_human_principal(username: Optional[str]) -> bool:
     """
     True when a usage_history user entry plausibly names a person.
@@ -1946,6 +2041,7 @@ def get_installs_filters(
         conn.close()
         
         managed_installs = set()
+        stale_agents = []
         cimian_installs = set()
         munki_installs = set()
         usages = set()
@@ -2063,6 +2159,22 @@ def get_installs_filters(
             # Get most recent session
             sessions = cimian_data.get('sessions', []) or munki_data.get('sessions', [])
             latest_session = sessions[0] if sessions else None
+
+            # How long this device has been reporting in with a silent agent.
+            # Computed per agent: the two record their run times in different
+            # shapes, so a single merged reading would be blank for one of them.
+            cimian_run_at = agent_last_run(cimian_data)
+            munki_run_at = agent_last_run(munki_data)
+            cimian_stale_days = agent_stale_days(cimian_run_at, last_seen)
+            munki_stale_days = agent_stale_days(munki_run_at, last_seen)
+            cimian_run_iso = cimian_run_at.isoformat() if cimian_run_at else None
+            munki_run_iso = munki_run_at.isoformat() if munki_run_at else None
+
+            agent_run_at = cimian_run_at or munki_run_at
+            stale_days = (
+                cimian_stale_days if cimian_data else munki_stale_days
+            )
+            agent_last_run_iso = agent_run_at.isoformat() if agent_run_at else None
             
             # Build device record with slimmed items — keep only fields the
             # installs page actually reads: names for labels and pill matching,
@@ -2100,6 +2212,10 @@ def get_installs_filters(
                     'config': config,
                     'version': cimian_data.get('version'),
                     'status': cimian_data.get('status'),
+                    # status above is a static string the client emits; it says
+                    # nothing about whether the agent still runs. These two do.
+                    'lastRunTime': agent_last_run_iso,
+                    'staleDays': stale_days,
                     # The page reads only sessions[0].status; five full
                     # session objects per device were ~6MB of the payload.
                     'sessions': (cimian_data.get('sessions') or [])[:1],
@@ -2121,6 +2237,8 @@ def get_installs_filters(
                 munki_slim = {
                     'version': munki_data.get('version'),
                     'status': munki_data.get('status'),
+                    'lastRunTime': munki_run_iso,
+                    'staleDays': munki_stale_days,
                     'manifestName': munki_data.get('manifestName'),
                     'clientIdentifier': munki_data.get('clientIdentifier'),
                     'softwareRepoURL': munki_data.get('softwareRepoURL'),
@@ -2137,6 +2255,18 @@ def get_installs_filters(
                     }
                 }
             
+            if stale_days is not None and stale_days >= STALE_AGENT_THRESHOLD_DAYS:
+                stale_agents.append({
+                    'serialNumber': serial,
+                    'deviceName': device_name or serial,
+                    'platform': platform,
+                    'agent': config_type,
+                    'agentVersion': (cimian_data or munki_data).get('version'),
+                    'lastRunTime': agent_last_run_iso,
+                    'lastSeen': last_seen.isoformat() if last_seen else None,
+                    'staleDays': round(stale_days, 1),
+                })
+
             devices.append({
                 'serialNumber': serial,
                 'deviceName': device_name or serial,
@@ -2178,6 +2308,15 @@ def get_installs_filters(
             'softwareRepos': sorted(software_repos),
             'manifests': sorted(manifests),
             'devicesWithData': len(devices),
+            # Devices still reporting in whose management agent has stopped
+            # running. They carry no errors or warnings -- their records froze
+            # on the day the agent died -- so no per-item metric can surface
+            # them. Newest silence first.
+            'staleAgentCount': len(stale_agents),
+            'staleAgentThresholdDays': STALE_AGENT_THRESHOLD_DAYS,
+            'staleAgents': sorted(
+                stale_agents, key=lambda d: d['staleDays'], reverse=True
+            ),
             'devices': devices
         }
         cache_set("installs_filters", _result, _ckey)
