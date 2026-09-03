@@ -158,3 +158,23 @@ def test_empty_sessions_list_falls_through_to_module_level():
 def test_agent_with_no_timestamps_anywhere_is_unknown():
     assert agent_last_run({"version": "1.0", "status": "Active"}) is None
     assert agent_last_run({}) is None
+
+
+def test_snake_case_sessions_from_the_macos_agent():
+    """The macOS agent's session reports use Cimian's schema, deliberately.
+
+    Its Swift model encodes startTime/endTime with convertToSnakeCase, so the
+    JSON keys are start_time/end_time -- the same spelling the Windows agent
+    writes. One reader must work for both, and it must keep working while the
+    macOS reporting client is mid-transition: devices not yet sending
+    sessions[] fall back to the module's own timestamps, and devices that are
+    sending them get the finer-grained reading with no change here.
+    """
+    agent = {
+        "sessions": [{"start_time": iso(NOW - timedelta(days=4)),
+                      "end_time": iso(NOW - timedelta(days=4) + timedelta(minutes=1))}],
+        "endTime": iso(NOW - timedelta(days=90)),
+    }
+    last_run = agent_last_run(agent)
+    assert last_run == NOW - timedelta(days=4) + timedelta(minutes=1)
+    assert agent_stale_days(last_run, NOW) > STALE_AGENT_THRESHOLD_DAYS
