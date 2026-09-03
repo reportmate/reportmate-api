@@ -4004,7 +4004,7 @@ def _shape_fleet_log_rows(rows, levels, needle, file_filter, platform_filter, ma
     }
 
 
-@router.get("/logs/{tool}", dependencies=[Depends(verify_authentication)], tags=["fleet"])
+@router.get("/management/logs/{tool}", dependencies=[Depends(verify_authentication)], tags=["fleet"])
 def get_fleet_log_lines(
     tool: str,
     levels: Optional[str] = Query(default=None, description="Comma-separated levels to return: error, warning, info, debug (default error,warning)"),
