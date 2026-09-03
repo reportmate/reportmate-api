@@ -21,6 +21,10 @@ def test_classify_line_covers_every_shape():
     assert classify_line(DAEMON_ERR) == "error"
     assert classify_line('{"level": "warning", "message": "x"}') == "warning"
     assert classify_line("plain text with no level") == "info"
+    # the stamped level wins over words in the message
+    assert classify_line("[2026-09-02 03:00:46]  INFO  CRITICAL PACKAGE: SbinInstaller (x64) - using aggressive retry strategy") == "info"
+    assert classify_line("[2026-09-02 03:00:46] DEBUG  CRITICAL PACKAGE INSTALLED") == "debug"
+    assert classify_line("[2026-09-02 03:00:46] FATAL  MSI Version value missing") == "error"
 
 
 def test_parse_levels_defaults_aliases_and_rejects_unknown():
