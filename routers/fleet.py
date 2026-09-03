@@ -59,27 +59,51 @@ def _parse_iso(raw: Any) -> Optional[datetime]:
     return parsed.astimezone(timezone.utc)
 
 
-def agent_last_run(sessions: Optional[List[Dict[str, Any]]]) -> Optional[datetime]:
-    """Newest completed-session timestamp across an agent's session list.
+# The two agents record their last run in different shapes, and reading only
+# one of them yields None for every device on the other platform -- parity in
+# code and a silent no-op in practice. Cimian carries a sessions[] list with
+# per-session end_time/start_time; Munki reports a single endTime/startTime on
+# the module itself and has no sessions[] at all.
+_RUN_TIME_KEYS = ("end_time", "endTime", "start_time", "startTime")
+
+
+def _newest_run_time(record: Dict[str, Any]) -> Optional[datetime]:
+    """Best available run timestamp from one session or module record.
+
+    Prefers an end time and falls back to a start time, so a run that was cut
+    short still counts as evidence the agent ran.
+    """
+    for key in _RUN_TIME_KEYS:
+        parsed = _parse_iso(record.get(key))
+        if parsed is not None:
+            return parsed
+    return None
+
+
+def agent_last_run(agent: Optional[Dict[str, Any]]) -> Optional[datetime]:
+    """Newest completed-run timestamp for a management agent, either shape.
 
     Sessions arrive newest-first, but that is the producer's ordering rather
-    than a guarantee, so take the maximum instead of the first element.
-    Prefers end_time and falls back to start_time for a session that is still
-    running or was cut short.
+    than a guarantee, so take the maximum instead of the first element. When
+    an agent reports no sessions[], fall back to the run timestamps on the
+    module itself.
     """
-    if not sessions:
+    if not isinstance(agent, dict) or not agent:
         return None
+
+    sessions = agent.get("sessions")
     newest = None
-    for session in sessions:
-        if not isinstance(session, dict):
-            continue
-        for key in ("end_time", "endTime", "start_time", "startTime"):
-            parsed = _parse_iso(session.get(key))
-            if parsed is not None:
-                if newest is None or parsed > newest:
-                    newest = parsed
-                break
-    return newest
+    if isinstance(sessions, list):
+        for session in sessions:
+            if not isinstance(session, dict):
+                continue
+            parsed = _newest_run_time(session)
+            if parsed is not None and (newest is None or parsed > newest):
+                newest = parsed
+    if newest is not None:
+        return newest
+
+    return _newest_run_time(agent)
 
 
 def agent_stale_days(
@@ -2137,8 +2161,19 @@ def get_installs_filters(
             latest_session = sessions[0] if sessions else None
 
             # How long this device has been reporting in with a silent agent.
-            agent_run_at = agent_last_run(sessions)
-            stale_days = agent_stale_days(agent_run_at, last_seen)
+            # Computed per agent: the two record their run times in different
+            # shapes, so a single merged reading would be blank for one of them.
+            cimian_run_at = agent_last_run(cimian_data)
+            munki_run_at = agent_last_run(munki_data)
+            cimian_stale_days = agent_stale_days(cimian_run_at, last_seen)
+            munki_stale_days = agent_stale_days(munki_run_at, last_seen)
+            cimian_run_iso = cimian_run_at.isoformat() if cimian_run_at else None
+            munki_run_iso = munki_run_at.isoformat() if munki_run_at else None
+
+            agent_run_at = cimian_run_at or munki_run_at
+            stale_days = (
+                cimian_stale_days if cimian_data else munki_stale_days
+            )
             agent_last_run_iso = agent_run_at.isoformat() if agent_run_at else None
             
             # Build device record with slimmed items — keep only fields the
@@ -2202,8 +2237,8 @@ def get_installs_filters(
                 munki_slim = {
                     'version': munki_data.get('version'),
                     'status': munki_data.get('status'),
-                    'lastRunTime': agent_last_run_iso,
-                    'staleDays': stale_days,
+                    'lastRunTime': munki_run_iso,
+                    'staleDays': munki_stale_days,
                     'manifestName': munki_data.get('manifestName'),
                     'clientIdentifier': munki_data.get('clientIdentifier'),
                     'softwareRepoURL': munki_data.get('softwareRepoURL'),

@@ -33,26 +33,26 @@ def test_last_run_uses_newest_session_not_first():
         {"end_time": iso(NOW - timedelta(days=2))},
         {"end_time": iso(NOW - timedelta(days=40))},
     ]
-    assert agent_last_run(sessions) == NOW - timedelta(days=2)
+    assert agent_last_run({"sessions": sessions}) == NOW - timedelta(days=2)
 
 
 def test_last_run_falls_back_to_start_time():
     """A session cut short mid-run has no end_time but still proves it ran."""
     sessions = [{"start_time": iso(NOW - timedelta(hours=3))}]
-    assert agent_last_run(sessions) == NOW - timedelta(hours=3)
+    assert agent_last_run({"sessions": sessions}) == NOW - timedelta(hours=3)
 
 
 def test_last_run_handles_missing_and_malformed():
     assert agent_last_run(None) is None
-    assert agent_last_run([]) is None
-    assert agent_last_run([{"end_time": "not a timestamp"}]) is None
-    assert agent_last_run(["not a dict"]) is None
+    assert agent_last_run({"sessions": []}) is None
+    assert agent_last_run({"sessions": [{"end_time": "not a timestamp"}]}) is None
+    assert agent_last_run({"sessions": ["not a dict"]}) is None
 
 
 def test_naive_timestamp_does_not_raise():
     """Client timestamps are not reliably tz-aware; comparison must still work."""
     sessions = [{"end_time": "2026-09-01T12:00:00"}]
-    last_run = agent_last_run(sessions)
+    last_run = agent_last_run({"sessions": sessions})
     assert last_run is not None
     assert agent_stale_days(last_run, NOW) == 1.0
 
@@ -65,20 +65,20 @@ def test_offset_timestamp_is_normalised():
     would give 1.29 days instead.
     """
     sessions = [{"end_time": "2026-09-01T05:00:00-07:00"}]
-    assert agent_stale_days(agent_last_run(sessions), NOW) == 1.0
+    assert agent_stale_days(agent_last_run({"sessions": sessions}), NOW) == 1.0
 
 
 def test_dead_agent_on_a_reporting_device_is_stale():
     """The real shape: checking in today, last ran seven weeks ago."""
     sessions = [{"end_time": iso(NOW - timedelta(days=48))}]
-    stale = agent_stale_days(agent_last_run(sessions), NOW)
+    stale = agent_stale_days(agent_last_run({"sessions": sessions}), NOW)
     assert stale == 48.0
     assert stale >= STALE_AGENT_THRESHOLD_DAYS
 
 
 def test_healthy_hourly_agent_is_not_stale():
     sessions = [{"end_time": iso(NOW - timedelta(minutes=20))}]
-    stale = agent_stale_days(agent_last_run(sessions), NOW)
+    stale = agent_stale_days(agent_last_run({"sessions": sessions}), NOW)
     assert stale < STALE_AGENT_THRESHOLD_DAYS
 
 
@@ -92,13 +92,13 @@ def test_powered_off_device_is_absent_not_stale():
     """
     last_seen = NOW - timedelta(days=30)
     sessions = [{"end_time": iso(last_seen - timedelta(minutes=5))}]
-    stale = agent_stale_days(agent_last_run(sessions), last_seen)
+    stale = agent_stale_days(agent_last_run({"sessions": sessions}), last_seen)
     assert stale < STALE_AGENT_THRESHOLD_DAYS
 
 
 def test_no_session_history_is_not_reported_stale():
     """Absence of evidence must not become evidence of a dead agent."""
-    assert agent_stale_days(agent_last_run([]), NOW) is None
+    assert agent_stale_days(agent_last_run({"sessions": []}), NOW) is None
     assert agent_stale_days(None, NOW) is None
 
 
@@ -109,4 +109,52 @@ def test_missing_last_seen_is_not_stale():
 def test_run_recorded_after_last_checkin_clamps_to_zero():
     """Clock drift between the two timestamps must not produce a negative age."""
     sessions = [{"end_time": iso(NOW + timedelta(hours=2))}]
-    assert agent_stale_days(agent_last_run(sessions), NOW) == 0.0
+    assert agent_stale_days(agent_last_run({"sessions": sessions}), NOW) == 0.0
+
+
+# --- the second agent shape -------------------------------------------------
+# Munki has no sessions[] at all: it reports a single startTime/endTime on the
+# module itself. Reading only the sessions shape returns None for every macOS
+# device, which is parity in code and a silent no-op in practice -- the exact
+# failure this whole signal exists to catch, reproduced in the detector.
+
+
+def test_module_level_timestamps_are_used_when_there_are_no_sessions():
+    agent = {"startTime": iso(NOW - timedelta(days=9)),
+             "endTime": iso(NOW - timedelta(days=9) + timedelta(seconds=50))}
+    last_run = agent_last_run(agent)
+    assert last_run is not None, "an agent without sessions[] must still report a run time"
+    assert agent_stale_days(last_run, NOW) > STALE_AGENT_THRESHOLD_DAYS
+
+
+def test_module_level_end_time_preferred_over_start_time():
+    agent = {"startTime": iso(NOW - timedelta(days=3)),
+             "endTime": iso(NOW - timedelta(days=2))}
+    assert agent_last_run(agent) == NOW - timedelta(days=2)
+
+
+def test_module_level_start_time_alone_still_counts():
+    agent = {"startTime": iso(NOW - timedelta(hours=1))}
+    assert agent_last_run(agent) == NOW - timedelta(hours=1)
+
+
+def test_healthy_module_level_agent_is_not_stale():
+    agent = {"endTime": iso(NOW - timedelta(minutes=30))}
+    assert agent_stale_days(agent_last_run(agent), NOW) < STALE_AGENT_THRESHOLD_DAYS
+
+
+def test_sessions_win_over_module_level_when_both_present():
+    """Sessions are the finer-grained record, so they decide when available."""
+    agent = {"sessions": [{"end_time": iso(NOW - timedelta(hours=2))}],
+             "endTime": iso(NOW - timedelta(days=30))}
+    assert agent_last_run(agent) == NOW - timedelta(hours=2)
+
+
+def test_empty_sessions_list_falls_through_to_module_level():
+    agent = {"sessions": [], "endTime": iso(NOW - timedelta(days=5))}
+    assert agent_last_run(agent) == NOW - timedelta(days=5)
+
+
+def test_agent_with_no_timestamps_anywhere_is_unknown():
+    assert agent_last_run({"version": "1.0", "status": "Active"}) is None
+    assert agent_last_run({}) is None
