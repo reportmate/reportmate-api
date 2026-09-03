@@ -1,4 +1,4 @@
--- Fleet log lines: /api/v1/logs/{tool}
+-- Fleet log lines: /api/v1/management/logs/{tool}
 -- One row per (device, tail file) for the requested log root, with the tail's
 -- lines already narrowed in Postgres when a level pattern is given so a fleet
 -- sweep for errors does not ship every INFO line to Python.
