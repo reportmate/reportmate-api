@@ -8,6 +8,7 @@ from typing import Any, Dict, List, Optional
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
 
 from pagination import add_pagination_headers
+from log_tails import classify_line, normalize_message, parse_levels, sql_pattern_for_levels
 
 from dependencies import (
     cache_get, cache_set, get_db_connection, load_sql, logger,
@@ -3895,3 +3896,174 @@ def get_bulk_profiles(
     except Exception as e:
         logger.error(f"Failed to get bulk profiles: {e}")
         raise HTTPException(status_code=500, detail=f"Failed to retrieve bulk profiles: {str(e)}")
+
+
+# ---------------------------------------------------------------------------
+# Fleet log sweep
+# ---------------------------------------------------------------------------
+
+def _shape_fleet_log_rows(rows, levels, needle, file_filter, platform_filter, max_lines, summarize):
+    """Turn (serial, last_seen, device_name, platform, root_meta, file, lines)
+    rows into per-device results and, when asked, fleet-wide message patterns.
+
+    Pure so it can be tested without a database. Lines are classified here
+    even when the query already narrowed them: the SQL pattern is a superset
+    filter and this is where the requested levels are enforced.
+    """
+    wanted = set(levels)
+    needle_l = (needle or "").strip().lower()
+    file_l = (file_filter or "").strip().lower()
+    platform_l = (platform_filter or "").strip().lower()
+
+    by_device: Dict[str, Dict[str, Any]] = {}
+    patterns: Dict[str, Dict[str, Any]] = {}
+    level_totals = {level: 0 for level in ("error", "warning", "info", "debug")}
+    scanned = set()
+    truncated_devices = set()
+
+    for serial, last_seen, device_name, platform, root_meta, file_name, lines in rows:
+        scanned.add(serial)
+        if platform_l:
+            plat = (platform or "").lower()
+            is_win = "win" in plat
+            if (platform_l.startswith("win") and not is_win) or (platform_l.startswith("mac") and is_win):
+                continue
+        if file_l and (file_name or "").lower() != file_l:
+            continue
+        if isinstance(root_meta, str):
+            try:
+                root_meta = json.loads(root_meta)
+            except Exception:
+                root_meta = {}
+        if isinstance(lines, str):
+            try:
+                lines = json.loads(lines)
+            except Exception:
+                lines = []
+        if not isinstance(lines, list):
+            continue
+
+        for raw in lines:
+            if not isinstance(raw, str):
+                continue
+            level = classify_line(raw)
+            if level not in wanted:
+                continue
+            if needle_l and needle_l not in raw.lower():
+                continue
+            level_totals[level] += 1
+            entry = by_device.get(serial)
+            if entry is None:
+                entry = by_device[serial] = {
+                    "serialNumber": serial,
+                    "deviceName": device_name or serial,
+                    "platform": platform,
+                    "lastSeen": last_seen.isoformat() if hasattr(last_seen, "isoformat") else last_seen,
+                    "root": {
+                        "name": (root_meta or {}).get("name"),
+                        "path": (root_meta or {}).get("path"),
+                        "newestModified": (root_meta or {}).get("newestModified"),
+                        "errorCount": (root_meta or {}).get("errorCount"),
+                        "warningCount": (root_meta or {}).get("warningCount"),
+                    },
+                    "counts": {"error": 0, "warning": 0, "info": 0, "debug": 0},
+                    "lines": [],
+                    "truncated": False,
+                }
+            entry["counts"][level] += 1
+            if len(entry["lines"]) < max_lines:
+                entry["lines"].append({"file": file_name, "level": level, "line": raw})
+            else:
+                entry["truncated"] = True
+                truncated_devices.add(serial)
+            if summarize:
+                key = normalize_message(raw)
+                pat = patterns.get(key)
+                if pat is None:
+                    pat = patterns[key] = {"message": key, "level": level, "lines": 0, "devices": set(), "sample": raw[:400]}
+                pat["lines"] += 1
+                pat["devices"].add(serial)
+
+    results = sorted(by_device.values(), key=lambda d: (-(d["counts"]["error"]), -(d["counts"]["warning"]), d["serialNumber"]))
+    shaped_patterns = None
+    if summarize:
+        shaped_patterns = sorted(
+            (
+                {"message": p["message"], "level": p["level"], "lines": p["lines"], "devices": len(p["devices"]), "sample": p["sample"]}
+                for p in patterns.values()
+            ),
+            key=lambda p: (-p["devices"], -p["lines"], p["message"]),
+        )[:200]
+    return {
+        "devicesScanned": len(scanned),
+        "devicesMatched": len(results),
+        "devicesTruncated": len(truncated_devices),
+        "lineTotals": level_totals,
+        "results": results,
+        "patterns": shaped_patterns,
+    }
+
+
+@router.get("/logs/{tool}", dependencies=[Depends(verify_authentication)], tags=["fleet"])
+def get_fleet_log_lines(
+    tool: str,
+    levels: Optional[str] = Query(default=None, description="Comma-separated levels to return: error, warning, info, debug (default error,warning)"),
+    platform: Optional[str] = Query(default=None, description="windows or macos"),
+    file: Optional[str] = Query(default=None, description="Only lines from this file within the root, e.g. run.log"),
+    q: Optional[str] = Query(default=None, description="Case-insensitive substring the line must contain"),
+    summary: bool = Query(default=False, description="Also return fleet-wide message patterns (same fault on many devices counted once)"),
+    max_lines_per_device: int = Query(default=200, ge=1, le=5000, alias="maxLinesPerDevice"),
+    include_archived: bool = Query(default=False, alias="includeArchived"),
+    limit: Optional[int] = Query(default=None, ge=1, le=5000, description="Maximum devices to return"),
+    offset: int = Query(default=0, ge=0),
+):
+    """
+    Sweep one management tool's log tails across the whole fleet.
+
+    ``tool`` is a log root key (installs, bootstrap, reports, state, encryption,
+    users, utilities, notifications, mdm, installer). Every device's tails for
+    that root are read straight from the management module in Postgres; when
+    ``levels`` excludes info the narrowing happens in the query, so a sweep for
+    errors and warnings ships only those lines. Each result carries the device,
+    the root's facts and the matching lines with their file and level;
+    ``summary=true`` adds the message patterns behind them, normalised so the
+    same fault on many devices is one row with a device count.
+    """
+    try:
+        wanted = parse_levels(levels)
+    except ValueError as bad:
+        raise HTTPException(status_code=400, detail=f"Unknown level '{bad}'. Use error, warning, info, debug.")
+
+    pattern = sql_pattern_for_levels(wanted)
+    try:
+        _t0 = _time.monotonic()
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute(
+            load_sql("devices/fleet_log_lines"),
+            {"tool": tool, "pattern": pattern, "include_archived": include_archived},
+        )
+        rows = cursor.fetchall()
+        conn.close()
+        shaped = _shape_fleet_log_rows(rows, wanted, q, file, platform, max_lines_per_device, summary)
+        logger.info(
+            f"Fleet log sweep {tool} levels={','.join(wanted)}: {len(rows)} tails, "
+            f"{shaped['devicesMatched']}/{shaped['devicesScanned']} devices in {_time.monotonic() - _t0:.1f}s"
+        )
+        results = paginate(shaped["results"], limit, offset)
+        return {
+            "tool": tool,
+            "levels": wanted,
+            "devicesScanned": shaped["devicesScanned"],
+            "devicesMatched": shaped["devicesMatched"],
+            "devicesTruncated": shaped["devicesTruncated"],
+            "lineTotals": shaped["lineTotals"],
+            "results": results,
+            "patterns": shaped["patterns"],
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Fleet log sweep failed for {tool}: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to sweep logs: {str(e)}")
+
