@@ -25,6 +25,10 @@ def test_classify_line_covers_every_shape():
     assert classify_line("[2026-09-02 03:00:46]  INFO  CRITICAL PACKAGE: SbinInstaller (x64) - using aggressive retry strategy") == "info"
     assert classify_line("[2026-09-02 03:00:46] DEBUG  CRITICAL PACKAGE INSTALLED") == "debug"
     assert classify_line("[2026-09-02 03:00:46] FATAL  MSI Version value missing") == "error"
+    # older builds bracket a mixed-case level after a stamp with milliseconds
+    assert classify_line("[2026-09-01 03:02:27.255] [Debug] CRITICAL PACKAGE INSTALLED: X") == "debug"
+    assert classify_line("[2026-09-01 03:02:27.290] [Info] Using sbin-installer") == "info"
+    assert classify_line("[2026-09-01 03:02:27.290] [Error] boom") == "error"
 
 
 def test_parse_levels_defaults_aliases_and_rejects_unknown():

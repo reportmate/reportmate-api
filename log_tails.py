@@ -85,7 +85,7 @@ _SQL_PATTERNS = {
 }
 
 
-_STAMPED_RE = re.compile(r'^\[[^\]]+\]\s+(DEBUG|INFO|WARN|WARNING|ERROR|FATAL|CRITICAL)\b')
+_STAMPED_RE = re.compile(r'^\[[^\]]+\]\s+\[?(DEBUG|INFO|WARN|WARNING|ERROR|FATAL|CRITICAL)\]?\b', re.IGNORECASE)
 
 
 def classify_line(line: str) -> str:
@@ -97,7 +97,7 @@ def classify_line(line: str) -> str:
     """
     stamped = _STAMPED_RE.match(line)
     if stamped:
-        token = stamped.group(1)
+        token = stamped.group(1).upper()
         if token in ("ERROR", "FATAL", "CRITICAL"):
             return "error"
         if token in ("WARN", "WARNING"):
