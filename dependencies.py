@@ -24,6 +24,7 @@ import secrets
 import socket
 import threading
 import time as _time
+from collections import OrderedDict
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
@@ -78,7 +79,25 @@ logger = logging.getLogger(__name__)
 # Endpoint response cache
 # ---------------------------------------------------------------------------
 
-_CACHE: dict = {}
+# The cache is keyed by namespace and, for most endpoints, by the request's
+# whole query string -- so its key space is every filter combination, offset and
+# search term any caller has ever sent. Nothing bounded it: entries were removed
+# only when a later read found them expired, so an entry written once and never
+# requested again was retained for the life of the process, holding a full
+# response payload. The fleet payloads are megabytes each (installs_full is tens
+# of MB), which is how the container walked from ~200 MB to its 4 GiB ceiling
+# over a few hours and was OOM-killed, repeatedly, several times a day.
+#
+# Two bounds, because either alone leaves a hole: expired entries are swept on
+# write, so nothing outlives its TTL by more than one write; and a hard cap
+# evicts oldest-first, so a burst of distinct keys inside one TTL window cannot
+# outrun the sweep.
+_CACHE: "OrderedDict[tuple, tuple]" = OrderedDict()
+
+# Generous next to the number of distinct keys in normal use, small next to the
+# memory a payload holds: 256 fleet responses is the difference between a
+# bounded cache and a container restart.
+_CACHE_MAX_ENTRIES = int(os.getenv("RESPONSE_CACHE_MAX_ENTRIES", "256"))
 _CACHE_TTL: dict = {
     "dashboard": 30,
     "devices": 30,
@@ -121,9 +140,21 @@ def cache_get(namespace: str, key: tuple = ()):
     return data
 
 
+def _expired(entry, namespace: str) -> bool:
+    _, ts = entry
+    return (_time.monotonic() - ts) >= _CACHE_TTL.get(namespace, 30)
+
+
 def cache_set(namespace: str, data, key: tuple = ()):
-    """Store response in cache."""
+    """Store a response, sweeping what has expired and capping what has not."""
     _CACHE[(namespace, key)] = (data, _time.monotonic())
+    _CACHE.move_to_end((namespace, key))
+
+    for stale in [k for k, entry in _CACHE.items() if _expired(entry, k[0])]:
+        _CACHE.pop(stale, None)
+
+    while len(_CACHE) > _CACHE_MAX_ENTRIES:
+        _CACHE.popitem(last=False)
 
 
 def invalidate_caches():
