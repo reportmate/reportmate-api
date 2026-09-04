@@ -71,8 +71,35 @@ _log_handler.setFormatter(
     )
 )
 _log_handler.addFilter(_RequestIdFilter())
-logging.basicConfig(level=logging.INFO, handlers=[_log_handler])
+# LOG_LEVEL controls the application's own verbosity. INFO stays the default
+# so nothing goes quiet by surprise; production sets WARNING.
+_LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
+_LOG_LEVEL_NUM = getattr(logging, _LOG_LEVEL, logging.INFO)
+logging.basicConfig(level=_LOG_LEVEL_NUM, handlers=[_log_handler])
+# basicConfig is a no-op once the root logger already has a handler, which is
+# the case whenever uvicorn (or pytest) configured logging first. Set the level
+# explicitly so LOG_LEVEL is honoured either way.
+logging.getLogger().setLevel(_LOG_LEVEL_NUM)
 logger = logging.getLogger(__name__)
+
+# The Azure SDK's HTTP logging policy emits one line per request URL, one per
+# request header, one per response header and one per response status for
+# every SDK call -- and every ingest broadcasts to Web PubSub. Left at the
+# root logger's INFO it produced 1,596,439 lines in 2 days, 61% of this
+# service's total log volume and the majority of the Log Analytics bill, all
+# of it envelope: `'Content-Length': '512'`, `'Connection': 'keep-alive'`.
+#
+# It is pinned to WARNING rather than left to LOG_LEVEL because it is never
+# what someone raising the app's verbosity is asking for. Set
+# AZURE_SDK_LOG_LEVEL=DEBUG deliberately when debugging the SDK itself.
+_AZURE_SDK_LOG_LEVEL = os.getenv("AZURE_SDK_LOG_LEVEL", "WARNING").upper()
+for _noisy in (
+    "azure",
+    "azure.core.pipeline.policies.http_logging_policy",
+):
+    logging.getLogger(_noisy).setLevel(
+        getattr(logging, _AZURE_SDK_LOG_LEVEL, logging.WARNING)
+    )
 
 # ---------------------------------------------------------------------------
 # Endpoint response cache
@@ -1686,14 +1713,21 @@ def get_webpubsub_service():
     return _webpubsub_service
 
 
-async def broadcast_event(event_data: dict):
-    """Broadcast an event to all connected WebSocket clients."""
+def broadcast_event(event_data: dict):
+    """Broadcast an event to all connected WebSocket clients.
+
+    Deliberately a plain `def`: the Web PubSub SDK client is synchronous, so
+    `send_to_all` is a blocking HTTP call. Declaring this `async` (as it was)
+    only disguised that -- awaiting it from the ingest handler blocked the
+    event loop for the duration of the call. Callers now run in the
+    threadpool, where a blocking send belongs.
+    """
     service = get_webpubsub_service()
     if not service:
         return
     try:
         service.send_to_all(message=event_data, content_type="application/json")
-        logger.info(
+        logger.debug(
             f"Broadcast event to WebPubSub: {event_data.get('kind', 'unknown')} for {event_data.get('device', 'unknown')}"
         )
     except Exception as e:
