@@ -1061,7 +1061,9 @@ def clear_stale_installs_errors(
         # devices.last_seen is the check-in watermark the rest of the API uses.
         cursor.execute(
             """
-            SELECT i.device_id, i.data
+            SELECT i.device_id, i.data,
+                   i.cimian_errors, i.cimian_warnings,
+                   i.munki_errors, i.munki_warnings
             FROM installs i
             JOIN devices d ON d.id = i.device_id
             WHERE COALESCE(d.last_seen, i.updated_at) < %s
@@ -1072,6 +1074,7 @@ def clear_stale_installs_errors(
 
         cleared_devices = []
         aged_devices = []
+        reconciled_devices = []
 
         # Devices that ARE checking in but carry stale individual failures. The
         # query above cannot see these: their last_seen is current, so nothing
@@ -1095,14 +1098,35 @@ def clear_stale_installs_errors(
                     )
                     aged_devices.append(device_id)
 
-        for device_id, data in rows:
+        for device_id, data, ce_db, cw_db, me_db, mw_db in rows:
             if not isinstance(data, dict):
                 continue
 
-            modified = False
-
-            # Error/failed status values that the frontend flags as "Devices with Install Errors"
             modified = _clear_install_issue_fields(data)
+
+            # The counter columns are a cache of the payload, and nothing else
+            # reconciles them. A row whose payload is already clean but whose
+            # columns still say five warnings was skipped entirely - the second
+            # full-fleet run cleared 2 devices while the dashboard still showed
+            # 275 warning items against payloads with none. Rewrite the columns
+            # whenever they disagree with the payload, changed or not.
+            ce, cw, me, mw = _install_issue_counts(data)
+            stale_counters = (
+                (ce, cw, me, mw)
+                != (ce_db or 0, cw_db or 0, me_db or 0, mw_db or 0)
+            )
+            if stale_counters and not modified:
+                cursor.execute(
+                    """
+                    UPDATE installs
+                    SET cimian_errors = %s, cimian_warnings = %s,
+                        munki_errors = %s, munki_warnings = %s
+                    WHERE device_id = %s
+                    """,
+                    (ce, cw, me, mw, device_id)
+                )
+                reconciled_devices.append(device_id)
+
             if modified:
                 # The dashboard does not read this JSONB. It sums the
                 # precomputed cimian_errors/cimian_warnings/munki_errors/
@@ -1112,7 +1136,6 @@ def clear_stale_installs_errors(
                 # dashboard cards did not move at all. Recompute the counters
                 # from the cleared payload with the same helper ingest uses, in
                 # the same statement, so the two can never disagree.
-                ce, cw, me, mw = _install_issue_counts(data)
                 cursor.execute(
                     """
                     UPDATE installs
@@ -1128,7 +1151,7 @@ def clear_stale_installs_errors(
         conn.commit()
         conn.close()
 
-        if cleared_devices or aged_devices:
+        if cleared_devices or aged_devices or reconciled_devices:
             invalidate_caches()
 
         logger.info(
@@ -1140,6 +1163,7 @@ def clear_stale_installs_errors(
             "success": True,
             "cleared": len(cleared_devices),
             "clearedByItemAge": len(aged_devices),
+            "countersReconciled": len(reconciled_devices),
             "itemAgeDays": item_age_days,
             "clearedByItemAgeDevices": aged_devices,
             "totalStale": len(rows),

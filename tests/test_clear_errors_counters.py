@@ -171,3 +171,76 @@ def test_age_gated_clear_uses_the_same_flag_rule():
     assert _install_issue_counts(data)[:2] != (0, 0)
     assert _clear_stale_items_by_age(data, datetime.now(timezone.utc), 1.0) is True
     assert _install_issue_counts(data)[:2] == (0, 0)
+
+
+class _FakeCursor:
+    """Just enough cursor to drive the endpoint's two statements."""
+
+    def __init__(self, rows, updates):
+        self._rows = rows
+        self._updates = updates
+        self._pending = []
+
+    def execute(self, sql, params=()):
+        text = " ".join(sql.split())
+        if text.startswith("SELECT"):
+            self._pending = list(self._rows)
+        elif text.startswith("UPDATE installs SET cimian_errors"):
+            ce, cw, me, mw, device_id = params
+            self._updates.append((device_id, (ce, cw, me, mw)))
+        elif text.startswith("UPDATE installs SET data"):
+            _data, ce, cw, me, mw, device_id = params
+            self._updates.append((device_id, (ce, cw, me, mw)))
+        else:  # pragma: no cover - the endpoint issues no others
+            raise AssertionError(f"unexpected statement: {text[:60]}")
+
+    def fetchall(self):
+        return self._pending
+
+
+class _FakeConn:
+    def __init__(self, rows):
+        self.updates = []
+        self._rows = rows
+        self.committed = False
+
+    def cursor(self):
+        return _FakeCursor(self._rows, self.updates)
+
+    def commit(self):
+        self.committed = True
+
+    def close(self):
+        pass
+
+
+def _run_clear(conn, days):
+    import routers.admin as admin_module
+
+    original = admin_module.get_db_connection
+    admin_module.get_db_connection = lambda: conn
+    try:
+        return admin_module.clear_stale_installs_errors(days=days, item_age_days=None)
+    finally:
+        admin_module.get_db_connection = original
+
+
+def test_clean_payload_with_stale_counters_is_reconciled():
+    """A row whose payload is clean but whose counter columns are not.
+
+    The columns are a cache of the payload and nothing else reconciles them, so
+    a device in this state was invisible to the cleanup forever: the payload had
+    nothing to clear, the row was skipped, and the dashboard kept summing the
+    stale columns. Measured on the fleet as 275 warning items counted against
+    payloads holding zero.
+    """
+    data = {"cimian": {"items": [{"itemName": "A", "currentStatus": "Installed"}]}}
+    assert _install_issue_counts(data) == (0, 0, 0, 0)
+    assert _clear_install_issue_fields(data) is False
+
+    conn = _FakeConn(rows=[("SER1", data, 0, 5, 0, 0)])
+    result = _run_clear(conn, days=0)
+
+    assert result["cleared"] == 0
+    assert result["countersReconciled"] == 1
+    assert conn.updates == [("SER1", (0, 0, 0, 0))]
