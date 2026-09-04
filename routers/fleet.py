@@ -2481,6 +2481,7 @@ def get_bulk_installs_full(
             d.serial_number,
             d.device_id,
             d.last_seen,
+            i.updated_at as installs_updated_at,
             i.data as installs_data,
             COALESCE(inv.data->>'device_name', inv.data->>'deviceName') as device_name,
             inv.data->>'usage' as usage,
@@ -2512,7 +2513,7 @@ def get_bulk_installs_full(
         
         for row in rows:
             try:
-                serial_number, device_uuid, last_seen, installs_data, device_name, usage, catalog, location, asset_tag = row
+                serial_number, device_uuid, last_seen, installs_updated_at, installs_data, device_name, usage, catalog, location, asset_tag = row
                 
                 # Extract only what UI needs from installs_data
                 installs_obj = installs_data if isinstance(installs_data, dict) else {}
@@ -2521,6 +2522,18 @@ def get_bulk_installs_full(
                 
                 # Build lightweight installs structure (exclude runLog which is huge)
                 lightweight_installs = {}
+
+                # When this module was last ingested, which is NOT the same as the
+                # device's last_seen. Several payloads go up per hour carrying
+                # different module sets, and installs specifically is published by
+                # Cimian's postflight - so it refreshes on an acting Cimian session,
+                # not on every check-in. Without this a consumer cannot tell a live
+                # failure from one the device already resolved hours ago, and the
+                # only way to find out is to get onto the machine and read
+                # reports\items.json.
+                lightweight_installs['collectedAt'] = (
+                    installs_updated_at.isoformat() if installs_updated_at else None
+                )
                 
                 # Include Cimian data if present (Windows)
                 if cimian_data:
