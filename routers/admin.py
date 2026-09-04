@@ -8,7 +8,12 @@ from typing import Any, Dict, List, Optional
 from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import StreamingResponse
 
-from routers.events import _install_issue_counts
+from routers.events import (
+    _install_issue_counts,
+    _CIMIAN_ERROR_RE,
+    _CIMIAN_WARNING_RE,
+    _MUNKI_ERROR_RE,
+)
 from dependencies import (
     get_db_connection, get_maintenance_db_connection, invalidate_caches,
     load_sql, logger,
@@ -878,6 +883,48 @@ def cleanup_usage_history(
         logger.error(f"Usage history cleanup failed: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
+def _item_is_flagged(item) -> bool:
+    """Whether the dashboard counts this Cimian item as an error or a warning.
+
+    Uses the ingest's own matchers rather than a restated set of status
+    literals. The restated set is how a cleanup can report success while the
+    dashboard does not move: the counter matches any status *containing*
+    "error", "failed", "problem" or "warning", so "Install Error", "Removal
+    Failed" and "Needs Attention" were all counted and none of them were ever
+    cleared.
+    """
+    if not isinstance(item, dict):
+        return False
+    status = str(item.get("currentStatus") or "").lower()
+    return bool(
+        (item.get("lastError") or "").strip()
+        or (item.get("lastWarning") or "").strip()
+        or (item.get("failureCount", 0) or 0) > 0
+        or (item.get("warningCount", 0) or 0) > 0
+        or item.get("installLoopDetected", False)
+        or item.get("hasInstallLoop", False)
+        or _CIMIAN_ERROR_RE.search(status)
+        or _CIMIAN_WARNING_RE.search(status)
+        or status == "needs_reinstall"
+    )
+
+
+def _clear_cimian_item(item) -> None:
+    """Blank one Cimian item's issue fields in place."""
+    status = str(item.get("currentStatus") or "").lower()
+    item["lastError"] = ""
+    item["lastWarning"] = ""
+    item["failureCount"] = 0
+    item["warningCount"] = 0
+    item["installLoopDetected"] = False
+    item["hasInstallLoop"] = False
+    if (_CIMIAN_ERROR_RE.search(status) or _CIMIAN_WARNING_RE.search(status)
+            or status == "needs_reinstall"):
+        item["currentStatus"] = "Installed"
+        if item.get("mappedStatus"):
+            item["mappedStatus"] = "Installed"
+
+
 def _item_attempt_age_days(item, now) -> float | None:
     """Age in days of the last thing that actually happened to this item.
 
@@ -914,40 +961,13 @@ def _clear_stale_items_by_age(data, now, max_age_days: float) -> bool:
         return False
 
     modified = False
-    error_statuses = {"error", "failed", "problem", "needs_reinstall", "install_failed"}
-    warning_statuses = {"warning"}
-
     for item in (data.get("cimian", {}) or {}).get("items", []) or []:
-        if not isinstance(item, dict):
+        if not _item_is_flagged(item):
             continue
-        status = (item.get("currentStatus") or "").lower()
-        flagged = (
-            bool((item.get("lastError") or "").strip())
-            or bool((item.get("lastWarning") or "").strip())
-            or (item.get("failureCount", 0) or 0) > 0
-            or (item.get("warningCount", 0) or 0) > 0
-            or item.get("installLoopDetected", False)
-            or item.get("hasInstallLoop", False)
-            or status in error_statuses
-            or status in warning_statuses
-        )
-        if not flagged:
-            continue
-
         age = _item_attempt_age_days(item, now)
         if age is None or age < max_age_days:
             continue
-
-        item["lastError"] = ""
-        item["lastWarning"] = ""
-        item["failureCount"] = 0
-        item["warningCount"] = 0
-        item["installLoopDetected"] = False
-        item["hasInstallLoop"] = False
-        if status in error_statuses or status in warning_statuses:
-            item["currentStatus"] = "Installed"
-            if item.get("mappedStatus"):
-                item["mappedStatus"] = "Installed"
+        _clear_cimian_item(item)
         modified = True
 
     return modified
@@ -966,40 +986,20 @@ def _clear_install_issue_fields(data) -> bool:
 
     modified = False
 
-    error_statuses = {"error", "failed", "problem", "needs_reinstall", "install_failed"}
-    # The fleet warning count keys on currentStatus, not on lastWarning, so a
-    # cleared item left at "Warning" still counts. Reset it with the text.
-    warning_statuses = {"warning"}
-
     for item in (data.get("cimian", {}) or {}).get("items", []) or []:
-        if not isinstance(item, dict):
+        if not _item_is_flagged(item):
             continue
-        has_error = bool((item.get("lastError") or "").strip())
-        has_warning = bool((item.get("lastWarning") or "").strip())
-        has_failure = (item.get("failureCount", 0) or 0) > 0
-        has_warn_count = (item.get("warningCount", 0) or 0) > 0
-        has_loop = item.get("installLoopDetected", False) or item.get("hasInstallLoop", False)
-        status = (item.get("currentStatus") or "").lower()
-        has_error_status = status in error_statuses
-        has_warning_status = status in warning_statuses
-
-        if (has_error or has_warning or has_failure or has_warn_count
-                or has_loop or has_error_status or has_warning_status):
-            item["lastError"] = ""
-            item["lastWarning"] = ""
-            item["failureCount"] = 0
-            item["warningCount"] = 0
-            item["installLoopDetected"] = False
-            item["hasInstallLoop"] = False
-            if has_error_status or has_warning_status:
-                item["currentStatus"] = "Installed"
-                if item.get("mappedStatus"):
-                    item["mappedStatus"] = "Installed"
-            modified = True
+        _clear_cimian_item(item)
+        modified = True
 
     munki = data.get("munki", {}) or {}
     if munki:
-        for key in ("errors", "warnings", "problemInstalls"):
+        # errorItems / warningItems are the shape newer clients send and the
+        # shape the counter falls back to when no item is individually flagged.
+        # Omitting them left every Mac carrying a run-level warning list
+        # permanently counted - the cleanup reported success and the Mac
+        # warning card did not move.
+        for key in ("errors", "warnings", "problemInstalls", "errorItems", "warningItems"):
             value = munki.get(key)
             if isinstance(value, str) and value.strip():
                 munki[key] = ""
@@ -1010,14 +1010,16 @@ def _clear_install_issue_fields(data) -> bool:
         for item in munki.get("items", []) or []:
             if not isinstance(item, dict):
                 continue
-            status = (item.get("status") or "").lower()
-            cur = (item.get("currentStatus") or "").lower()
-            if ((item.get("lastError") or "").strip() or (item.get("lastWarning") or "").strip()
-                    or "fail" in status or "error" in status or "warning" in status
+            status = str(item.get("status") or "").lower()
+            cur = str(item.get("currentStatus") or "").lower()
+            flagged_status = bool(_MUNKI_ERROR_RE.search(status)) or "warning" in status
+            if ((item.get("lastError") or "").strip()
+                    or (item.get("lastWarning") or "").strip()
+                    or flagged_status
                     or cur in ("error", "warning")):
                 item["lastError"] = ""
                 item["lastWarning"] = ""
-                if "fail" in status or "error" in status or "warning" in status:
+                if flagged_status:
                     item["status"] = "installed"
                 if cur in ("error", "warning"):
                     item["currentStatus"] = "Installed"
