@@ -1386,8 +1386,13 @@ async def submit_events(request: Request):
         # delete the results of a run that has already landed.
         #
         # The module_id IS NULL arm catches the run events stored before ingest
-        # named them: a success/warning/error stamped with the run it came from.
-        # It can go once retention has aged those out.
+        # named them. Recognising those by their details would miss the legacy
+        # Munki shape, whose event carries only an 'errors' string — no session
+        # id, no module status. It does not need to: success, warning and error
+        # are emitted from the managed-software path and nowhere else, on both
+        # clients (installs / managedinstalls / munkireport on macOS,
+        # InstallsModuleProcessor alone on Windows). Everything else is info or
+        # system. This arm can go once retention has aged the unnamed rows out.
         if has_installs_module:
             cursor.execute("""
                 DELETE FROM events
@@ -1396,9 +1401,7 @@ async def submit_events(request: Request):
                   AND (
                         module_id = ANY(%s)
                         OR (module_id IS NULL
-                            AND event_type IN ('success', 'warning', 'error')
-                            AND (jsonb_exists(details, 'session_id')
-                                 OR jsonb_exists(details, 'module_status')))
+                            AND event_type IN ('success', 'warning', 'error'))
                       )
             """, (serial_number, collected_at, list(INSTALLS_EVENT_MODULES)))
             if cursor.rowcount:

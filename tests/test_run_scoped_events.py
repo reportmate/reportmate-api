@@ -60,13 +60,32 @@ def test_the_sweep_runs_on_the_module_not_on_the_events(submit_events_src):
 
 
 def test_legacy_events_without_a_module_id_are_swept_too(submit_events_src):
-    # Rows stored before ingest named the module carry no module_id; they are
-    # recognisable as a run's own events by the run they are stamped with.
+    # Rows stored before ingest named the module carry no module_id, and the
+    # event types are enough to find them: success, warning and error come from
+    # the managed-software path on both clients and from nowhere else.
     delete = submit_events_src[submit_events_src.index("DELETE FROM events"):]
     delete = delete[: delete.index('"""')]
     assert "module_id IS NULL" in delete
-    assert "jsonb_exists(details, 'session_id')" in delete
-    assert "jsonb_exists(details, 'module_status')" in delete
+    assert "event_type IN ('success', 'warning', 'error')" in delete
+
+
+def test_the_legacy_arm_does_not_key_on_details(submit_events_src):
+    # A device on Munki without the structured reports sends its errors as one
+    # event whose details are a single 'errors' string -- no session_id, no
+    # module_status. Matching on those keys silently skipped every such device.
+    delete = submit_events_src[submit_events_src.index("DELETE FROM events"):]
+    delete = delete[: delete.index('"""')]
+    assert "jsonb_exists" not in delete
+
+
+def test_the_legacy_munki_modules_are_swept_by_name_too():
+    from routers.events import INSTALLS_EVENT_MODULES
+
+    # Once a client sends moduleId, a Munki run without structured reports
+    # names itself managedinstalls (its installs and removals) and munkireport
+    # (its errors and warnings), never installs.
+    assert "managedinstalls" in INSTALLS_EVENT_MODULES
+    assert "munkireport" in INSTALLS_EVENT_MODULES
 
 
 def test_events_are_stored_with_their_module_id(submit_events_src):
