@@ -29,6 +29,13 @@ from dependencies import (
 
 router = APIRouter(tags=["events"])
 
+# Events that report the outcome of a managed-software run, keyed by the module
+# they belong to. A run re-derives the device's state from scratch, so its events
+# replace the previous run's instead of accumulating: the run that fixes a
+# problem is what clears it. Everything else (collection summaries, reboots)
+# stays a timeline and keeps its history.
+INSTALLS_EVENT_MODULES = ('installs', 'managedinstalls', 'munkireport')
+
 _CIMIAN_ERROR_RE = re.compile(r'(error|failed|problem|install-error)')
 _CIMIAN_WARNING_RE = re.compile(r'(warning|needs-attention)')
 _MUNKI_ERROR_RE = re.compile(r'(error|failed)')
@@ -1370,13 +1377,44 @@ async def submit_events(request: Request):
         
         # Check if installs module is present in payload
         has_installs_module = 'installs' in modules_data and modules_data['installs']
-        
+
+        # This payload carries a fresh managed-software run, so the previous run's
+        # events no longer describe the device. Clear them before inserting, even
+        # when the new run produced no events of its own — a quiet run is exactly
+        # the case where a stale error would otherwise sit on the device forever.
+        # Scoped to rows this run is newer than, so a late-arriving payload cannot
+        # delete the results of a run that has already landed.
+        #
+        # The module_id IS NULL arm catches the run events stored before ingest
+        # named them: a success/warning/error stamped with the run it came from.
+        # It can go once retention has aged those out.
+        if has_installs_module:
+            cursor.execute("""
+                DELETE FROM events
+                WHERE device_id = %s
+                  AND timestamp <= %s
+                  AND (
+                        module_id = ANY(%s)
+                        OR (module_id IS NULL
+                            AND event_type IN ('success', 'warning', 'error')
+                            AND (jsonb_exists(details, 'session_id')
+                                 OR jsonb_exists(details, 'module_status')))
+                      )
+            """, (serial_number, collected_at, list(INSTALLS_EVENT_MODULES)))
+            if cursor.rowcount:
+                logger.info(f"Superseded {cursor.rowcount} installs event(s) for device {serial_number}")
+
         for event in payload_events:
             try:
                 event_type = event.get('eventType', 'info').lower()  # Normalize to lowercase
                 message = event.get('message', 'Event from device')
                 details = event.get('details', {})
-                module_id = event.get('moduleId', None)  # For upsert: os_update events are one per device
+                module_id = event.get('moduleId') or event.get('module_id') or None
+                # Clients that predate moduleId on the wire still send the run's
+                # outcome as a success/warning/error event alongside the module;
+                # name it so it is superseded with the rest of the run.
+                if not module_id and has_installs_module and event_type in {'success', 'warning', 'error'}:
+                    module_id = 'installs'
                 
                 # VALIDATION: Events containing installs module MUST be success/warning/error
                 if has_installs_module or (isinstance(details, dict) and details.get('module_status') in ['success', 'warning', 'error']):
@@ -1393,28 +1431,21 @@ async def submit_events(request: Request):
                 
                 # Store enhanced details as JSON
                 details_json = json.dumps(enhanced_details)
-                
-                # Upsert for module-scoped events (e.g., os_update) — latest only per device
-                if module_id and module_id == 'os_update':
+
+                # An os_update event is only sent when the version changed, so the
+                # previous one is superseded here rather than by the sweep above.
+                if module_id == 'os_update':
                     cursor.execute("""
-                        INSERT INTO events (device_id, event_type, module_id, message, details, timestamp, created_at)
-                        VALUES (%s, %s, %s, %s, %s::jsonb, %s, %s)
-                        ON CONFLICT (device_id, module_id) WHERE module_id IS NOT NULL
-                        DO UPDATE SET event_type = EXCLUDED.event_type,
-                                      message = EXCLUDED.message,
-                                      details = EXCLUDED.details,
-                                      timestamp = EXCLUDED.timestamp,
-                                      created_at = EXCLUDED.created_at
-                        RETURNING id
-                    """, (serial_number, event_type, module_id, message, details_json, collected_at, datetime.now(timezone.utc)))
-                    logger.info(f"Upserted os_update event for device {serial_number}: {message}")
-                else:
-                    # NOTE: events.device_id references devices.id which equals serial_number
-                    cursor.execute("""
-                        INSERT INTO events (device_id, event_type, message, details, timestamp, created_at)
-                        VALUES (%s, %s, %s, %s::jsonb, %s, %s)
-                        RETURNING id
-                    """, (serial_number, event_type, message, details_json, collected_at, datetime.now(timezone.utc)))
+                        DELETE FROM events
+                        WHERE device_id = %s AND module_id = 'os_update' AND timestamp <= %s
+                    """, (serial_number, collected_at))
+
+                # NOTE: events.device_id references devices.id which equals serial_number
+                cursor.execute("""
+                    INSERT INTO events (device_id, event_type, module_id, message, details, timestamp, created_at)
+                    VALUES (%s, %s, %s, %s, %s::jsonb, %s, %s)
+                    RETURNING id
+                """, (serial_number, event_type, module_id, message, details_json, collected_at, datetime.now(timezone.utc)))
                 
                 event_row = cursor.fetchone()
                 event_id = event_row[0] if event_row else None
