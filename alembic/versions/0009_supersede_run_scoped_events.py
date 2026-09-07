@@ -30,34 +30,48 @@ branch_labels = None
 depends_on = None
 
 
+def _tolerant(stmt: str) -> str:
+    # Same pattern as 0001 and 0003: swallow only "table does not exist", so a
+    # fresh database (where events is created by ingestion, not the baseline)
+    # migrates cleanly.
+    body = stmt.replace("'", "''")
+    return (
+        "DO $$ BEGIN "
+        f"EXECUTE '{body}'; "
+        "EXCEPTION WHEN undefined_table THEN NULL; "
+        "END $$;"
+    )
+
+
+# The unique index admits one row per (device, module), so a run that reported
+# both a success and a warning has to lose one before it can be recreated.
+# Going back is lossy.
+_COLLAPSE_TO_ONE_PER_MODULE = """
+    DELETE FROM events e
+    USING (
+        SELECT device_id, module_id, MAX(id) AS keep
+        FROM events
+        WHERE module_id IS NOT NULL
+        GROUP BY device_id, module_id
+    ) newest
+    WHERE e.device_id = newest.device_id
+      AND e.module_id = newest.module_id
+      AND e.id <> newest.keep
+"""
+
+
 def upgrade() -> None:
-    op.execute("DROP INDEX IF EXISTS idx_events_device_module_upsert")
-    op.execute(
+    op.execute(_tolerant("DROP INDEX IF EXISTS idx_events_device_module_upsert"))
+    op.execute(_tolerant(
         "CREATE INDEX IF NOT EXISTS idx_events_device_module "
         "ON events(device_id, module_id) WHERE module_id IS NOT NULL"
-    )
+    ))
 
 
 def downgrade() -> None:
-    op.execute("DROP INDEX IF EXISTS idx_events_device_module")
-    # The unique index admits one row per (device, module), so a run that
-    # reported both a success and a warning has to lose one before it can be
-    # recreated. Going back is lossy.
-    op.execute(
-        """
-        DELETE FROM events e
-        USING (
-            SELECT device_id, module_id, MAX(id) AS keep
-            FROM events
-            WHERE module_id IS NOT NULL
-            GROUP BY device_id, module_id
-        ) newest
-        WHERE e.device_id = newest.device_id
-          AND e.module_id = newest.module_id
-          AND e.id <> newest.keep
-        """
-    )
-    op.execute(
+    op.execute(_tolerant("DROP INDEX IF EXISTS idx_events_device_module"))
+    op.execute(_tolerant(_COLLAPSE_TO_ONE_PER_MODULE))
+    op.execute(_tolerant(
         "CREATE UNIQUE INDEX IF NOT EXISTS idx_events_device_module_upsert "
         "ON events(device_id, module_id) WHERE module_id IS NOT NULL"
-    )
+    ))
