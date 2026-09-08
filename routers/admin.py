@@ -9,6 +9,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import StreamingResponse
 
 from install_status import (
+    stamp_items as _stamp_install_items,
     _CIMIAN_ERROR_RE,
     _CIMIAN_WARNING_RE,
     _MUNKI_ERROR_RE,
@@ -1176,6 +1177,114 @@ def clear_stale_installs_errors(
     except Exception as e:
         logger.error(f"Installs error cleanup failed: {e}")
         raise HTTPException(status_code=500, detail=f"Installs error cleanup failed: {str(e)}")
+
+@router.post("/admin/installs/reclassify", dependencies=[Depends(verify_authentication)], tags=["admin"])
+def reclassify_stored_installs(
+    batch: int = Query(default=200, ge=1, le=1000, description="Rows to read per batch; the write is one statement per changed row"),
+    limit: int | None = Query(default=None, ge=1, description="Stop after this many rows, for a rehearsal against part of the fleet"),
+):
+    """
+    Re-run the install-item classifier over stored installs rows.
+
+    Every item carries the state ingest decided for it, and the four counter
+    columns the dashboard reads are stamped at the same moment. Both therefore
+    reflect whatever the classifier said on that device's last check-in, so a
+    change to the classifier reaches a device only when it next reports — up to
+    an hour for a lab machine, and far longer for a laptop that sleeps.
+
+    This applies the current classifier to what is already stored, so the fleet
+    agrees with the code immediately. It is the same two functions ingest calls,
+    not a second implementation, and it is idempotent: a row whose stamps and
+    counters already match is left untouched, so the JSONB is not rewritten and
+    the TOAST churn that would come with it is avoided.
+
+    Batched and manual, never automated — the database is IOPS-constrained and a
+    table-wide rewrite belongs off the request path of every other caller.
+
+    **Authentication Required:**
+    - Windows clients: X-API-PASSPHRASE header
+    - Azure resources: X-MS-CLIENT-PRINCIPAL-ID header (Managed Identity)
+    """
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+
+        scanned = 0
+        changed = 0
+        last_id = 0
+        moved = []
+
+        while True:
+            remaining = None if limit is None else max(0, limit - scanned)
+            if remaining == 0:
+                break
+            size = batch if remaining is None else min(batch, remaining)
+            cursor.execute(
+                """
+                SELECT id, device_id, data, cimian_errors, cimian_warnings, munki_errors, munki_warnings
+                FROM installs
+                WHERE id > %s
+                ORDER BY id
+                LIMIT %s
+                """,
+                (last_id, size),
+            )
+            rows = cursor.fetchall()
+            if not rows:
+                break
+
+            for row_id, device_id, data, ce_old, cw_old, me_old, mw_old in rows:
+                last_id = row_id
+                scanned += 1
+                if not isinstance(data, dict):
+                    continue
+
+                before = json.dumps(data, sort_keys=True)
+                stamped = _stamp_install_items(data)
+                after = json.dumps(stamped, sort_keys=True)
+                ce, cw, me, mw = _install_issue_counts(stamped)
+
+                counters_moved = (ce, cw, me, mw) != (ce_old or 0, cw_old or 0, me_old or 0, mw_old or 0)
+                if before == after and not counters_moved:
+                    continue
+
+                cursor.execute(
+                    """
+                    UPDATE installs
+                    SET data = %s::jsonb,
+                        cimian_errors = %s, cimian_warnings = %s,
+                        munki_errors = %s, munki_warnings = %s,
+                        updated_at = %s
+                    WHERE id = %s
+                    """,
+                    (after, ce, cw, me, mw, datetime.now(timezone.utc), row_id),
+                )
+                changed += 1
+                if counters_moved and len(moved) < 50:
+                    moved.append({
+                        "device_id": device_id,
+                        "before": {"cimian_errors": ce_old, "cimian_warnings": cw_old,
+                                   "munki_errors": me_old, "munki_warnings": mw_old},
+                        "after": {"cimian_errors": ce, "cimian_warnings": cw,
+                                  "munki_errors": me, "munki_warnings": mw},
+                    })
+
+            conn.commit()
+
+        conn.close()
+        invalidate_caches()
+        logger.info(f"Reclassified stored installs: scanned={scanned} changed={changed}")
+        return {
+            "success": True,
+            "scanned": scanned,
+            "changed": changed,
+            "countersMoved": len(moved),
+            "sample": moved,
+        }
+    except Exception as e:
+        logger.error(f"Failed to reclassify stored installs: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to reclassify stored installs: {e}")
+
 
 @router.get("/debug/database", dependencies=[Depends(verify_authentication)], tags=["admin"])
 def debug_database():
