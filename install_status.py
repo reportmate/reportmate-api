@@ -16,15 +16,16 @@ consumer was asked.
 
 This module is the single ladder, applied identically to both platforms:
 
-1. A status that names a problem or an intention -- Error, Warning, Pending --
-   is the answer, from ``currentStatus``, ``mappedStatus`` or ``status``.
-2. Otherwise the status only claims the package is *present* (Installed,
-   Removed), which is not a claim that the last attempt went well. Both tools
-   report an item as Installed while recording a failed or warned attempt
-   against it, so ``lastAttemptStatus`` and then ``lastError`` / ``lastWarning``
-   decide -- and they are also all that legacy Munki, which has no normalized
-   status at all, ever provides.
-3. Failing all of that, the presence status stands, or the item is left
+1. A status that names a *problem* -- Error or Warning -- is the answer, from
+   ``currentStatus``, ``mappedStatus`` or ``status``.
+2. Every other status describes where the item stands, not how the last attempt
+   went. Installed is a claim about presence, and Pending says an install is
+   owed -- often owed precisely because the last attempt warned. Both tools
+   report an item that way while recording the failure against it, so
+   ``lastAttemptStatus`` and then ``lastError`` / ``lastWarning`` decide. They
+   are also all that legacy Munki, which has no normalized status at all, ever
+   provides.
+3. Failing all of that, the standing status is the answer, or the item is left
    unclassified.
 
 An item the install-loop guard has flagged is at least a warning, whatever its
@@ -109,16 +110,25 @@ def _state_from_status(raw: Any) -> Optional[str]:
     return None
 
 
+def _is_true(value: Any) -> bool:
+    """A flag that arrives as a bool from one client and a number from the other."""
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return value != 0
+    if isinstance(value, str):
+        return value.strip().lower() in ("true", "yes", "1")
+    return False
+
+
 def _has_install_loop(item: Dict[str, Any]) -> bool:
     """Whether the install-loop guard flagged this item, under either name.
 
-    Cimian writes both hasInstallLoop and installLoopDetected; the Mac client
-    forwards only the first, and only when the fork set it. Read either.
+    Cimian writes both hasInstallLoop and installLoopDetected as booleans; the
+    Mac client forwards only the first, and it arrives as 1 rather than true.
+    Read either name, and accept either spelling of the value.
     """
-    for key in ("hasInstallLoop", "installLoopDetected"):
-        if item.get(key) is True:
-            return True
-    return False
+    return any(_is_true(item.get(k)) for k in ("hasInstallLoop", "installLoopDetected"))
 
 
 def classify_item(item: Any) -> Optional[str]:
@@ -126,13 +136,16 @@ def classify_item(item: Any) -> Optional[str]:
     if not isinstance(item, dict):
         return None
 
-    presence = None
+    # Only a status that names a *problem* settles it. Installed, Removed and
+    # Pending all describe where the item stands, not how the last attempt went,
+    # and an item can be pending precisely because its last attempt warned.
+    standing = None
     for key in ("currentStatus", "mappedStatus", "status"):
         state = _state_from_status(item.get(key))
-        if state in (ERROR, WARNING, PENDING):
-            return WARNING if state != ERROR and _has_install_loop(item) else state
-        if state is not None and presence is None:
-            presence = state  # Installed / Removed: presence, not outcome.
+        if state in (ERROR, WARNING):
+            return state
+        if state is not None and standing is None:
+            standing = state
 
     attempt = _state_from_status(item.get("lastAttemptStatus"))
     if attempt in (ERROR, WARNING):
@@ -143,7 +156,7 @@ def classify_item(item: Any) -> Optional[str]:
         return ERROR
     if _text(item.get("lastWarning")) or _has_install_loop(item):
         return WARNING
-    return presence
+    return standing
 
 
 def _items(source: Dict[str, Any]) -> List[Dict[str, Any]]:

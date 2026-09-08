@@ -169,3 +169,26 @@ def test_an_unclassifiable_item_carries_no_stale_stamp():
 def test_a_payload_that_is_not_a_dict_is_returned_untouched():
     assert stamp_items(None) is None
     assert install_issue_counts(None) == (0, 0, 0, 0)
+
+
+# --- pending is a standing, not a verdict on the last attempt --------------
+
+def test_a_pending_item_keeps_the_warning_its_attempt_recorded():
+    # Munki reports these as pending_install with the message attached. Letting
+    # the Pending status win dropped 36 real warnings across 16 Macs.
+    item = {"status": "pending_install", "currentStatus": "Pending",
+            "lastWarning": "Download of Excel failed: error -1001"}
+    assert classify_item(item) == WARNING
+
+
+def test_a_clean_pending_item_stays_pending():
+    assert classify_item({"currentStatus": "Pending"}) == PENDING
+
+
+def test_the_loop_flag_is_read_whether_it_arrives_as_true_or_as_one():
+    # Cimian sends a boolean; the Mac client's value arrives as 1, so an
+    # identity check against True missed every real Munki loop.
+    assert classify_item({"currentStatus": "Installed", "hasInstallLoop": 1}) == WARNING
+    assert classify_item({"currentStatus": "Installed", "hasInstallLoop": True}) == WARNING
+    assert classify_item({"currentStatus": "Installed", "hasInstallLoop": 0}) == INSTALLED
+    assert classify_item({"currentStatus": "Installed", "hasInstallLoop": "false"}) == INSTALLED
