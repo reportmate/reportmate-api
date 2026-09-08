@@ -1248,16 +1248,21 @@ def reclassify_stored_installs(
                 if before == after and not counters_moved:
                     continue
 
+                # updated_at is deliberately untouched: /installs/full reports it
+                # as collectedAt, so stamping it here would present a maintenance
+                # rewrite as a fresh check-in. A sweep over the whole table would
+                # otherwise make every long-dead device look like it had just
+                # reported, and anything using collectedAt as a freshness key
+                # would believe it.
                 cursor.execute(
                     """
                     UPDATE installs
                     SET data = %s::jsonb,
                         cimian_errors = %s, cimian_warnings = %s,
-                        munki_errors = %s, munki_warnings = %s,
-                        updated_at = %s
+                        munki_errors = %s, munki_warnings = %s
                     WHERE id = %s
                     """,
-                    (after, ce, cw, me, mw, datetime.now(timezone.utc), row_id),
+                    (after, ce, cw, me, mw, row_id),
                 )
                 changed += 1
                 if counters_moved and len(moved) < 50:
