@@ -28,6 +28,16 @@ This module is the single ladder, applied identically to both platforms:
    is not evidence: every such mismatch in the fleet carried no message, no
    failureCount and no warningCount.
 
+``lastError`` / ``lastWarning`` only count when the run actually reported them.
+The Mac client also scrapes warning text out of the Munki run log and attaches
+it to an item by name -- "Download of Excel failed: The network connection was
+lost." lands on Excel -- without the run ever raising a structured warning for
+it. Nothing downstream can show those: events are built from the session's
+warningItems, so the item would be counted while no event could exist. The run's
+own attribution stamps ``lastSeenInSession``; the log scrape leaves it empty,
+which is how the two are told apart. A payload with no sessions at all predates
+that stamp, so its messages still count.
+
 An item the install-loop guard has flagged is at least a warning, whatever its
 status says. Both tools detect loops -- Cimian in its own items.json, Munki in
 the fork's LoopGuard -- but neither reliably says so in the status: Cimian's
@@ -121,6 +131,18 @@ def _is_true(value: Any) -> bool:
     return False
 
 
+def _run_reported(item: Dict[str, Any], has_sessions: bool) -> bool:
+    """Whether the run itself attributed this message, rather than a log scrape.
+
+    The fork stamps lastSeenInSession when a warning or error comes from the
+    session's own warningItems/errorItems. Text the client matched to an item by
+    parsing the run log carries no stamp and produces no event.
+    """
+    if not has_sessions:
+        return True
+    return bool(_text(item.get("lastSeenInSession")))
+
+
 def _has_install_loop(item: Dict[str, Any]) -> bool:
     """Whether the install-loop guard flagged this item, under either name.
 
@@ -131,7 +153,7 @@ def _has_install_loop(item: Dict[str, Any]) -> bool:
     return any(_is_true(item.get(k)) for k in ("hasInstallLoop", "installLoopDetected"))
 
 
-def classify_item(item: Any) -> Optional[str]:
+def classify_item(item: Any, has_sessions: bool = False) -> Optional[str]:
     """The state of one reported item, by the shared ladder."""
     if not isinstance(item, dict):
         return None
@@ -163,9 +185,12 @@ def classify_item(item: Any) -> Optional[str]:
     if attempt in (ERROR, WARNING):
         return attempt
 
-    if _text(item.get("lastError")):
-        return ERROR
-    if _text(item.get("lastWarning")) or _has_install_loop(item):
+    if _run_reported(item, has_sessions):
+        if _text(item.get("lastError")):
+            return ERROR
+        if _text(item.get("lastWarning")):
+            return WARNING
+    if _has_install_loop(item):
         return WARNING
     return verdict or presence
 
@@ -204,8 +229,9 @@ def stamp_items(module_data: Any) -> Any:
         source = module_data.get(platform)
         if not isinstance(source, dict):
             continue
+        has_sessions = bool(source.get("sessions"))
         for item in _items(source):
-            state = classify_item(item)
+            state = classify_item(item, has_sessions)
             if state is None:
                 item.pop(STATE_FIELD, None)
             else:
@@ -217,7 +243,8 @@ def _counts_for(source: Any) -> Tuple[int, int]:
     """(errors, warnings) for one platform's section of the installs module."""
     if not isinstance(source, dict):
         return (0, 0)
-    states = [classify_item(i) for i in _items(source)]
+    has_sessions = bool(source.get("sessions"))
+    states = [classify_item(i, has_sessions) for i in _items(source)]
     errors = sum(1 for s in states if s == ERROR)
     warnings = sum(1 for s in states if s == WARNING)
     # Run-level problems stand in only when no item carried one, so a run whose
@@ -250,8 +277,9 @@ def item_state_totals(module_data: Any) -> Dict[str, int]:
         source = data.get(platform)
         if not isinstance(source, dict):
             continue
+        has_sessions = bool(source.get("sessions"))
         for item in _items(source):
-            state = classify_item(item)
+            state = classify_item(item, has_sessions)
             if state in totals:
                 totals[state] += 1
     return totals

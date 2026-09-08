@@ -208,3 +208,41 @@ def test_the_loop_flag_is_read_whether_it_arrives_as_true_or_as_one():
     assert classify_item({"currentStatus": "Installed", "hasInstallLoop": True}) == WARNING
     assert classify_item({"currentStatus": "Installed", "hasInstallLoop": 0}) == INSTALLED
     assert classify_item({"currentStatus": "Installed", "hasInstallLoop": "false"}) == INSTALLED
+
+
+# --- only what the run reported counts -------------------------------------
+
+def test_a_log_scraped_warning_does_not_count():
+    # The Mac client parses warning text out of the Munki run log and attaches
+    # it to an item by name, without the run raising a structured warning. No
+    # event can ever be built from that, so counting it put 10 devices on the
+    # dashboard that the events feed could not show.
+    scraped = {"itemName": "Excel", "currentStatus": "Pending", "lastSeenInSession": "",
+               "lastWarning": "Download of Excel failed: The network connection was lost."}
+    data = {"munki": {"items": [scraped], "sessions": [{"session_id": "2026-09-08-0653"}]}}
+    assert classify_item(scraped, has_sessions=True) == PENDING
+    assert install_issue_counts(data)[3] == 0
+
+
+def test_a_warning_the_run_attributed_still_counts():
+    # The fork stamps lastSeenInSession when the warning came from the
+    # session's own warningItems.
+    reported = {"itemName": "Excel", "currentStatus": "Pending",
+                "lastSeenInSession": "2026-09-08-0653", "lastWarning": "Install failed"}
+    data = {"munki": {"items": [reported], "sessions": [{"session_id": "2026-09-08-0653"}]}}
+    assert install_issue_counts(data)[3] == 1
+
+
+def test_a_payload_with_no_sessions_still_counts_its_messages():
+    # Munki without the fork's session reports predates the stamp; its messages
+    # are all it has, and they do produce events.
+    data = {"munki": {"items": [{"status": "installed", "lastError": "Installer returned 1"}]}}
+    assert install_issue_counts(data)[2] == 1
+
+
+def test_a_held_loop_counts_even_without_a_session_stamp():
+    # The loop guard deliberately keeps its holds out of the run's warning
+    # report, so the stamp is absent by design.
+    held = {"currentStatus": "Installed", "lastSeenInSession": "", "hasInstallLoop": True}
+    data = {"cimian": {"items": [held], "sessions": [{"session_id": "s1"}]}}
+    assert install_issue_counts(data)[1] == 1
