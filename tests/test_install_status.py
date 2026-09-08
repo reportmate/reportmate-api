@@ -53,12 +53,28 @@ def test_a_status_naming_a_failure_beats_the_word_install_inside_it():
 
 # --- presence is not an outcome --------------------------------------------
 
-def test_installed_does_not_mask_a_failed_attempt():
-    # Both tools report an item as Installed while recording that the most
-    # recent attempt failed. Reading the status alone loses every one of them.
+def test_installed_is_a_verdict_and_a_bare_attempt_status_does_not_override_it():
+    # An installed item is a good item: its last attempt succeeded, or it would
+    # not be installed. Across 876 live devices every Installed item carrying a
+    # failed or warning lastAttemptStatus had no message, failureCount 0 and
+    # warningCount 0 -- stale data, not a failure. Believing it turned 5 Windows
+    # devices with errors into 23.
+    assert classify_item({"currentStatus": "Installed", "lastAttemptStatus": "Failed"}) == INSTALLED
+    assert classify_item({"currentStatus": "Installed", "lastAttemptStatus": "Warning"}) == INSTALLED
+    assert classify_item({"currentStatus": "Removed", "lastAttemptStatus": "Error"}) == REMOVED
+
+
+def test_legacy_status_is_presence_not_a_verdict():
+    # Munki without the fork writes only `status`, which says the package is
+    # there -- it is not the tool's judgement on the run, so a message still
+    # speaks.
     assert classify_item({"status": "installed", "lastError": "Installer returned 1"}) == ERROR
-    assert classify_item({"currentStatus": "Installed", "lastAttemptStatus": "Failed"}) == ERROR
-    assert classify_item({"currentStatus": "Installed", "lastAttemptStatus": "Warning"}) == WARNING
+    assert classify_item({"status": "installed", "lastWarning": "Download failed"}) == WARNING
+
+
+def test_the_attempt_record_still_speaks_when_there_is_no_verdict():
+    assert classify_item({"lastAttemptStatus": "Failed"}) == ERROR
+    assert classify_item({"lastAttemptStatus": "Warning"}) == WARNING
 
 
 def test_a_status_that_names_a_problem_wins_over_the_message():

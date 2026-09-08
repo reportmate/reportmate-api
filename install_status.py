@@ -16,17 +16,17 @@ consumer was asked.
 
 This module is the single ladder, applied identically to both platforms:
 
-1. A status that names a *problem* -- Error or Warning -- is the answer, from
-   ``currentStatus``, ``mappedStatus`` or ``status``.
-2. Every other status describes where the item stands, not how the last attempt
-   went. Installed is a claim about presence, and Pending says an install is
-   owed -- often owed precisely because the last attempt warned. Both tools
-   report an item that way while recording the failure against it, so
-   ``lastAttemptStatus`` and then ``lastError`` / ``lastWarning`` decide. They
-   are also all that legacy Munki, which has no normalized status at all, ever
-   provides.
-3. Failing all of that, the standing status is the answer, or the item is left
-   unclassified.
+1. ``currentStatus`` / ``mappedStatus`` is the tool's verdict after the run.
+   Error and Warning settle it, and so do Installed and Removed: an installed
+   item is a good item, and its last attempt succeeded by definition.
+2. Pending is the exception, because it says an install is still owed -- often
+   owed precisely because the last attempt warned -- so the messages still
+   speak. Legacy Munki's ``status`` is likewise only a statement about
+   presence, not a verdict.
+3. With no verdict, ``lastAttemptStatus`` and then ``lastError`` /
+   ``lastWarning`` decide. Against a verdict of Installed, ``lastAttemptStatus``
+   is not evidence: every such mismatch in the fleet carried no message, no
+   failureCount and no warningCount.
 
 An item the install-loop guard has flagged is at least a warning, whatever its
 status says. Both tools detect loops -- Cimian in its own items.json, Munki in
@@ -136,27 +136,38 @@ def classify_item(item: Any) -> Optional[str]:
     if not isinstance(item, dict):
         return None
 
-    # Only a status that names a *problem* settles it. Installed, Removed and
-    # Pending all describe where the item stands, not how the last attempt went,
-    # and an item can be pending precisely because its last attempt warned.
-    standing = None
-    for key in ("currentStatus", "mappedStatus", "status"):
-        state = _state_from_status(item.get(key))
-        if state in (ERROR, WARNING):
-            return state
-        if state is not None and standing is None:
-            standing = state
+    # currentStatus / mappedStatus are the tool's verdict after the run. If it
+    # says Installed or Removed, the item is good and the last attempt
+    # succeeded by definition -- that is what installed means.
+    verdict = None
+    for key in ("currentStatus", "mappedStatus"):
+        verdict = _state_from_status(item.get(key))
+        if verdict is not None:
+            break
+    if verdict in (ERROR, WARNING):
+        return verdict
+    if verdict in (INSTALLED, REMOVED):
+        return WARNING if _has_install_loop(item) else verdict
 
+    # Legacy Munki has no verdict, only `status`, which is a factual statement
+    # about presence. It cannot settle whether the run went well.
+    presence = _state_from_status(item.get("status"))
+    if presence in (ERROR, WARNING):
+        return presence
+
+    # No verdict: now the attempt record is the best thing available. It is only
+    # consulted here -- against a verdict of Installed it is not evidence of
+    # anything. Across the fleet every such mismatch carried no message, no
+    # failureCount and no warningCount, which is stale data, not a failure.
     attempt = _state_from_status(item.get("lastAttemptStatus"))
     if attempt in (ERROR, WARNING):
-        return WARNING if attempt != ERROR and _has_install_loop(item) else attempt
+        return attempt
 
-    # An error outranks a warning on the same item.
     if _text(item.get("lastError")):
         return ERROR
     if _text(item.get("lastWarning")) or _has_install_loop(item):
         return WARNING
-    return standing
+    return verdict or presence
 
 
 def _items(source: Dict[str, Any]) -> List[Dict[str, Any]]:
