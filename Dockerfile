@@ -28,6 +28,7 @@ COPY metrics.py .
 COPY pagination.py .
 COPY rate_limit.py .
 COPY log_tails.py .
+COPY install_status.py .
 COPY routers/ ./routers/
 COPY sql/ ./sql/
 
