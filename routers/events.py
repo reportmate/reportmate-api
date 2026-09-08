@@ -17,6 +17,11 @@ from slowapi.util import get_remote_address
 
 from starlette.requests import ClientDisconnect
 
+from install_status import (
+    install_issue_counts as _install_issue_counts,
+    stamp_items as _stamp_install_items,
+)
+
 from dependencies import (
     broadcast_event, cache_get, cache_set, get_db_connection,
     load_sql, logger, paginate,
@@ -35,66 +40,6 @@ router = APIRouter(tags=["events"])
 # problem is what clears it. Everything else (collection summaries, reboots)
 # stays a timeline and keeps its history.
 INSTALLS_EVENT_MODULES = ('installs', 'managedinstalls', 'munkireport')
-
-_CIMIAN_ERROR_RE = re.compile(r'(error|failed|problem|install-error)')
-_CIMIAN_WARNING_RE = re.compile(r'(warning|needs-attention)')
-_MUNKI_ERROR_RE = re.compile(r'(error|failed)')
-
-
-def _install_issue_counts(module_data):
-    """Per-device install error/warning counts for the installs module.
-
-    Mirrors the status-matching rules the dashboard aggregate uses (and the
-    backfill in migration 0003), so the precomputed columns agree with what
-    the dashboard previously derived from the JSONB at read time."""
-    def _items(source):
-        items = (((module_data or {}).get(source) or {}).get('items')) or []
-        return items if isinstance(items, list) else []
-
-    def _status(item, key):
-        return str(item.get(key) or '').lower() if isinstance(item, dict) else ''
-
-    cimian = [_status(i, 'currentStatus') for i in _items('cimian')]
-
-    # Munki items carry a MunkiReport-style status (installed, pending_install,
-    # install_failed) that never says "warning"; a Munki warning lives on the
-    # item as lastWarning / currentStatus (newer clients) or on the run as
-    # warningItems / the semicolon-joined warnings string. Count an item once
-    # whichever way it arrived, and fall back to the run-level list when no item
-    # is named so the device still registers.
-    munki_items = _items('munki')
-    munki_run = (module_data or {}).get('munki') or {}
-
-    def _text(item, key):
-        return str(item.get(key) or '').strip() if isinstance(item, dict) else ''
-
-    def _run_list(key, legacy_key):
-        entries = munki_run.get(key)
-        if isinstance(entries, list):
-            return [e for e in entries if isinstance(e, dict) and (e.get('message') or e.get('name'))]
-        legacy = munki_run.get(legacy_key)
-        if isinstance(legacy, str) and legacy.strip():
-            return [{'message': part.strip()} for part in legacy.split(';') if part.strip()]
-        return []
-
-    munki_error_items = sum(
-        1 for i in munki_items
-        if _MUNKI_ERROR_RE.search(_status(i, 'status')) or _status(i, 'currentStatus') == 'error' or _text(i, 'lastError')
-    )
-    munki_warning_items = sum(
-        1 for i in munki_items
-        if 'warning' in _status(i, 'status') or _status(i, 'currentStatus') == 'warning'
-        or (_text(i, 'lastWarning') and not _text(i, 'lastError'))
-    )
-    munki_errors = munki_error_items or len(_run_list('errorItems', 'errors'))
-    munki_warnings = munki_warning_items or len(_run_list('warningItems', 'warnings'))
-    return (
-        sum(1 for s in cimian if _CIMIAN_ERROR_RE.search(s) or s == 'needs_reinstall'),
-        sum(1 for s in cimian if _CIMIAN_WARNING_RE.search(s)),
-        munki_errors,
-        munki_warnings,
-    )
-
 
 def _run_retention_purge():
     """Delete expired events/idempotency keys in bounded batches.
@@ -1093,7 +1038,14 @@ async def submit_events(request: Request):
             if module_name in modules_data and modules_data[module_name]:
                 try:
                     module_data = modules_data[module_name]
-                    
+
+                    # Classify each install item once, here, and store the answer
+                    # on the item. Ingest, the dashboard aggregate and the web
+                    # each used to decide this for themselves and disagreed; the
+                    # stored state is now the single answer they all read.
+                    if module_name == 'installs':
+                        module_data = _stamp_install_items(module_data)
+
                     # STANDARD HANDLING: All modules store in their table with data JSONB
                     # Check if module record exists (device_id in module tables = serial_number per schema)
                     cursor.execute(

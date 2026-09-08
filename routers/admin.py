@@ -8,11 +8,11 @@ from typing import Any, Dict, List, Optional
 from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import StreamingResponse
 
-from routers.events import (
-    _install_issue_counts,
+from install_status import (
     _CIMIAN_ERROR_RE,
     _CIMIAN_WARNING_RE,
     _MUNKI_ERROR_RE,
+    install_issue_counts as _install_issue_counts,
 )
 from dependencies import (
     get_db_connection, get_maintenance_db_connection, invalidate_caches,
