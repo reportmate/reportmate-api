@@ -217,14 +217,258 @@ def _run_problems(source: Dict[str, Any], key: str, legacy_key: str) -> List[Dic
     return []
 
 
+# ─── Transient network failures ──────────────────────────────────────────
+#: Where the run-level messages suppressed below are kept, on the munki
+#: section, so the evidence survives even though nothing counts it.
+TRANSIENT_FIELD = "transientProblems"
+SESSION_TRANSIENT_FIELD = "transient_items"
+
+# The same classification the Munki fork applies at the source, so the two
+# never disagree about what "transient" means. The codes are
+# FetchError.transientNetworkErrorCodes: NSURLErrorTimedOut (-1001),
+# CannotFindHost (-1003), CannotConnectToHost (-1004), NetworkConnectionLost
+# (-1005), DNSLookupFailed (-1006), NotConnectedToInternet (-1009). Keyed on
+# the code where the message carries one, for the reason the fork gives:
+# "Download failed:" text is shared with real failures such as a full disk, so
+# the description alone cannot be trusted; TLS failures arrive as connection
+# errors too, with SSL codes, and are not transient.
+_TRANSIENT_CODE_RE = re.compile(r"(?<![\w.-])-(?:1001|1003|1004|1005|1006|1009)(?!\d)")
+# The localized descriptions of those codes, for messages that carry the words
+# without the number -- the same allowlist as the Mac client's
+# isTransientDownloadFailure fallback.
+_TRANSIENT_PHRASES = (
+    "the network connection was lost",
+    "the request timed out",
+    "the internet connection appears to be offline",
+    "could not connect to the server",
+    "a server with the specified hostname could not be found",
+    "network connection was interrupted",
+)
+# Only the run-level fetches -- catalog and manifest retrieval -- are eligible.
+# An item download that failed the same way is that item's story and stays
+# attributed to it.
+_RUN_FETCH_RE = re.compile(
+    r"^could not (?:retrieve (?:managed install primary manifest|manifest .+? from the server|"
+    r"catalog .+? from (?:the )?server)|reach the munki server)\b",
+    re.IGNORECASE,
+)
+# Munki 7 reports a catalog it could not fetch twice: once from the download
+# with the reason (HTTP error, or a connection error with its code), and once
+# from the caller with only the catalog name. The fork demotes the reasoned
+# line to info when the reason is transient, which leaves the bare line as the
+# only error the run reports. So a bare line with no HTTP-error sibling for the
+# same catalog is the transient case.
+_BARE_CATALOG_RE = re.compile(r"^could not download catalog (\S+)$", re.IGNORECASE)
+_CATALOG_HTTP_RE = re.compile(
+    r"^could not retrieve catalog (\S+?)(?:\.yaml|\.plist)? from server\. http error",
+    re.IGNORECASE,
+)
+
+
+def _split_flat(value: Any) -> List[str]:
+    """The parts of a legacy '; '-joined errors/warnings string."""
+    if not isinstance(value, str):
+        return []
+    return [part.strip() for part in value.split(";") if part.strip()]
+
+
+def _is_transient(message: Any, siblings: Iterable[str]) -> bool:
+    """Whether a run-level message only says the Munki server was unreachable."""
+    text = _text(message)
+    bare = _BARE_CATALOG_RE.match(text)
+    if bare:
+        name = bare.group(1).lower()
+        for other in siblings:
+            http = _CATALOG_HTTP_RE.match(_text(other))
+            if http and http.group(1).lower() == name:
+                return False
+        return True
+    if not _RUN_FETCH_RE.match(text):
+        return False
+    lowered = text.lower()
+    if _TRANSIENT_CODE_RE.search(text):
+        return True
+    return any(phrase in lowered for phrase in _TRANSIENT_PHRASES)
+
+
+def _nameless(problem: Any) -> bool:
+    return isinstance(problem, dict) and not _text(problem.get("name"))
+
+
+def _problem_messages(problems: Any) -> List[str]:
+    if not isinstance(problems, list):
+        return []
+    return [_text(p.get("message")) for p in problems if isinstance(p, dict) and _text(p.get("message"))]
+
+
+def suppress_transient_problems(module_data: Any) -> int:
+    """Drop the run-level messages that only say the Munki server was unreachable.
+
+    A laptop that sleeps, roams or leaves the network mid-run cannot fetch its
+    catalog or manifest, reports that as an error, and succeeds an hour later.
+    Nothing is wrong with the machine or the repo; the fork already logs the
+    reasoned line as info for exactly this case. Every consumer downstream --
+    the device page, the dashboard counters, the daily run-error card -- reads
+    what ingest stored, so the suppression lives here, once, and covers every
+    client version at the same moment.
+
+    Only nameless problems from the run-level fetches are eligible; a message
+    attributed to an item is left for the item's own state to decide. What is
+    removed is kept under ``transientProblems`` on the munki section and
+    ``transient_items`` on the session it came from, and the run's status,
+    ``lastRunSuccess`` and session summary counts are re-derived from what
+    remains. Returns how many messages were suppressed. Idempotent: a payload
+    with nothing to suppress is untouched, so ingest's unchanged-payload path
+    still compares equal.
+    """
+    munki = module_data.get("munki") if isinstance(module_data, dict) else None
+    if not isinstance(munki, dict):
+        return 0
+
+    sessions = [s for s in (munki.get("sessions") or []) if isinstance(s, dict)] \
+        if isinstance(munki.get("sessions"), list) else []
+    latest = sessions[0] if sessions else None
+
+    # Every message the latest run produced, whichever field carries it, so a
+    # bare catalog line can see the HTTP-error line it may have come with.
+    siblings: List[str] = _split_flat(munki.get("errors")) + _split_flat(munki.get("warnings"))
+    for key in ("errorItems", "warningItems"):
+        siblings += _problem_messages(munki.get(key))
+    if latest is not None:
+        for key in ("error_items", "errorItems", "warning_items", "warningItems"):
+            siblings += _problem_messages(latest.get(key))
+
+    removed = 0
+    recorded: List[Dict[str, str]] = []
+
+    def record(level: str, message: str) -> None:
+        entry = {"level": level, "message": message}
+        if entry not in recorded:
+            recorded.append(entry)
+
+    # Legacy flattened strings.
+    for level, key in ((ERROR, "errors"), (WARNING, "warnings")):
+        parts = _split_flat(munki.get(key))
+        keep = [p for p in parts if not _is_transient(p, siblings)]
+        if len(keep) == len(parts):
+            continue
+        for part in parts:
+            if part not in keep:
+                record(level, part)
+        removed += len(parts) - len(keep)
+        if keep:
+            munki[key] = "; ".join(keep)
+        else:
+            munki.pop(key, None)
+
+    # The latest run's structured problems, as the client copies them up.
+    for level, key in ((ERROR, "errorItems"), (WARNING, "warningItems")):
+        problems = munki.get(key)
+        if not isinstance(problems, list):
+            continue
+        keep = [p for p in problems if not (_nameless(p) and _is_transient(p.get("message"), siblings))]
+        if len(keep) == len(problems):
+            continue
+        for p in problems:
+            if p not in keep:
+                record(level, _text(p.get("message")))
+        removed += len(problems) - len(keep)
+        munki[key] = keep
+
+    # Each session in the retained history. A session's own problems are its
+    # siblings; the summary counts are the client's tally of those lists.
+    for session in sessions:
+        session_siblings: List[str] = []
+        for key in ("error_items", "errorItems", "warning_items", "warningItems"):
+            session_siblings += _problem_messages(session.get(key))
+        dropped: List[Dict[str, str]] = []
+        for level, keys, count_key in (
+            (ERROR, ("error_items", "errorItems"), "errors"),
+            (WARNING, ("warning_items", "warningItems"), "warnings"),
+        ):
+            for key in keys:
+                problems = session.get(key)
+                if not isinstance(problems, list):
+                    continue
+                keep = [p for p in problems
+                        if not (_nameless(p) and _is_transient(p.get("message"), session_siblings))]
+                if len(keep) == len(problems):
+                    continue
+                gone = len(problems) - len(keep)
+                for p in problems:
+                    if p not in keep:
+                        entry = {"level": level, "message": _text(p.get("message"))}
+                        if entry not in dropped:
+                            dropped.append(entry)
+                        if session is latest:
+                            record(level, entry["message"])
+                removed += gone
+                session[key] = keep
+                summary = session.get("summary")
+                if isinstance(summary, dict) and isinstance(summary.get(count_key), int):
+                    summary[count_key] = max(0, summary[count_key] - gone)
+        if dropped:
+            session[SESSION_TRANSIENT_FIELD] = session.get(SESSION_TRANSIENT_FIELD, []) + dropped
+
+    if not removed:
+        return 0
+
+    if recorded:
+        munki[TRANSIENT_FIELD] = munki.get(TRANSIENT_FIELD, []) + recorded
+
+    # Re-derive the run's verdict from what is left, the way the client set it:
+    # errors make Error, warnings make Warning, otherwise the run was fine.
+    def remaining(flat_key: str, list_key: str, session_keys: Tuple[str, ...]) -> bool:
+        if _split_flat(munki.get(flat_key)) or _problem_messages(munki.get(list_key)):
+            return True
+        return latest is not None and any(_problem_messages(latest.get(k)) for k in session_keys)
+
+    has_errors = remaining("errors", "errorItems", ("error_items", "errorItems"))
+    has_warnings = remaining("warnings", "warningItems", ("warning_items", "warningItems"))
+    status = _text(munki.get("status")).lower()
+    if status == "error" and not has_errors:
+        munki["status"] = "Warning" if has_warnings else "Active"
+    elif status == "warning" and not has_warnings and not has_errors:
+        munki["status"] = "Active"
+    if not has_errors and "lastRunSuccess" in munki and not _is_true(munki.get("lastRunSuccess")):
+        munki["lastRunSuccess"] = True
+    return removed
+
+
+def run_event_is_moot(module_data: Any, event_type: str) -> bool:
+    """Whether a run's error/warning event only existed because of messages
+    ``suppress_transient_problems`` removed.
+
+    The client raises "1 Munki error" alongside the module; once the one error
+    is gone the event would announce a problem nothing else records. Only a
+    payload that actually had something suppressed is judged, so every other
+    event is stored exactly as sent.
+    """
+    munki = module_data.get("munki") if isinstance(module_data, dict) else None
+    if not isinstance(munki, dict) or not munki.get(TRANSIENT_FIELD):
+        return False
+    _, _, munki_errors, munki_warnings = install_issue_counts(module_data)
+    kind = _text(event_type).lower()
+    if kind == "error":
+        return munki_errors == 0
+    if kind == "warning":
+        return munki_warnings == 0
+    return False
+
+
 def stamp_items(module_data: Any) -> Any:
     """Write each item's state onto it, in place, for both platforms.
 
     Deterministic: the same payload stamps to the same JSON, so ingest's
     unchanged-payload fast path still compares equal on a repeat check-in.
+
+    Transient network failures are suppressed first (``suppress_transient_problems``)
+    so the stamps, the counters and everything read from the stored row agree
+    that an unreachable server is not a failed run.
     """
     if not isinstance(module_data, dict):
         return module_data
+    suppress_transient_problems(module_data)
     for platform in PLATFORM_SOURCES:
         source = module_data.get(platform)
         if not isinstance(source, dict):
