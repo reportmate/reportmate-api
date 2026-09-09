@@ -19,6 +19,7 @@ from starlette.requests import ClientDisconnect
 
 from install_status import (
     install_issue_counts as _install_issue_counts,
+    run_event_is_moot as _run_event_is_moot,
     stamp_items as _stamp_install_items,
 )
 
@@ -1370,6 +1371,16 @@ async def submit_events(request: Request):
                 # name it so it is superseded with the rest of the run.
                 if not module_id and has_installs_module and event_type in {'success', 'warning', 'error'}:
                     module_id = 'installs'
+
+                # The run's error/warning event announces problems the module
+                # carries. When ingest suppressed those as transient network
+                # failures and nothing else remains, the event would be the
+                # only place still saying the run failed -- so it goes too.
+                if (module_id in INSTALLS_EVENT_MODULES and has_installs_module
+                        and _run_event_is_moot(modules_data['installs'], event_type)):
+                    logger.info(f"Dropped {event_type} run event for device {serial_number}: "
+                                "only transient network failures were reported")
+                    continue
                 
                 # VALIDATION: Events containing installs module MUST be success/warning/error
                 if has_installs_module or (isinstance(details, dict) and details.get('module_status') in ['success', 'warning', 'error']):
