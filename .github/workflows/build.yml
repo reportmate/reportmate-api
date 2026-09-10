@@ -59,6 +59,43 @@ jobs:
       - name: Run tests
         run: pytest -rs
 
+  # The spec is a build product. Exporting it here proves the app still
+  # imports and the schema still renders on every change, and leaves the
+  # artifact for anyone who needs the spec for exactly this commit. The
+  # website (reportmate/reportmate-website, openapi-sync workflow) exports
+  # the same file from main on its own schedule and publishes it at
+  # /openapi.json, so an integrator always reads the deployed contract.
+  openapi:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.11'
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Export the OpenAPI spec
+        run: |
+          python scripts/export_openapi.py
+          python - <<'EOF'
+          import json
+          spec = json.load(open("docs/api/openapi.json"))
+          paths = len(spec["paths"])
+          assert paths >= 50, f"spec looks truncated: {paths} paths"
+          assert "securitySchemes" in spec.get("components", {}), "auth schemes missing"
+          print(f"{paths} paths, schemes: {sorted(spec['components']['securitySchemes'])}")
+          EOF
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: openapi
+          path: docs/api/openapi.json
+
   build:
     needs: test
     runs-on: ubuntu-latest
