@@ -90,6 +90,27 @@ def test_manifest_fetches_use_the_forks_six_codes_and_their_descriptions():
     assert [p["message"] for p in munki[TRANSIENT_FIELD]] == [MANIFEST_TIMEOUT, PRIMARY_OFFLINE]
 
 
+def test_the_updatecheck_wrapper_goes_with_the_manifest_failure_it_repeats():
+    manifest = ("Could not retrieve manifest Assigned/Staff/Room/Host from the server: "
+                "There was a connection error: -1009: The Internet connection appears to be offline.")
+    wrapper = ("Error during updatecheck: There was a connection error: -1009: "
+               "The Internet connection appears to be offline.")
+    data = munki_module(errors=[{"message": manifest}, {"message": PRIMARY_OFFLINE}, {"message": wrapper}])
+    suppress_transient_problems(data)
+    munki = data["munki"]
+    assert "errors" not in munki
+    assert munki["status"] == "Active"
+    assert munki["lastRunSuccess"] is True
+    assert [p["message"] for p in munki[TRANSIENT_FIELD]] == [manifest, PRIMARY_OFFLINE, wrapper]
+
+
+def test_an_updatecheck_that_failed_for_a_real_reason_is_still_an_error():
+    wrapper = "Error during updatecheck: Could not retrieve manifest Host from the server. HTTP error 404: Not Found"
+    data = {"munki": {"status": "Error", "errors": wrapper}}
+    assert suppress_transient_problems(data) == 0
+    assert data["munki"]["status"] == "Error"
+
+
 def test_an_items_own_download_failure_is_left_to_the_item():
     data = munki_module(warnings=[{"name": "Excel", "message": ITEM_LOST}])
     assert suppress_transient_problems(data) == 0
