@@ -38,12 +38,16 @@ own attribution stamps ``lastSeenInSession``; the log scrape leaves it empty,
 which is how the two are told apart. A payload with no sessions at all predates
 that stamp, so its messages still count.
 
-An item the install-loop guard has flagged is at least a warning, whatever its
-status says. Both tools detect loops -- Cimian in its own items.json, Munki in
-the fork's LoopGuard -- but neither reliably says so in the status: Cimian's
-mapper takes a hasInstallLoop argument and never reads it, and the Mac client
-only forwards the flag when the fork happened to set it. Deciding it here means
-the fleet is right now, rather than after two client rollouts.
+A status of "Install Loop" is an error: a package that reinstalls every run is
+not installing, and Cimian's own client files it under the run's failed items,
+so the events feed shows it red. The bare loop flag is a softer signal and stays
+a warning -- Munki's LoopGuard deliberately keeps its holds out of the run's
+warning report, so there is no event behind it either way, and only the flag
+says a loop is happening at all. Both tools detect loops but neither reliably
+says so in the status: Cimian's mapper takes a hasInstallLoop argument and never
+reads it, and the Mac client only forwards the flag when the fork happened to
+set it. Deciding it here means the fleet is right now, rather than after two
+client rollouts.
 
 Anything the ladder cannot place is left unclassified rather than guessed.
 
@@ -70,12 +74,15 @@ PLATFORM_SOURCES = ("cimian", "munki")
 
 # Ordered: a status naming a failure is a failure even when it also contains
 # "install" ("install_failed", "needs_reinstall", "install-error").
-_ERROR_TOKENS = ("error", "failed", "failure", "problem")
+_ERROR_TOKENS = ("error", "failed", "failure", "problem", "install-loop")
 _ERROR_EXACT = ("needs-reinstall",)
-_WARNING_TOKENS = ("warning", "install-loop")
+_WARNING_TOKENS = ("warning",)
 # Cimian's own mapper reads "not installed" as a warning: the package is
-# managed, was expected, and is not there.
-_WARNING_EXACT = ("needs-attention", "not-installed")
+# managed, was expected, and is not there. "Not Available" is the same kind of
+# statement -- the package is managed and the catalog does not offer it -- and
+# both have to be matched exactly, because each contains a token that means the
+# opposite of what it says ("installed", "available").
+_WARNING_EXACT = ("needs-attention", "not-installed", "not-available")
 _PENDING_TOKENS = (
     "pending", "will-be-installed", "update-available", "will-be-removed",
     "scheduled", "install-requested", "removal-requested", "available",
@@ -215,6 +222,78 @@ def _run_problems(source: Dict[str, Any], key: str, legacy_key: str) -> List[Dic
     if isinstance(legacy, str) and legacy.strip():
         return [{"message": part.strip()} for part in legacy.split(";") if part.strip()]
     return []
+
+
+# Cimian's run log names the package it acted on, and the actions whose outcome
+# is an install attempt. A status_check event verifies state rather than acting,
+# so it is not one of these.
+_RUN_ACTIONS = ("install", "update", "upgrade", "remove", "uninstall")
+_FAILURE_STATUSES = ("failed", "error")
+
+
+def _latest_session_id(events: List[Dict[str, Any]]) -> str:
+    """The session the newest event belongs to.
+
+    Taken from the events rather than sessions.json, which is flushed at the end
+    of a run and so can still have the previous session as its newest entry.
+    """
+    latest_ts, latest_id = "", ""
+    for event in events:
+        session_id = _text(event.get("sessionId"))
+        if not session_id:
+            continue
+        timestamp = _text(event.get("timestamp"))
+        if timestamp >= latest_ts:
+            latest_ts, latest_id = timestamp, session_id
+    return latest_id
+
+
+def unattributed_run_failures(source: Any) -> List[str]:
+    """Packages the latest run failed on that no item accounts for.
+
+    Cimian's items.json does not reliably mark an item Failed when its install
+    fails: the Windows client says so in as many words, and builds the event's
+    failed_items from the run log for exactly that reason. A package can also
+    fail without ever appearing in items.json at all. Reading the same log here
+    is what stops a tile from missing a failure the events feed is showing.
+
+    Only failures from the latest session count, and only for packages no item
+    already reports a problem for -- otherwise the same failure is counted
+    twice.
+    """
+    if not isinstance(source, dict):
+        return []
+    events = source.get("events")
+    if not isinstance(events, list):
+        return []
+    events = [e for e in events if isinstance(e, dict)]
+    if not events:
+        return []
+
+    has_sessions = bool(source.get("sessions"))
+    accounted = {
+        _text(item.get("itemName") or item.get("name")).lower()
+        for item in _items(source)
+        if classify_item(item, has_sessions) in (ERROR, WARNING)
+    }
+    accounted.discard("")
+
+    session_id = _latest_session_id(events)
+    failures: Dict[str, str] = {}
+    for event in events:
+        if session_id and _text(event.get("sessionId")) != session_id:
+            continue
+        package = _text(event.get("package"))
+        if not package or package.lower() in accounted:
+            continue
+        if _text(event.get("status")).lower() not in _FAILURE_STATUSES:
+            continue
+        action = _text(event.get("action")).lower()
+        event_type = _text(event.get("eventType")).lower()
+        if action not in _RUN_ACTIONS and event_type not in _RUN_ACTIONS:
+            continue
+        failures[package.lower()] = package
+    return sorted(failures.values())
 
 
 # ─── Transient network failures ──────────────────────────────────────────
@@ -500,6 +579,9 @@ def _counts_for(source: Any) -> Tuple[int, int]:
         errors = len(_run_problems(source, "errorItems", "errors"))
     if warnings == 0:
         warnings = len(_run_problems(source, "warningItems", "warnings"))
+    # A package the run log failed on that no item accounts for is still a
+    # failure, and the events feed already shows it as one.
+    errors += len(unattributed_run_failures(source))
     return (errors, warnings)
 
 
