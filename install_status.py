@@ -246,10 +246,13 @@ _TRANSIENT_PHRASES = (
 )
 # Only the run-level fetches -- catalog and manifest retrieval -- are eligible.
 # An item download that failed the same way is that item's story and stays
-# attributed to it.
+# attributed to it. A failed manifest fetch aborts the updatecheck, and
+# managedsoftwareupdate then reports the same reason a third time as
+# "Error during updatecheck: <reason>"; that wrapper is run-level too, and the
+# code or phrase check below still decides whether its reason was transient.
 _RUN_FETCH_RE = re.compile(
-    r"^could not (?:retrieve (?:managed install primary manifest|manifest .+? from the server|"
-    r"catalog .+? from (?:the )?server)|reach the munki server)\b",
+    r"^(?:could not (?:retrieve (?:managed install primary manifest|manifest .+? from the server|"
+    r"catalog .+? from (?:the )?server)|reach the munki server)\b|error during updatecheck:)",
     re.IGNORECASE,
 )
 # Munki 7 reports a catalog it could not fetch twice: once from the download
