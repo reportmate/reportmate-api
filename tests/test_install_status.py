@@ -12,6 +12,7 @@ import pytest
 from install_status import (
     ERROR, WARNING, PENDING, INSTALLED, REMOVED, STATE_FIELD,
     classify_item, install_issue_counts, item_state_totals, stamp_items,
+    unattributed_run_failures,
 )
 
 
@@ -22,7 +23,8 @@ from install_status import (
     ("Pending", PENDING), ("Pending Install", PENDING), ("update-available", PENDING),
     ("Update Available", PENDING), ("update_available", PENDING), ("Skipped", PENDING),
     ("Warning", WARNING), ("needs-attention", WARNING), ("Not Installed", WARNING),
-    ("Install Loop", WARNING),
+    ("Not Available", WARNING),
+    ("Install Loop", ERROR),
     ("Error", ERROR), ("failed", ERROR), ("install_failed", ERROR), ("needs_reinstall", ERROR),
     ("Removed", REMOVED),
 ])
@@ -246,3 +248,72 @@ def test_a_held_loop_counts_even_without_a_session_stamp():
     held = {"currentStatus": "Installed", "lastSeenInSession": "", "hasInstallLoop": True}
     data = {"cimian": {"items": [held], "sessions": [{"session_id": "s1"}]}}
     assert install_issue_counts(data)[1] == 1
+
+
+# --- the two vocabularies the events feed already used ---------------------
+
+def test_a_looping_status_is_an_error_because_the_feed_shows_one():
+    # Cimian's client files "Install Loop" under the run's failed items, so the
+    # row is red; counting it as a warning left the tile disagreeing with it.
+    assert classify_item({"currentStatus": "Install Loop"}) == ERROR
+    assert classify_item({"mappedStatus": "install_loop"}) == ERROR
+
+
+def test_an_unavailable_package_is_a_warning_not_a_pending_install():
+    # "Not Available" means the catalog does not offer a package the device is
+    # managed for -- Cimian's client raises it as a warning item. It contains
+    # "available", so without the exact match it fell through to Pending and
+    # the warning the feed showed was counted as nothing at all.
+    assert classify_item({"currentStatus": "Not Available"}) == WARNING
+    assert classify_item({"currentStatus": "not_available"}) == WARNING
+
+
+# --- failures that live only in the run log --------------------------------
+
+def _session_events(*events):
+    return {"cimian": {"items": [], "sessions": [{"sessionId": "s2"}], "events": list(events)}}
+
+
+def test_a_failure_only_the_run_log_names_still_counts():
+    # Cimian's items.json does not reliably mark an item Failed when its
+    # install fails, and a package can fail without appearing there at all --
+    # which is why the client builds the event's failed_items from this log.
+    data = _session_events(
+        {"sessionId": "s2", "package": "ManageUsers", "action": "install", "status": "failed"},
+    )
+    assert install_issue_counts(data)[0] == 1
+
+
+def test_only_the_latest_session_counts():
+    data = _session_events(
+        {"sessionId": "s1", "timestamp": "2026-09-10T08:00:00Z", "package": "Old",
+         "action": "install", "status": "failed"},
+        {"sessionId": "s2", "timestamp": "2026-09-11T08:00:00Z", "package": "New",
+         "action": "install", "status": "failed"},
+    )
+    assert unattributed_run_failures(data["cimian"]) == ["New"]
+
+
+def test_a_failure_an_item_already_reports_is_not_counted_twice():
+    data = {"cimian": {
+        "items": [{"itemName": "Acrobat", "currentStatus": "Failed"}],
+        "events": [{"sessionId": "s2", "package": "Acrobat", "action": "install", "status": "failed"}],
+    }}
+    assert install_issue_counts(data)[0] == 1
+
+
+def test_a_status_check_is_not_an_install_attempt():
+    # status_check events verify state; they do not act, so a failed one is not
+    # a failed install.
+    data = _session_events(
+        {"sessionId": "s2", "package": "Chrome", "eventType": "status_check", "status": "failed"},
+    )
+    assert install_issue_counts(data)[0] == 0
+
+
+def test_a_package_that_failed_twice_counts_once():
+    data = _session_events(
+        {"sessionId": "s2", "package": "Firefox", "action": "install", "status": "failed"},
+        {"sessionId": "s2", "package": "Firefox", "action": "update", "status": "error"},
+    )
+    assert install_issue_counts(data)[0] == 1
