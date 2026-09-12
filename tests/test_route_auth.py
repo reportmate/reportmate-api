@@ -14,6 +14,7 @@ from dependencies import verify_authentication
 from routers import (
     admin,
     api_keys,
+    auth_config,
     devices,
     events,
     fleet,
@@ -22,7 +23,7 @@ from routers import (
     statistics,
 )
 
-ROUTER_MODULES = [admin, api_keys, devices, events, fleet, health, settings, statistics]
+ROUTER_MODULES = [admin, api_keys, auth_config, devices, events, fleet, health, settings, statistics]
 
 # Routes that are anonymous by design. Adding to this list is a deliberate,
 # reviewed decision — liveness/readiness must work before secrets are mounted,
@@ -31,6 +32,10 @@ ANONYMOUS_ALLOWED = {
     "/health",
     "/health/live",
     "/health/ready",
+    # /auth/config describes how to authenticate (accepted headers, OIDC issuer
+    # and audience): the same non-secret values a token carries, needed before a
+    # client has any credential at all.
+    "/auth/config",
 }
 
 
@@ -75,3 +80,36 @@ def test_allowlist_matches_reality():
     }
     missing = ANONYMOUS_ALLOWED - all_paths
     assert not missing, f"Allowlisted routes no longer exist: {sorted(missing)}"
+
+
+def _mounted_api_paths(app, prefix=""):
+    """Every APIRoute path the app serves: plain routes, routers included
+    lazily (FastAPI keeps them as an included-router entry carrying the
+    original router and the prefix it was mounted with), and sub-app mounts."""
+    from starlette.routing import Mount
+
+    paths = set()
+    for r in app.routes:
+        if isinstance(r, APIRoute):
+            paths.add(prefix + r.path)
+        elif hasattr(r, "original_router") and hasattr(r, "include_context"):
+            inner = getattr(r.include_context, "prefix", "") or ""
+            for sub in r.original_router.routes:
+                if isinstance(sub, APIRoute):
+                    paths.add(prefix + inner + sub.path)
+        elif isinstance(r, Mount) and hasattr(r.app, "routes"):
+            paths |= _mounted_api_paths(r.app, prefix + r.path)
+    return paths
+
+
+def test_registry_covers_every_router_the_app_mounts():
+    # A router added to main.py but not to ROUTER_MODULES would escape the
+    # authentication check above; mount-time and registry must agree.
+    import main as app_main
+
+    mounted = {p for p in _mounted_api_paths(app_main.app) if p.startswith("/api/v1/")}
+    registered = {
+        "/api/v1" + r.path for m in ROUTER_MODULES for r in m.router.routes if isinstance(r, APIRoute)
+    }
+    assert mounted, "no /api/v1 routes found on the app"
+    assert mounted == registered, f"unregistered routes: {sorted(mounted - registered)}"
