@@ -1387,6 +1387,97 @@ def orphaned_module_rows(samples: int = Query(default=5, ge=0, le=50)):
         raise HTTPException(status_code=500, detail=f"Failed to survey orphaned module rows: {e}")
 
 
+@router.delete("/admin/orphans", dependencies=[Depends(verify_authentication)], tags=["admin"])
+def delete_orphaned_module_rows(
+    device_ids: str = Query(..., description="Comma-separated device ids to clean up; each must be an orphan"),
+    confirm: bool = Query(False, description="Must be true to delete"),
+):
+    """
+    Delete the module rows of specific orphaned device ids.
+
+    Deliberately not a blanket sweep. An orphan is a module row whose device
+    row is gone, and the reason it is gone matters: a machine that is still in
+    inventory and might check in again deserves to keep its history, while a
+    test id or a hostname-keyed duplicate does not. So the caller names the ids,
+    having decided that, and this refuses any id that is not actually an orphan
+    -- naming a live device deletes nothing.
+
+    Irreversible, and separate from ``DELETE /device/{serial}``, which is for
+    devices that still exist.
+
+    **Authentication Required:**
+    - Windows clients: X-API-PASSPHRASE header
+    - Azure resources: X-MS-CLIENT-PRINCIPAL-ID header (Managed Identity)
+    """
+    wanted = [d.strip() for d in device_ids.split(",") if d.strip()]
+    if not wanted:
+        raise HTTPException(status_code=400, detail="No device ids supplied")
+    if not confirm:
+        raise HTTPException(
+            status_code=400,
+            detail="Deletion requires confirmation. Add &confirm=true. This permanently removes the named rows.",
+        )
+
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+
+        # Refuse anything that still has a device row: this endpoint only ever
+        # removes rows that nothing can reach.
+        cursor.execute(
+            "SELECT id, serial_number FROM devices WHERE id = ANY(%s) OR serial_number = ANY(%s)",
+            (wanted, wanted),
+        )
+        live = {value for row in cursor.fetchall() for value in row if value}
+        not_orphans = sorted(set(wanted) & live)
+        if not_orphans:
+            conn.close()
+            raise HTTPException(
+                status_code=400,
+                detail=f"These device ids still have a device row and are not orphans: {', '.join(not_orphans)}",
+            )
+
+        deleted: Dict[str, Dict[str, int]] = {}
+        total = 0
+        for table in _MODULE_TABLES:
+            try:
+                cursor.execute(f"DELETE FROM {table} WHERE device_id = ANY(%s)", (wanted,))
+            except Exception:
+                conn.rollback()
+                continue
+            if cursor.rowcount:
+                deleted.setdefault(table, {})["rows"] = cursor.rowcount
+                total += cursor.rowcount
+
+        # Events are keyed the same way and are just as unreachable.
+        try:
+            cursor.execute("DELETE FROM events WHERE device_id = ANY(%s)", (wanted,))
+            if cursor.rowcount:
+                deleted.setdefault("events", {})["rows"] = cursor.rowcount
+                total += cursor.rowcount
+        except Exception:
+            conn.rollback()
+
+        conn.commit()
+        conn.close()
+        invalidate_caches()
+
+        logger.warning("Deleted %d orphaned rows for %s", total, ", ".join(wanted))
+        return {
+            "success": True,
+            "deviceIds": wanted,
+            "totalRowsDeleted": total,
+            "tables": deleted,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "warning": "This data cannot be recovered",
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Failed to delete orphaned module rows: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to delete orphaned module rows: {e}")
+
+
 @router.get("/debug/database", dependencies=[Depends(verify_authentication)], tags=["admin"])
 def debug_database():
     """
