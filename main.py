@@ -33,6 +33,7 @@ from dependencies import (
 )
 from migrations import run_migrations
 from routers import (
+    auth_config,
     admin,
     api_keys,
     devices,
@@ -203,6 +204,7 @@ for _router_mod in (
     admin,
     settings,
     api_keys,
+    auth_config,
 ):
     app.include_router(_router_mod.router, prefix="/api/v1")
 
