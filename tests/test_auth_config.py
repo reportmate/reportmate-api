@@ -30,3 +30,21 @@ def test_auth_config_advertises_the_oidc_audience(monkeypatch):
 def test_auth_config_needs_no_credential():
     r = TestClient(app).get("/api/v1/auth/config")
     assert r.status_code == 200
+
+
+def test_401_detail_matches_auth_config(monkeypatch):
+    import dependencies
+
+    monkeypatch.setattr(dependencies, "DISABLE_AUTH", False)
+    monkeypatch.setattr(oidc_auth, "ENABLE_OIDC_AUTH", True)
+    monkeypatch.setattr(oidc_auth, "OIDC_ISSUERS", ("https://login.example.test/tenant/v2.0",))
+    monkeypatch.setattr(oidc_auth, "OIDC_AUDIENCES", ("api://sample",))
+    r = TestClient(app).get("/api/v1/devices")
+    assert r.status_code == 401
+    assert "Authorization: Bearer" in r.json()["detail"]
+    assert "/api/v1/auth/config" in r.json()["detail"]
+
+    monkeypatch.setattr(oidc_auth, "ENABLE_OIDC_AUTH", False)
+    r = TestClient(app).get("/api/v1/devices")
+    assert r.status_code == 401
+    assert "Bearer" not in r.json()["detail"]

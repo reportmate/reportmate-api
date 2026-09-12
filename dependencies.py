@@ -1014,8 +1014,7 @@ async def verify_authentication(
         )
         raise HTTPException(
             status_code=401,
-            detail="Authentication required. Supply X-API-Key (per-client), "
-            "X-Client-Passphrase (clients), or X-Internal-Secret (internal).",
+            detail=_authentication_required_detail(),
         )
 
     try:
@@ -1729,3 +1728,17 @@ async def broadcast_event(event_data: dict):
         )
     except Exception as e:
         logger.error(f"Failed to broadcast event: {e}")
+
+
+def _authentication_required_detail() -> str:
+    """The 401 detail must match what /auth/config advertises: a static header
+    list once claimed bearer auth was absent while it was on."""
+    options = ["X-API-Key (per-client)", "X-Client-Passphrase (clients)", "X-Internal-Secret (internal)"]
+    try:
+        import oidc_auth
+
+        if oidc_auth.oidc_enabled():
+            options.insert(0, "Authorization: Bearer (OIDC sign-in)")
+    except Exception:
+        pass
+    return "Authentication required. Supply " + ", ".join(options) + ". See /api/v1/auth/config."
