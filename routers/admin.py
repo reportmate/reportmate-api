@@ -1286,6 +1286,107 @@ def reclassify_stored_installs(
         raise HTTPException(status_code=500, detail=f"Failed to reclassify stored installs: {e}")
 
 
+# Every table ingest writes a per-device row into, keyed on the serial number.
+_MODULE_TABLES = (
+    "system", "hardware", "applications", "installs", "network", "security",
+    "inventory", "management", "peripherals", "identity", "displays",
+    "printers", "profiles",
+)
+
+
+@router.get("/admin/orphans", dependencies=[Depends(verify_authentication)], tags=["admin"])
+def orphaned_module_rows(samples: int = Query(default=5, ge=0, le=50)):
+    """
+    Module rows whose device no longer exists.
+
+    Every fleet-wide query joins a module table to ``devices``, so a module row
+    whose ``device_id`` matches no device contributes to nothing: its errors are
+    absent from the dashboard tiles, its items from the installs page, its
+    applications from the inventory. The row is still there, still counted by
+    the reclassify pass, and still invisible.
+
+    They should not exist -- ingest writes the device row before any module row,
+    and deleting a device cascades -- so a non-zero count here is evidence of a
+    delete that did not cascade, or of a device row whose id and serial number
+    disagree. Read-only: this reports them and removes nothing.
+    """
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+
+        tables: Dict[str, Any] = {}
+        total = 0
+        for table in _MODULE_TABLES:
+            try:
+                cursor.execute(
+                    f"""
+                    SELECT COUNT(*) FROM {table} m
+                    WHERE NOT EXISTS (
+                        SELECT 1 FROM devices d
+                        WHERE d.id = m.device_id OR d.serial_number = m.device_id
+                    )
+                    """
+                )
+                row = cursor.fetchone()
+                count = int(row[0] or 0) if row else 0
+            except Exception:
+                # A table this deployment does not have is not an orphan story.
+                conn.rollback()
+                continue
+            entry: Dict[str, Any] = {"orphanedRows": count}
+            if count and samples:
+                cursor.execute(
+                    f"""
+                    SELECT m.device_id FROM {table} m
+                    WHERE NOT EXISTS (
+                        SELECT 1 FROM devices d
+                        WHERE d.id = m.device_id OR d.serial_number = m.device_id
+                    )
+                    ORDER BY m.device_id
+                    LIMIT %s
+                    """,
+                    (samples,),
+                )
+                entry["sample"] = [r[0] for r in cursor.fetchall()]
+            tables[table] = entry
+            total += count
+
+        # What the invisible installs rows would have contributed, so the size of
+        # the gap is reported rather than inferred.
+        hidden = {"devices": 0, "errors": 0, "warnings": 0}
+        if tables.get("installs", {}).get("orphanedRows"):
+            cursor.execute(
+                """
+                SELECT COUNT(*),
+                       COALESCE(SUM(cimian_errors + munki_errors), 0),
+                       COALESCE(SUM(cimian_warnings + munki_warnings), 0)
+                FROM installs m
+                WHERE NOT EXISTS (
+                    SELECT 1 FROM devices d
+                    WHERE d.id = m.device_id OR d.serial_number = m.device_id
+                )
+                  AND (cimian_errors + munki_errors + cimian_warnings + munki_warnings) > 0
+                """
+            )
+            row = cursor.fetchone()
+            if row:
+                hidden = {"devices": int(row[0] or 0),
+                          "errors": int(row[1] or 0),
+                          "warnings": int(row[2] or 0)}
+
+        conn.close()
+        return {
+            "success": True,
+            "totalOrphanedRows": total,
+            "tables": tables,
+            "hiddenByOrphanedInstalls": hidden,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        }
+    except Exception as e:
+        logger.error(f"Failed to survey orphaned module rows: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to survey orphaned module rows: {e}")
+
+
 @router.get("/debug/database", dependencies=[Depends(verify_authentication)], tags=["admin"])
 def debug_database():
     """
