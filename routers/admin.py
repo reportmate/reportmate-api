@@ -23,6 +23,14 @@ from dependencies import (
 
 router = APIRouter(tags=["admin"])
 
+# Every table ingest writes a per-device row into, keyed on the serial number.
+_MODULE_TABLES = (
+    "system", "hardware", "applications", "installs", "network", "security",
+    "inventory", "management", "peripherals", "identity", "displays",
+    "printers", "profiles",
+)
+
+
 @router.patch("/device/{serial_number}/archive", dependencies=[Depends(verify_authentication)], tags=["devices"])
 def archive_device(serial_number: str):
     """
@@ -178,7 +186,9 @@ def delete_device(serial_number: str, confirm: bool = Query(False)):
     
     Deletion removes:
     - Device record from devices table
-    - All module data (cascading delete via foreign keys)
+    - Every module row for the device, deleted explicitly: the module tables
+      are created by the ingestion path, not by a migration, and none of them
+      declares a foreign key to devices, so nothing cascades
     - All events history
     - ALL historical data - cannot be recovered
     
@@ -219,11 +229,9 @@ def delete_device(serial_number: str, confirm: bool = Query(False)):
         device_id, device_uuid, device_name, is_archived = device_row
         
         # Get module counts for logging
-        module_tables = ["system", "hardware", "applications", "installs", "network", "security",
-                        "inventory", "management", "peripherals", "identity"]
         module_counts = {}
-        
-        for table in module_tables:
+
+        for table in _MODULE_TABLES:
             try:
                 cursor.execute(f"SELECT COUNT(*) FROM {table} WHERE device_id = %s", (device_id,))
                 count_result = cursor.fetchone()
@@ -236,12 +244,29 @@ def delete_device(serial_number: str, confirm: bool = Query(False)):
         event_count_result = cursor.fetchone()
         event_count = event_count_result[0] if event_count_result else 0
 
-        # usage_history has no FK to devices, so it must be cleaned up explicitly
-        # to avoid orphan rows after a hard delete.
+        # Nothing here cascades. The module tables are created by the ingestion
+        # path rather than by a migration, and none of them declares a foreign
+        # key to devices -- so deleting the device row used to leave every
+        # module row and every event behind, unreachable but still present, and
+        # this endpoint reported them as deleted anyway. That is where the
+        # orphans /admin/orphans finds came from. Each table is therefore
+        # cleared explicitly, which is correct whether or not a cascade is ever
+        # added.
         cursor.execute("DELETE FROM usage_history WHERE device_id = %s", (device_id,))
         usage_history_deleted = cursor.rowcount
 
-        # Delete the device (CASCADE will delete all related module data and events)
+        module_rows_deleted = 0
+        for table in _MODULE_TABLES:
+            try:
+                cursor.execute(f"DELETE FROM {table} WHERE device_id = %s", (device_id,))
+                module_rows_deleted += cursor.rowcount
+            except Exception:
+                # A table this deployment does not have is not an error here.
+                conn.rollback()
+
+        cursor.execute("DELETE FROM events WHERE device_id = %s", (device_id,))
+        events_deleted = cursor.rowcount
+
         cursor.execute("""
             DELETE FROM devices
             WHERE serial_number = %s OR id = %s
@@ -258,9 +283,9 @@ def delete_device(serial_number: str, confirm: bool = Query(False)):
         
         logger.warning(f"DELETED device: {serial_number} (UUID: {device_uuid}, Name: {device_name})")
         logger.warning(f"   - Archived status: {is_archived}")
-        logger.warning(f"   - Events deleted: {event_count}")
+        logger.warning(f"   - Events deleted: {events_deleted}")
         logger.warning(f"   - Usage history rows deleted: {usage_history_deleted}")
-        logger.warning(f"   - Modules deleted: {sum(module_counts.values())} records across {len([k for k, v in module_counts.items() if v > 0])} tables")
+        logger.warning(f"   - Modules deleted: {module_rows_deleted} records across {len([k for k, v in module_counts.items() if v > 0])} tables")
 
         return {
             "success": True,
@@ -270,10 +295,10 @@ def delete_device(serial_number: str, confirm: bool = Query(False)):
             "deviceName": device_name,
             "wasArchived": is_archived,
             "deletedData": {
-                "events": event_count,
+                "events": events_deleted,
                 "usageHistory": usage_history_deleted,
                 "modules": module_counts,
-                "totalModuleRecords": sum(module_counts.values())
+                "totalModuleRecords": module_rows_deleted
             },
             "timestamp": datetime.now(timezone.utc).isoformat(),
             "warning": "This data cannot be recovered"
@@ -1284,14 +1309,6 @@ def reclassify_stored_installs(
     except Exception as e:
         logger.error(f"Failed to reclassify stored installs: {e}")
         raise HTTPException(status_code=500, detail=f"Failed to reclassify stored installs: {e}")
-
-
-# Every table ingest writes a per-device row into, keyed on the serial number.
-_MODULE_TABLES = (
-    "system", "hardware", "applications", "installs", "network", "security",
-    "inventory", "management", "peripherals", "identity", "displays",
-    "printers", "profiles",
-)
 
 
 @router.get("/admin/orphans", dependencies=[Depends(verify_authentication)], tags=["admin"])
