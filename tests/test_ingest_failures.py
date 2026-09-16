@@ -708,6 +708,14 @@ def test_no_nul_means_no_recording(monkeypatch):
     assert resp.status_code == 200
     assert [q for q in _inserts(conn) if "nul_in_payload" in str(q[1])] == []
 
+    accepted = [
+        q for q in conn.cur.queries if "INSERT INTO device_ingest_state" in q[0]
+    ]
+    assert len(accepted) == 1
+    assert accepted[0][1] == ("TESTSERIAL0001",)
+    assert "NOW()" in accepted[0][0]
+    assert "collected_at" not in accepted[0][0]
+
 
 def test_rate_limited_ingest_is_recorded(monkeypatch):
     """Throttling was the largest rejection class and the only one the
@@ -837,12 +845,30 @@ def test_only_transport_reasons_can_be_retried():
     assert "upload_aborted" in retried
     assert "body_unreadable" in retried
     assert "empty_body" in retried
-    assert "d.last_seen > f.occurred_at" in retried
+    assert "device_ingest_state" in retried
+    assert "succeeded.last_accepted_at > f.occurred_at" in retried
+    assert "last_seen" not in retried
     for still_a_failure in (
         "malformed_json", "invalid_passphrase", "invalid_api_key",
         "rate_limited", "invalid_payload", "internal_error",
     ):
         assert still_a_failure not in retried
+
+
+def test_every_failure_query_uses_server_acceptance_time():
+    """List, totals and summary must not disagree about the same upload."""
+    from dependencies import load_sql
+
+    for name in (
+        "list_ingest_failures",
+        "count_ingest_failures",
+        "outcome_counts_ingest_failures",
+        "summary_ingest_failures",
+    ):
+        sql = load_sql(f"events/{name}")
+        assert "device_ingest_state" in sql
+        assert "last_accepted_at > f.occurred_at" in sql
+        assert "last_seen > f.occurred_at" not in sql
 
 
 # ---------------------------------------------------------------------------

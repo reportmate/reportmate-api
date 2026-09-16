@@ -10,8 +10,8 @@
 --               only to keep a client-side defect visible (nul_in_payload,
 --               usage_out_of_bounds).
 --   retried  -- turned away, but the payload was never the problem: the
---               upload died in transport and the device has checked in
---               successfully since. The clients retry three times with
+--               upload died in transport and the server accepted a later
+--               check-in. The clients retry three times with
 --               backoff, so this is the ordinary outcome of a dropped upload
 --               rather than a device that failed to report.
 --   rejected -- turned away with nothing since. These are the devices whose
@@ -29,9 +29,9 @@ WITH scoped AS (
                AND f.reason IN ('upload_aborted', 'body_unreadable', 'empty_body')
                AND f.serial_number IS NOT NULL
                AND EXISTS (
-                   SELECT 1 FROM devices d
-                   WHERE d.serial_number = f.serial_number
-                     AND d.last_seen > f.occurred_at
+                   SELECT 1 FROM device_ingest_state succeeded
+                   WHERE succeeded.device_id = f.serial_number
+                     AND succeeded.last_accepted_at > f.occurred_at
                )
            ) AS retried
     FROM ingest_failures f
