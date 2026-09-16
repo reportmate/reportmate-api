@@ -210,3 +210,58 @@ def test_a_client_that_has_not_reported_the_field_yet_is_null(client, monkeypatc
     device = client.get("/api/v1/system", headers=AUTH).json()[0]
     assert device["inPlaceUpgradeCount"] is None
     assert device["lastInPlaceUpgrade"] is None
+
+
+def test_installed_windows_updates_are_projected_for_fleet_search(client, monkeypatch):
+    import routers.fleet as fleet_router
+
+    def row_with_updates(index):
+        row = list(make_row(index))
+        row[3]["updates"] = [
+            {
+                "id": "KB5129195",
+                "title": "Security Update",
+                "installDate": "2026-09-15T08:30:00",
+                "category": "Windows Update",
+                "status": "Installed",
+            },
+            {
+                "hotfix_id": "KB5000001",
+                "description": "Legacy-shaped update",
+                "installed_on": "2026-08-01",
+            },
+        ]
+        return tuple(row)
+
+    monkeypatch.setattr(fleet_router, "get_db_connection",
+                        lambda: FakeConnection([row_with_updates(0)]))
+    invalidate_caches()
+
+    device = client.get("/api/v1/system", headers=AUTH).json()[0]
+    assert device["updatesCount"] == 2
+    assert device["installedUpdates"] == [
+        {"id": "KB5129195", "title": "Security Update", "installedOn": "2026-09-15T08:30:00"},
+        {"id": "KB5000001", "title": "Legacy-shaped update", "installedOn": "2026-08-01"},
+    ]
+
+
+def test_installed_update_projection_is_bounded_and_ignores_noise(client, monkeypatch):
+    import routers.fleet as fleet_router
+
+    def row_with_updates(index):
+        row = list(make_row(index))
+        row[3]["updates"] = [None, "not-an-update", {}] + [
+            {"id": f"KB{i:07d}", "title": f"Update {i}"}
+            for i in range(125)
+        ]
+        return tuple(row)
+
+    monkeypatch.setattr(fleet_router, "get_db_connection",
+                        lambda: FakeConnection([row_with_updates(0)]))
+    invalidate_caches()
+
+    device = client.get("/api/v1/system", headers=AUTH).json()[0]
+    assert device["updatesCount"] == 128
+    assert len(device["installedUpdates"]) == 100
+    assert device["installedUpdates"][0]["id"] == "KB0000000"
+    assert device["installedUpdates"][-1]["id"] == "KB0000099"

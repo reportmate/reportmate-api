@@ -26,6 +26,50 @@ _SERVICE_PRINCIPAL_NAMES = frozenset({
     "trustedinstaller", "local system",
 })
 
+_MAX_INSTALLED_UPDATES = 100
+
+
+def normalize_installed_updates(raw_updates: Any) -> List[Dict[str, Optional[str]]]:
+    """Return a small, stable projection of updates reported by endpoint clients.
+
+    ReportMate has received both .NET camelCase payloads and legacy snake_case
+    payloads. Keep that compatibility at the API boundary so fleet consumers do
+    not need to understand every historical client shape. The cap keeps the bulk
+    endpoint lean even if a producer accidentally sends an unbounded history.
+    """
+    if not isinstance(raw_updates, list):
+        return []
+
+    normalized: List[Dict[str, Optional[str]]] = []
+    for raw in raw_updates:
+        if not isinstance(raw, dict):
+            continue
+
+        update_id = (raw.get("id") or raw.get("kbNumber") or raw.get("kb_number")
+                     or raw.get("hotfixId") or raw.get("hotfix_id"))
+        title = raw.get("title") or raw.get("name") or raw.get("description")
+        installed_on = (raw.get("installDate") or raw.get("install_date")
+                        or raw.get("installedOn") or raw.get("installed_on")
+                        or raw.get("installedDate") or raw.get("installed_date"))
+
+        def text(value: Any) -> Optional[str]:
+            if value is None or isinstance(value, (dict, list)):
+                return None
+            rendered = str(value).strip()
+            return rendered[:500] if rendered else None
+
+        item = {
+            "id": text(update_id),
+            "title": text(title),
+            "installedOn": text(installed_on),
+        }
+        if item["id"] or item["title"]:
+            normalized.append(item)
+        if len(normalized) == _MAX_INSTALLED_UPDATES:
+            break
+
+    return normalized
+
 
 # A managed-software agent that has stopped running is invisible in every
 # per-item metric, because the device keeps re-uploading the last report it
@@ -3272,7 +3316,8 @@ def get_bulk_system(
     - Device identifiers and inventory
     - Operating system name, version, build number
     - System uptime, boot time
-    - Pending updates and service status (in raw field)
+    - Pending-update counts and normalized installed-update identities
+    - Service and scheduled-task counts
     """
     try:
         # Cache the whole result set and slice it per request, the way the other
@@ -3351,6 +3396,7 @@ def get_bulk_system(
                 # Get counts for services, updates, scheduled_tasks (NOT the full arrays)
                 services_count = 0
                 updates_count = 0
+                installed_updates = []
                 tasks_count = 0
                 pending_updates_count = 0
                 login_items_count = 0
@@ -3362,6 +3408,7 @@ def get_bulk_system(
                     tasks = system_data.get('scheduled_tasks') or system_data.get('scheduledTasks', [])
                     services_count = len(services) if isinstance(services, list) else 0
                     updates_count = len(updates) if isinstance(updates, list) else 0
+                    installed_updates = normalize_installed_updates(updates)
                     tasks_count = len(tasks) if isinstance(tasks, list) else 0
                     # Mac-specific counts
                     pending = system_data.get('pendingAppleUpdates') or system_data.get('pending_apple_updates', [])
@@ -3454,6 +3501,7 @@ def get_bulk_system(
                     'bootTime': system_data.get('bootTime') or system_data.get('last_boot_time') if system_data else None,
                     'servicesCount': services_count,
                     'updatesCount': updates_count,
+                    'installedUpdates': installed_updates,
                     'tasksCount': tasks_count,
                     # New enriched fields
                     'platform': platform,
@@ -4079,4 +4127,3 @@ def get_fleet_log_lines(
     except Exception as e:
         logger.error(f"Fleet log sweep failed for {tool}: {e}")
         raise HTTPException(status_code=500, detail=f"Failed to sweep logs: {str(e)}")
-
