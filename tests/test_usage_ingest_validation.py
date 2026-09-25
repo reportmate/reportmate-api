@@ -15,6 +15,7 @@ from datetime import datetime, timedelta, timezone
 from routers.events import (
     USAGE_DAY_SECONDS_CAP,
     USAGE_MIN_CLIENT_VERSION,
+    USAGE_MIN_CLIENT_VERSION_WINDOWS,
     _usage_client_too_old,
     _usage_entry_date,
     _usage_entry_numbers,
@@ -164,3 +165,16 @@ def test_unparseable_versions_are_not_judged():
     # usage from a current client whose metadata is incomplete.
     for version in (None, "", "unknown", "YYYY.MM.DD.HHMM", "1.2.3"):
         assert _usage_client_too_old(version) is False
+
+
+def test_windows_has_its_own_later_floor():
+    assert USAGE_MIN_CLIENT_VERSION_WINDOWS == "2026.09.02.0926"
+    assert _usage_client_too_old("2026.08.27.1930", "Windows") is True
+    assert _usage_client_too_old("2026.09.02.0743", "Windows") is True
+    assert _usage_client_too_old("2026.09.02.0926", "Windows") is False
+    assert _usage_client_too_old("2026.09.15.0500", "Windows") is False
+
+
+def test_macos_floor_is_unchanged_by_the_windows_one():
+    assert _usage_client_too_old("2026.09.01.0000", "macOS") is False
+    assert _usage_client_too_old("2026.08.27.0000", "macOS") is True
