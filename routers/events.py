@@ -229,17 +229,34 @@ _USAGE_DATE_MIN = "2020-01-01"
 _USAGE_DATE_FUTURE_SKEW = timedelta(days=2)
 
 
-# Oldest client build whose usage figures are trusted. Builds before it predate
-# the macOS fixes that cap foreground at total and report open sessions by
-# watermark; a dormant Mac on one of them that wakes up re-sends a month of
-# days with total 0 and the same foreground on every date. The rest of the
-# check-in is still stored -- only dailyUsageHistory is dropped.
+# Oldest client build whose usage figures are trusted, per platform. The rest
+# of a check-in from an older build is still stored -- only dailyUsageHistory
+# is dropped.
+#
+# macOS builds before 2026.08.28 predate the foreground cap and watermark
+# reporting; a dormant Mac on one of them that wakes up re-sends a month of
+# days with total 0 and the same foreground on every date.
+#
+# Windows builds before 2026.09.02.0926 count one launch per process, key days
+# on UTC rather than the local day, book a session's whole length onto its
+# start day, and can report foreground above total.
 USAGE_MIN_CLIENT_VERSION = os.environ.get("USAGE_MIN_CLIENT_VERSION", "2026.08.28.0000")
+USAGE_MIN_CLIENT_VERSION_WINDOWS = os.environ.get(
+    "USAGE_MIN_CLIENT_VERSION_WINDOWS", "2026.09.02.0926"
+)
 _CLIENT_VERSION_RE = re.compile(r"^\d{4}\.\d{2}\.\d{2}\.\d{4}$")
 
 
-def _usage_client_too_old(client_version):
-    """True when the client reports a dated build older than the usage floor.
+def _usage_min_client_version(platform):
+    """The usage floor for a platform; anything not Windows gets the macOS one."""
+    if "windows" in (platform or "").lower():
+        return USAGE_MIN_CLIENT_VERSION_WINDOWS
+    return USAGE_MIN_CLIENT_VERSION
+
+
+def _usage_client_too_old(client_version, platform=None):
+    """True when the client reports a dated build older than its platform's
+    usage floor.
 
     Only a well-formed YYYY.MM.DD.HHMM is judged: that format sorts correctly
     as a string. Anything else (a missing version, a dev build) is let through
@@ -247,7 +264,7 @@ def _usage_client_too_old(client_version):
     version = (client_version or "").strip()
     if not _CLIENT_VERSION_RE.match(version):
         return False
-    return version < USAGE_MIN_CLIENT_VERSION
+    return version < _usage_min_client_version(platform)
 
 
 USAGE_UPSERT_SQL = """
@@ -1143,13 +1160,14 @@ async def submit_events(request: Request):
                     # Long-term fix: payload-level transmission_id dedup (TODO).
                     if module_name == 'applications' and isinstance(module_data, dict):
                         daily_history = module_data.get('dailyUsageHistory', [])
-                        if daily_history and _usage_client_too_old(client_version):
+                        if daily_history and _usage_client_too_old(client_version, platform):
                             record_ingest_failure(
                                 failure_type="validation",
                                 reason="usage_client_too_old",
                                 status_code=200,
                                 detail=(f"dropped {len(daily_history)} usage rows from client "
-                                        f"{client_version}, older than {USAGE_MIN_CLIENT_VERSION}"),
+                                        f"{platform} {client_version}, older than "
+                                        f"{_usage_min_client_version(platform)}"),
                                 endpoint=request.url.path,
                                 client_ip=resolve_client_ip(request),
                                 user_agent=request.headers.get("user-agent"),
