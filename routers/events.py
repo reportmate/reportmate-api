@@ -559,9 +559,9 @@ def get_ingest_failures(
     passphrase is resent identically, so a later success says nothing about
     that check-in.
 
-    outcome is derived from the recorded status and devices.last_seen rather
-    than a stored flag, so it reads correctly over history as well, and a row
-    reclassifies on its own as soon as the device gets back in.
+    outcome is derived from the recorded status and the server-side successful
+    ingest watermark rather than a stored flag, so it reads correctly over
+    history as well, and a row reclassifies as soon as the device gets back in.
     counts.rejected / counts.retried / counts.accepted are always all present
     so the other sides are one click away rather than invisible.
     """
@@ -1521,7 +1521,20 @@ async def submit_events(request: Request):
             logger.warning(f"[WARN] INSTALLS MODULE PRESENT but NO events sent - this should not happen! Device: {serial_number}")
         else:
             logger.info(f"Skipped system event creation - {events_stored} events already in payload")
-        
+
+        # Record acceptance in server time immediately before the final ingest
+        # commit. Client collectedAt belongs to the data and can predate a
+        # retry; it cannot answer whether a later upload landed.
+        cursor.execute("""
+            INSERT INTO device_ingest_state (device_id, last_accepted_at)
+            VALUES (%s, NOW())
+            ON CONFLICT (device_id) DO UPDATE
+            SET last_accepted_at = GREATEST(
+                device_ingest_state.last_accepted_at,
+                EXCLUDED.last_accepted_at
+            )
+        """, (serial_number,))
+
         conn.commit()
 
         # Periodic retention: purge old events on ~1% of requests. Runs on a
@@ -1560,4 +1573,3 @@ async def submit_events(request: Request):
     except Exception as e:
         logger.error(f"Failed to submit events: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"Failed to process events: {str(e)}")
-
