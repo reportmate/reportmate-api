@@ -720,9 +720,13 @@ def reset_usage_history_baseline(
     before: str = Query(..., description="Archive and remove rows dated before this YYYY-MM-DD (exclusive)"),
     confirm: bool = Query(False, description="Must be true to execute; otherwise a preview is returned"),
     reason: str = Query("", description="Recorded on the archived rows so a batch can be identified later"),
+    device: Optional[List[str]] = Query(None, description="Limit the reset to these serial numbers; repeat for several"),
 ):
     """
     Archive and remove usage_history rows before a cutoff date.
+
+    With ``device`` the reset is limited to those serial numbers, for the case
+    where one client build wrote bad rows and the rest of the fleet is sound.
 
     **This is a DESTRUCTIVE operation on the live reporting table.**
 
@@ -753,6 +757,12 @@ def reset_usage_history_baseline(
 
         # A pooled connection's 120s statement_timeout is too short for the
         # table-wide aggregates and the archive copy; use a dedicated one.
+        devices = sorted({d.strip() for d in (device or []) if d and d.strip()})
+        if devices:
+            scope, scope_params = "date < %s AND device_id = ANY(%s)", (cutoff, devices)
+        else:
+            scope, scope_params = "date < %s", (cutoff,)
+
         conn = get_maintenance_db_connection()
         cursor = conn.cursor()
 
@@ -763,9 +773,8 @@ def reset_usage_history_baseline(
             SELECT COUNT(*), COUNT(DISTINCT device_id), COUNT(DISTINCT app_name),
                    MIN(date)::text, MAX(date)::text
             FROM usage_history
-            WHERE date < %s
-            """,
-            (cutoff,),
+            WHERE """ + scope,
+            scope_params,
         )
         row = cursor.fetchone() or (0, 0, 0, None, None)
         affected = {
@@ -779,8 +788,8 @@ def reset_usage_history_baseline(
         # What survives the reset, so the caller can see the resulting baseline
         # rather than inferring it.
         cursor.execute(
-            "SELECT COUNT(*), MIN(date)::text, MAX(date)::text FROM usage_history WHERE date >= %s",
-            (cutoff,),
+            "SELECT COUNT(*), MIN(date)::text, MAX(date)::text FROM usage_history WHERE NOT (" + scope + ")",
+            scope_params,
         )
         kept = cursor.fetchone() or (0, None, None)
         remaining = {
@@ -795,6 +804,7 @@ def reset_usage_history_baseline(
                 "status": "preview",
                 "executed": False,
                 "cutoffDate": str(cutoff),
+                "devices": devices,
                 "wouldArchiveAndDelete": affected,
                 "wouldRemain": remaining,
                 "detail": "Nothing was changed. Re-send with confirm=true to execute.",
@@ -825,13 +835,12 @@ def reset_usage_history_baseline(
                    total_seconds, active_seconds, foreground_seconds, users,
                    updated_at, %s
             FROM usage_history
-            WHERE date < %s
-            """,
-            (reason, cutoff),
+            WHERE """ + scope,
+            (reason,) + scope_params,
         )
         archived = cursor.rowcount
 
-        cursor.execute("DELETE FROM usage_history WHERE date < %s", (cutoff,))
+        cursor.execute("DELETE FROM usage_history WHERE " + scope, scope_params)
         deleted = cursor.rowcount
 
         # Refuse to commit a partial copy rather than leave rows unrecoverable.
@@ -855,14 +864,15 @@ def reset_usage_history_baseline(
         invalidate_caches()
 
         logger.warning(
-            "usage_history baseline reset: archived and deleted %s rows before %s (reason=%r)",
-            deleted, cutoff, reason,
+            "usage_history baseline reset: archived and deleted %s rows before %s devices=%s (reason=%r)",
+            deleted, cutoff, devices or "all", reason,
         )
 
         return {
             "status": "ok",
             "executed": True,
             "cutoffDate": str(cutoff),
+            "devices": devices,
             "archived": archived,
             "deleted": deleted,
             "remaining": remaining,
