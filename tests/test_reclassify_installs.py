@@ -59,3 +59,14 @@ def test_it_is_a_manual_post_and_authenticated():
     assert '@router.post("/admin/installs/reclassify"' in TEXT
     idx = TEXT.index('@router.post("/admin/installs/reclassify"')
     assert "verify_authentication" in TEXT[idx:idx + 200]
+
+
+def test_it_does_not_present_itself_as_a_fresh_check_in():
+    # /installs/full reports installs.updated_at as collectedAt. Stamping it in
+    # a maintenance rewrite made 70 devices last seen weeks to nine months ago
+    # look like they had just reported, and a consumer keying on collectedAt
+    # believed it.
+    src = _reclassify_src()
+    update = src[src.index("UPDATE installs"):]
+    update = update[: update.index('"""')]
+    assert "updated_at" not in update, "a reclassify must not move the freshness stamp"
