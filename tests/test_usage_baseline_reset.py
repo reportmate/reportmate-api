@@ -177,6 +177,37 @@ class TestExecution:
         assert not any("INSERT INTO usage_history_archive" in s for s, _ in cursor.executed)
 
 
+class TestDeviceScope:
+    def test_device_filter_scopes_every_statement(self, client):
+        cursor = FakeCursor([COUNTS, KEPT], rowcounts=[0, 0, 40, 40])
+        conn, p = _patch_db(cursor)
+        with p, patch("routers.admin.invalidate_caches"):
+            body = client.post(
+                "/api/v1/admin/usage-history/reset-baseline"
+                "?before=2026-09-26&confirm=true&device=SERIAL-B&device=SERIAL-A"
+            ).json()
+
+        assert body["devices"] == ["SERIAL-A", "SERIAL-B"]
+        assert body["deleted"] == 40
+        assert conn.committed
+        for sql, params in cursor.executed:
+            assert "device_id = ANY(%s)" in sql
+            assert ["SERIAL-A", "SERIAL-B"] in list(params)
+        # What survives is everything outside the scope, not only later dates.
+        assert any("WHERE NOT (" in s for s, _ in cursor.executed)
+
+    def test_without_device_the_scope_is_the_whole_fleet(self, client):
+        cursor = FakeCursor([COUNTS, KEPT])
+        _, p = _patch_db(cursor)
+        with p:
+            body = client.post(
+                "/api/v1/admin/usage-history/reset-baseline?before=2026-09-01"
+            ).json()
+
+        assert body["devices"] == []
+        assert not any("device_id = ANY" in s for s, _ in cursor.executed)
+
+
 class TestInputValidation:
     @pytest.mark.parametrize("bad", ["2026-13-01", "01-09-2026", "september", "2026/09/01", ""])
     def test_a_malformed_cutoff_is_rejected(self, client, bad):

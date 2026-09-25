@@ -229,6 +229,27 @@ _USAGE_DATE_MIN = "2020-01-01"
 _USAGE_DATE_FUTURE_SKEW = timedelta(days=2)
 
 
+# Oldest client build whose usage figures are trusted. Builds before it predate
+# the macOS fixes that cap foreground at total and report open sessions by
+# watermark; a dormant Mac on one of them that wakes up re-sends a month of
+# days with total 0 and the same foreground on every date. The rest of the
+# check-in is still stored -- only dailyUsageHistory is dropped.
+USAGE_MIN_CLIENT_VERSION = os.environ.get("USAGE_MIN_CLIENT_VERSION", "2026.08.28.0000")
+_CLIENT_VERSION_RE = re.compile(r"^\d{4}\.\d{2}\.\d{2}\.\d{4}$")
+
+
+def _usage_client_too_old(client_version):
+    """True when the client reports a dated build older than the usage floor.
+
+    Only a well-formed YYYY.MM.DD.HHMM is judged: that format sorts correctly
+    as a string. Anything else (a missing version, a dev build) is let through
+    so a metadata gap never silently drops usage from a current client."""
+    version = (client_version or "").strip()
+    if not _CLIENT_VERSION_RE.match(version):
+        return False
+    return version < USAGE_MIN_CLIENT_VERSION
+
+
 USAGE_UPSERT_SQL = """
 INSERT INTO usage_history (device_id, date, app_name, publisher, launches, total_seconds, active_seconds, foreground_seconds, users, updated_at)
 VALUES (%s, %s, %s, %s, %s, %s,
@@ -1122,6 +1143,19 @@ async def submit_events(request: Request):
                     # Long-term fix: payload-level transmission_id dedup (TODO).
                     if module_name == 'applications' and isinstance(module_data, dict):
                         daily_history = module_data.get('dailyUsageHistory', [])
+                        if daily_history and _usage_client_too_old(client_version):
+                            record_ingest_failure(
+                                failure_type="validation",
+                                reason="usage_client_too_old",
+                                status_code=200,
+                                detail=(f"dropped {len(daily_history)} usage rows from client "
+                                        f"{client_version}, older than {USAGE_MIN_CLIENT_VERSION}"),
+                                endpoint=request.url.path,
+                                client_ip=resolve_client_ip(request),
+                                user_agent=request.headers.get("user-agent"),
+                                identity=extract_ingest_identity(payload),
+                            )
+                            daily_history = []
                         if daily_history:
                             try:
                                 stored = 0

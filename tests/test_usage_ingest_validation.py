@@ -14,6 +14,8 @@ from datetime import datetime, timedelta, timezone
 
 from routers.events import (
     USAGE_DAY_SECONDS_CAP,
+    USAGE_MIN_CLIENT_VERSION,
+    _usage_client_too_old,
     _usage_entry_date,
     _usage_entry_numbers,
 )
@@ -144,3 +146,21 @@ def test_timezone_skew_tolerated_but_not_more():
     far = (today + timedelta(days=3)).isoformat()
     assert _usage_entry_date({"date": tomorrow}) == tomorrow
     assert _usage_entry_date({"date": far}) is None
+
+
+def test_builds_before_the_usage_floor_are_too_old():
+    assert USAGE_MIN_CLIENT_VERSION == "2026.08.28.0000"
+    assert _usage_client_too_old("2026.08.20.1907") is True
+    assert _usage_client_too_old("2026.08.27.2359") is True
+
+
+def test_builds_at_or_after_the_floor_are_accepted():
+    assert _usage_client_too_old("2026.08.28.0000") is False
+    assert _usage_client_too_old("2026.09.24.0622") is False
+
+
+def test_unparseable_versions_are_not_judged():
+    # A missing or non-dated version is let through rather than dropping
+    # usage from a current client whose metadata is incomplete.
+    for version in (None, "", "unknown", "YYYY.MM.DD.HHMM", "1.2.3"):
+        assert _usage_client_too_old(version) is False
