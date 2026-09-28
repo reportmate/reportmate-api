@@ -567,10 +567,12 @@ def get_ingest_failures(
     carries declared vs received byte counts so the two stay separable.
 
     A transport failure is only a failed check-in if nothing arrived
-    afterwards. The clients retry three times with backoff, so a dropped
-    upload is normally resent down a fresh connection seconds later and the
-    data lands; counting the dropped attempt as a device that was turned away
-    describes an outage that is not happening. A transport row whose device
+    afterwards. Both clients make up to three attempts per check-in, 1s then
+    2s apart (MaxRetryAttempts), and the next scheduled run sends again if
+    those are spent. A dropped upload is therefore normally resent down a
+    fresh connection seconds later and the data lands; counting the dropped
+    attempt as a device that was turned away describes an outage that is not
+    happening. A transport row whose device
     has a later successful check-in is therefore ``retried``, not
     ``rejected``. Only transport reasons qualify: a malformed body or a bad
     passphrase is resent identically, so a later success says nothing about
