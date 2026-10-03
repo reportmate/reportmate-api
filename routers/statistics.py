@@ -14,6 +14,7 @@ from dependencies import (
     cache_get, cache_set, get_db_connection, load_sql, logger,
     verify_authentication, infer_platform,
 )
+from routers.inventory_state import fetch_inventory_states, is_stored, normalize_serial
 
 router = APIRouter(tags=["statistics"])
 
@@ -39,7 +40,8 @@ async def get_dashboard_data(
     Returns:
         {
             "devices": [...],           # Full device list with OS data
-            "totalDevices": int,        # Total device count
+            "totalDevices": int,        # Fleet count, stored devices excluded
+            "storageDevices": int,      # Devices an inventory says are in storage
             "installStats": {...},      # Install error/warning counts
             "events": [...],            # Recent events for widget
             "totalEvents": int,         # Total recent events count
@@ -112,6 +114,9 @@ def _compute_dashboard_data(events_limit: int, include_archived: bool):
             logger.warning(f"Failed to batch-fetch hardware names: {hw_err}")
         _t4 = _time.monotonic()
         logger.info(f"[DASHBOARD PERF] hardware name batch: {_t4-_t3:.3f}s ({len(hw_lookup)} rows)")
+
+        # === STEP 3b: Inventory state (stored devices leave the fleet counts) ===
+        inventory_states = fetch_inventory_states(conn)
 
         # === STEP 4: Build device list in Python (fast dict lookups) ===
         now_utc = datetime.now(timezone.utc)
@@ -187,6 +192,7 @@ def _compute_dashboard_data(events_limit: int, include_archived: bool):
                 "archived": archived or False,
                 "lastSeen": last_seen.isoformat() if last_seen else None,
                 "createdAt": created_at.isoformat() if created_at else None,
+                "inventoryState": inventory_states.get(normalize_serial(serial_number)),
                 "modules": modules_obj
             })
 
@@ -221,6 +227,12 @@ def _compute_dashboard_data(events_limit: int, include_archived: bool):
                     FROM installs i
                     INNER JOIN devices d ON d.serial_number = i.device_id
                     WHERE d.archived = FALSE
+                      -- A device on a shelf is not failing anyone's installs.
+                      AND NOT EXISTS (
+                          SELECT 1 FROM device_inventory_state st
+                          WHERE st.serial_number = UPPER(d.serial_number)
+                            AND st.state = 'storage'
+                      )
                 )
                 SELECT
                     -- Item totals (per platform)
@@ -347,9 +359,14 @@ def _compute_dashboard_data(events_limit: int, include_archived: bool):
 
         conn.close()
 
+        # Stored devices stay in the list, so they can be found and shown,
+        # but they are not part of the fleet being counted.
+        storage_devices = sum(1 for d in devices if is_stored(d.get("inventoryState")))
+
         result = {
             "devices": devices,
-            "totalDevices": len(devices),
+            "totalDevices": len(devices) - storage_devices,
+            "storageDevices": storage_devices,
             "installStats": install_stats,
             "events": events,
             "totalEvents": len(events),

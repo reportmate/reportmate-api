@@ -20,6 +20,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
 
 from pagination import add_pagination_headers
 from log_tails import strip_log_tails
+from routers.inventory_state import fetch_inventory_states, normalize_serial
 
 from dependencies import (
     logger,
@@ -146,6 +147,7 @@ def get_all_devices(
             cursor.execute(query)
 
         rows = cursor.fetchall()
+        inventory_states = fetch_inventory_states(conn)
 
         devices: List[Dict[str, Any]] = []
 
@@ -265,6 +267,9 @@ def get_all_devices(
                 "lastEventTime": last_seen.isoformat() if last_seen else None,
                 "totalEvents": 0,
             }
+            inventory_state = inventory_states.get(normalize_serial(serial))
+            if inventory_state:
+                device_info["inventoryState"] = inventory_state
 
             # DEBUG: Log what we're actually adding to device_info
             logger.info(
@@ -449,6 +454,9 @@ def get_device_by_serial(serial_number: str):
             except Exception as e:
                 logger.warning(f"Failed to get {table} data for {serial_num}: {e}")
 
+        inventory_state = fetch_inventory_states(conn, [serial_num]).get(
+            normalize_serial(serial_num)
+        )
         conn.close()
 
         # Resolve best device name: inventory.deviceName > network.hostname > stored name > serial
@@ -486,6 +494,7 @@ def get_device_by_serial(serial_number: str):
                 "registrationDate": created_at.isoformat() if created_at else None,
                 "archived": archived or False,
                 "archivedAt": archived_at.isoformat() if archived_at else None,
+                "inventoryState": inventory_state,
                 "modules": modules,
             },
         }

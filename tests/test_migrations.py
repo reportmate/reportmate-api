@@ -31,6 +31,7 @@ def test_baseline_renders_offline():
     assert "idempotency_keys" in sql
     assert "device_ingest_state" in sql
     assert "last_accepted_at" in sql
+    assert "device_inventory_state" in sql
     # 0008 drops the module GIN indexes the baseline created; both sides must
     # render so the drop is versioned and reversible rather than ad hoc.
     assert "CREATE INDEX IF NOT EXISTS idx_applications_data_gin" in sql
