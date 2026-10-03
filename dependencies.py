@@ -1329,6 +1329,9 @@ class DeviceInfo(BaseModel):
     totalEvents: Optional[int] = None
     inventory: Optional[InventorySummary] = None
     modules: Optional[DeviceModules] = None
+    # What the asset inventory says the device is doing -- checked out,
+    # stored, or being decommissioning -- when an inventory reports it.
+    inventoryState: Optional[Dict[str, Any]] = None
 
 
 class DevicesResponse(BaseModel):
