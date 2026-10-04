@@ -15,6 +15,7 @@ from dependencies import (
     canonicalize_app_name, normalize_app_name, paginate, verify_authentication,
     build_os_summary, infer_platform,
 )
+from routers.inventory_state import fetch_inventory_states, is_stored, normalize_serial
 
 router = APIRouter(tags=["fleet"])
 
@@ -27,6 +28,28 @@ _SERVICE_PRINCIPAL_NAMES = frozenset({
 })
 
 _MAX_INSTALLED_UPDATES = 100
+
+
+def attach_inventory_states(
+    rows: List[Dict[str, Any]],
+    states: Dict[str, Dict[str, Any]],
+    key: str = "serialNumber",
+) -> List[Dict[str, Any]]:
+    """Put each device's inventory state on its row as ``inventoryState``.
+
+    A device an asset inventory reports as stored is expected to be silent, so
+    every page that judges a device stale, missing or dark reads this to show
+    it as Storage instead. Rows with no state are left untouched.
+    """
+    if not rows or not states:
+        return rows
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        state = states.get(normalize_serial(row.get(key)))
+        if state:
+            row["inventoryState"] = state
+    return rows
 
 
 def normalize_installed_updates(raw_updates: Any) -> List[Dict[str, Optional[str]]]:
@@ -252,6 +275,7 @@ def get_applications_filters(
         cursor.execute(devices_query, {"include_archived": include_archived})
         device_rows = cursor.fetchall()
         
+        inventory_states = fetch_inventory_states(conn)
         conn.close()
         
         usages = set()
@@ -298,7 +322,7 @@ def get_applications_filters(
             'rooms': sorted(locations),
             'areas': sorted(areas),
             'fleets': sorted(fleets),
-            'devices': devices,
+            'devices': attach_inventory_states(devices, inventory_states),
             'devicesWithData': len(devices)
         }
         cache_set("applications_filters", _result, _ckey)
@@ -1223,6 +1247,7 @@ def get_applications_collection_health(
               {archived_clause}
         """)
         rows = cursor.fetchall()
+        inventory_states = fetch_inventory_states(conn)
 
         conn.close()
         conn = None
@@ -1234,6 +1259,10 @@ def get_applications_collection_health(
         bucket_counts = {"healthy": 0, "stale": 0, "dark": 0, "never": 0}
         bucket_counts_by_platform: Dict[str, Dict[str, int]] = {}
         dark_devices: List[Dict[str, Any]] = []
+        # A stored device has no user, so silent usage collection on it is
+        # expected rather than a collection fault. Counted apart, outside the
+        # four buckets and the total.
+        storage_count = 0
 
         for (serial, device_name, platform, os_name, last_seen,
              inv_usage, catalog, location, last_usage_date,
@@ -1241,6 +1270,10 @@ def get_applications_collection_health(
 
             # Normalize platform label for grouping.
             plat = infer_platform(platform or os_name) or (platform or 'Unknown')
+
+            if is_stored(inventory_states.get(normalize_serial(serial))):
+                storage_count += 1
+                continue
 
             if last_usage_date is None:
                 bucket = "never"
@@ -1298,6 +1331,7 @@ def get_applications_collection_health(
             "summary": {
                 "totalDevices": total,
                 **bucket_counts,
+                "storage": storage_count,
                 "freshDays": freshDays,
                 "staleDays": staleDays,
             },
@@ -1705,6 +1739,7 @@ def get_bulk_applications(
         
         cursor.execute(query, tuple(query_params))
         rows = cursor.fetchall()
+        inventory_states = fetch_inventory_states(conn)
         conn.close()
         conn = None
         
@@ -1804,6 +1839,7 @@ def get_bulk_applications(
                         all_applications.append(bucket[i])
         
         logger.info(f"Processed {len(all_applications)} applications from {len(rows)} devices")
+        attach_inventory_states(all_applications, inventory_states)
         cache_set("applications", all_applications, _ckey)
         logger.info(f"[PERF] /api/devices/applications: {_time.monotonic()-_t0:.3f}s ({len(all_applications)} apps)")
         return paginate(all_applications, limit, offset)
@@ -1913,6 +1949,7 @@ def get_bulk_hardware(
 
         cursor.execute(query, {"include_archived": include_archived})
         rows = cursor.fetchall()
+        inventory_states = fetch_inventory_states(conn)
         conn.close()
         
         logger.info(f"Retrieved {len(rows)} devices with hardware data")
@@ -2042,6 +2079,7 @@ def get_bulk_hardware(
                 continue
         
         logger.info(f"Processed {len(all_hardware)} hardware records")
+        attach_inventory_states(all_hardware, inventory_states)
         cache_set("hardware", all_hardware, _ckey)
         logger.info(f"[PERF] /api/devices/hardware: {_time.monotonic()-_t0:.3f}s ({len(all_hardware)} devices)")
         # X-Total-Count is how a paging client tells a short page from a truncated
@@ -2083,10 +2121,12 @@ def get_installs_filters(
         query = load_sql("devices/installs_filter_options")
         cursor.execute(query, {"include_archived": include_archived})
         rows = cursor.fetchall()
+        inventory_states = fetch_inventory_states(conn)
         conn.close()
         
         managed_installs = set()
         stale_agents = []
+        stored_device_count = 0
         cimian_installs = set()
         munki_installs = set()
         usages = set()
@@ -2300,7 +2340,16 @@ def get_installs_filters(
                     }
                 }
             
-            if stale_days is not None and stale_days >= STALE_AGENT_THRESHOLD_DAYS:
+            # A stored device is not expected to run its agent; a dead agent
+            # there is not the fault this list exists to surface.
+            stored = is_stored(inventory_states.get(normalize_serial(serial)))
+            if stored:
+                stored_device_count += 1
+            if (
+                stale_days is not None
+                and stale_days >= STALE_AGENT_THRESHOLD_DAYS
+                and not stored
+            ):
                 stale_agents.append({
                     'serialNumber': serial,
                     'deviceName': device_name or serial,
@@ -2362,7 +2411,8 @@ def get_installs_filters(
             'staleAgents': sorted(
                 stale_agents, key=lambda d: d['staleDays'], reverse=True
             ),
-            'devices': devices
+            'storageDeviceCount': stored_device_count,
+            'devices': attach_inventory_states(devices, inventory_states)
         }
         cache_set("installs_filters", _result, _ckey)
         logger.info(f"[PERF] /api/devices/installs/filters: {_time.monotonic()-_t0:.3f}s")
@@ -2406,6 +2456,7 @@ def get_bulk_installs(
         
         cursor.execute(query, {"include_archived": include_archived})
         rows = cursor.fetchall()
+        inventory_states = fetch_inventory_states(conn)
         conn.close()
         
         logger.info(f"Retrieved {len(rows)} devices with installs data")
@@ -2482,6 +2533,7 @@ def get_bulk_installs(
                 continue
         
         logger.info(f"Processed {len(all_installs)} install records from {len(rows)} devices")
+        attach_inventory_states(all_installs, inventory_states)
         cache_set("installs", all_installs, _ckey)
         logger.info(f"[PERF] /api/devices/installs: {_time.monotonic()-_t0:.3f}s ({len(all_installs)} records)")
         return paginate(all_installs, limit, offset)
@@ -2548,6 +2600,7 @@ def get_bulk_installs_full(
         
         cursor.execute(query)
         rows = cursor.fetchall()
+        inventory_states = fetch_inventory_states(conn)
         conn.close()
         
         logger.info(f"Retrieved {len(rows)} devices with full installs data")
@@ -2626,6 +2679,7 @@ def get_bulk_installs_full(
                 continue
         
         logger.info(f"Processed {len(devices)} devices with full installs structure")
+        attach_inventory_states(devices, inventory_states)
         cache_set("installs_full", devices, _ckey)
         logger.info(f"[PERF] /api/devices/installs/full: {_time.monotonic()-_t0:.3f}s ({len(devices)} devices)")
         return paginate(devices, limit, offset)
@@ -2669,6 +2723,7 @@ def get_bulk_network(
         
         cursor.execute(query, {"include_archived": include_archived})
         rows = cursor.fetchall()
+        inventory_states = fetch_inventory_states(conn)
         conn.close()
         
         logger.info(f"Retrieved {len(rows)} devices with network data")
@@ -2712,6 +2767,7 @@ def get_bulk_network(
                 continue
         
         logger.info(f"Processed {len(devices)} devices with network data")
+        attach_inventory_states(devices, inventory_states)
         cache_set("network", devices, _ckey)
         logger.info(f"[PERF] /api/devices/network: {_time.monotonic()-_t0:.3f}s ({len(devices)} devices)")
         return paginate(devices, limit, offset)
@@ -2755,6 +2811,7 @@ def get_bulk_security(
         
         cursor.execute(query, {"include_archived": include_archived})
         rows = cursor.fetchall()
+        inventory_states = fetch_inventory_states(conn)
         conn.close()
         
         logger.info(f"Retrieved {len(rows)} devices with security data")
@@ -2880,6 +2937,7 @@ def get_bulk_security(
                 continue
         
         logger.info(f"Processed {len(devices)} devices with security data")
+        attach_inventory_states(devices, inventory_states)
         cache_set("security", devices, _ckey)
         logger.info(f"[PERF] /api/devices/security: {_time.monotonic()-_t0:.3f}s ({len(devices)} devices)")
         return paginate(devices, limit, offset)
@@ -3063,6 +3121,7 @@ def get_bulk_management(
         
         cursor.execute(query, {"include_archived": include_archived})
         rows = cursor.fetchall()
+        inventory_states = fetch_inventory_states(conn)
         conn.close()
         
         logger.info(f"Retrieved {len(rows)} devices with management data")
@@ -3215,6 +3274,7 @@ def get_bulk_management(
                 continue
         
         logger.info(f"Processed {len(devices)} devices with management data")
+        attach_inventory_states(devices, inventory_states)
         cache_set("management", devices, _ckey)
         logger.info(f"[PERF] /api/devices/management: {_time.monotonic()-_t0:.3f}s ({len(devices)} devices)")
         return paginate(devices, limit, offset)
@@ -3257,6 +3317,7 @@ def get_bulk_inventory(
         
         cursor.execute(query, {"include_archived": include_archived})
         rows = cursor.fetchall()
+        inventory_states = fetch_inventory_states(conn)
         conn.close()
         
         logger.info(f"Retrieved {len(rows)} devices with inventory data")
@@ -3285,6 +3346,7 @@ def get_bulk_inventory(
                 continue
         
         logger.info(f"Processed {len(devices)} devices with inventory data")
+        attach_inventory_states(devices, inventory_states)
         cache_set("inventory", devices, _ckey)
         logger.info(f"[PERF] /api/devices/inventory: {_time.monotonic()-_t0:.3f}s ({len(devices)} devices)")
         return paginate(devices, limit, offset)
@@ -3342,6 +3404,7 @@ def get_bulk_system(
         
         cursor.execute(query, {"include_archived": include_archived})
         rows = cursor.fetchall()
+        inventory_states = fetch_inventory_states(conn)
         conn.close()
         
         logger.info(f"Retrieved {len(rows)} devices with system data")
@@ -3531,6 +3594,7 @@ def get_bulk_system(
                 continue
         
         logger.info(f"Processed {len(devices)} devices with system data")
+        attach_inventory_states(devices, inventory_states)
         cache_set("system", devices, _ckey)
         logger.info(f"[PERF] /api/devices/system: {_time.monotonic()-_t0:.3f}s ({len(devices)} devices)")
         # X-Total-Count is how a paging client tells a short page from a truncated
@@ -3585,6 +3649,7 @@ def get_bulk_peripherals(
         
         cursor.execute(query, {"include_archived": include_archived})
         rows = cursor.fetchall()
+        inventory_states = fetch_inventory_states(conn)
         conn.close()
         
         logger.info(f"Retrieved {len(rows)} devices with peripherals data")
@@ -3644,6 +3709,7 @@ def get_bulk_peripherals(
                 continue
         
         logger.info(f"Processed {len(devices)} devices with peripherals data")
+        attach_inventory_states(devices, inventory_states)
         cache_set("peripherals", devices, _ckey)
         logger.info(f"[PERF] /api/devices/peripherals: {_time.monotonic()-_t0:.3f}s ({len(devices)} devices)")
         return paginate(devices, limit, offset)
@@ -3691,6 +3757,7 @@ def get_bulk_identity(
         
         cursor.execute(query, {"include_archived": include_archived})
         rows = cursor.fetchall()
+        inventory_states = fetch_inventory_states(conn)
         conn.close()
         
         logger.info(f"Retrieved {len(rows)} devices with identity data")
@@ -3874,6 +3941,7 @@ def get_bulk_identity(
                 continue
         
         logger.info(f"Processed {len(devices)} devices with identity data")
+        attach_inventory_states(devices, inventory_states)
         cache_set("identity", devices, _ckey)
         logger.info(f"[PERF] /api/devices/identity: {_time.monotonic()-_t0:.3f}s ({len(devices)} devices)")
         return paginate(devices, limit, offset)
@@ -3911,6 +3979,7 @@ def get_bulk_profiles(
         
         cursor.execute(query, {"include_archived": include_archived})
         rows = cursor.fetchall()
+        inventory_states = fetch_inventory_states(conn)
         conn.close()
         
         logger.info(f"Retrieved {len(rows)} devices with profiles data")
@@ -3950,6 +4019,7 @@ def get_bulk_profiles(
                 continue
         
         logger.info(f"Processed {len(devices)} devices with profiles data")
+        attach_inventory_states(devices, inventory_states)
         cache_set("profiles", devices, _ckey)
         logger.info(f"[PERF] /api/devices/profiles: {_time.monotonic()-_t0:.3f}s ({len(devices)} devices)")
         return paginate(devices, limit, offset)
