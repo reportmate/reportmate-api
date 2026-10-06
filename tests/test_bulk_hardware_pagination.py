@@ -48,6 +48,7 @@ def make_row(index: int):
                 "freeSpace": 12000000000,
                 "isInternal": True,
                 "interface": "NVMe",
+                "volumeLetters": ["C"],
             }],
         },
         datetime.datetime(2026, 8, 27, 11, 0, 0),
@@ -209,4 +210,5 @@ def test_storage_is_projected_for_the_alert_that_reads_it(client):
     assert drive["freeSpace"] == 12000000000
     assert drive["isInternal"] is True
     assert drive["interface"] == "NVMe"
+    assert drive["volumeLetters"] == ["C"]
     assert device["usage"] == "Shared"
