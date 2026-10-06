@@ -1994,6 +1994,7 @@ def get_bulk_hardware(
                             'health': d.get('health'),
                             'interface': d.get('interface'),
                             'isInternal': d.get('isInternal'),
+                            'volumeLetters': d.get('volumeLetters'),
                         } for d in storage_data]
                     elif isinstance(storage_data, dict):
                         slim_storage = storage_data
