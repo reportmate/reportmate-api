@@ -1412,7 +1412,7 @@ async def submit_events(request: Request):
                       )
             """, (serial_number, collected_at, list(INSTALLS_EVENT_MODULES)))
             if cursor.rowcount:
-                logger.info(f"Superseded {cursor.rowcount} installs event(s) for device {serial_number}")
+                logger.debug(f"Superseded {cursor.rowcount} installs event(s) for device {serial_number}")
 
         for event in payload_events:
             try:
