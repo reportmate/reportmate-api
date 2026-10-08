@@ -23,7 +23,7 @@ This is deliberately **not** changed here because a pooling rewrite must be vali
 
 ### 2. Auth model is a single shared secret
 
-There is no per-user identity or RBAC on the API. Anything holding `X-Internal-Secret` (or the client passphrase) is fully authorized, including writing org settings via `PUT /api/v1/settings`. Settings write-gating is enforced **upstream** in the Next.js proxy (admin role check) — document this and treat it as a known v1 constraint. If stronger control is needed later, forward the session principal in a header and enforce server-side.
+There is no per-user identity or RBAC on the API. Anything holding `X-Internal-Secret` is fully authorized, including writing org settings via `PUT /api/v1/settings`. The shared client passphrase is read only, and per-client API keys carry only their granted scopes. Settings write-gating is enforced **upstream** in the Next.js proxy (admin role check) — document this and treat it as a known v1 constraint. If stronger control is needed later, forward the session principal in a header and enforce server-side.
 
 ### 3. WebPubSub
 
