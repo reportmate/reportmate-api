@@ -3191,7 +3191,8 @@ def get_bulk_management(
                 # Provider detection - the active MDM server/check-in URL is
                 # authoritative; the MDM identity certificate is only a fallback
                 # because it goes stale after a device migrates between MDMs.
-                # Priority: explicit provider > enrollment URL > certificate > "Unmanaged"
+                # Priority: explicit provider > enrollment URL > mdm_info server URL >
+                # certificate > Intune data > "Unknown MDM" (managed) / "Unmanaged"
                 provider = mdm_enrollment.get('provider')
                 if not provider:
                     server_url = mdm_enrollment.get('server_url') or mdm_enrollment.get('serverUrl') or ''
