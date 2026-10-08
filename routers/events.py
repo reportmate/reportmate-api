@@ -25,23 +25,13 @@ from install_status import (
 )
 
 from dependencies import (
-    broadcast_event,
-    cache_get,
-    cache_set,
-    get_db_connection,
-    load_sql,
-    logger,
-    paginate,
-    verify_authentication,
-    VALID_MODULE_NAMES,
-    infer_platform,
-    build_os_summary,
+    broadcast_event, cache_get, cache_set, get_db_connection,
+    load_sql, logger, paginate,
+    verify_authentication, VALID_MODULE_NAMES,
+    infer_platform, build_os_summary,
     EventSubmission,
-    extract_ingest_identity,
-    extract_ingest_identity_headers,
-    merge_ingest_identity,
-    record_ingest_failure,
-    resolve_client_ip,
+    extract_ingest_identity, extract_ingest_identity_headers,
+    merge_ingest_identity, record_ingest_failure, resolve_client_ip,
 )
 
 router = APIRouter(tags=["events"])
@@ -51,8 +41,7 @@ router = APIRouter(tags=["events"])
 # replace the previous run's instead of accumulating: the run that fixes a
 # problem is what clears it. Everything else (collection summaries, reboots)
 # stays a timeline and keeps its history.
-INSTALLS_EVENT_MODULES = ("installs", "managedinstalls", "munkireport")
-
+INSTALLS_EVENT_MODULES = ('installs', 'managedinstalls', 'munkireport')
 
 def _run_retention_purge():
     """Delete expired events/idempotency keys in bounded batches.
@@ -203,9 +192,8 @@ def _decompress_body(request: Request, raw_body: bytes) -> bytes:
     return body
 
 
-def _reject_ingest(
-    request: Request, payload, *, reason: str, detail: str, status_code: int = 400
-):
+def _reject_ingest(request: Request, payload, *, reason: str, detail: str,
+                   status_code: int = 400):
     """Persist a rejected check-in with whatever identity it presented, then
     raise the HTTP error. The device failed validation, but it still told us
     who it is -- that is exactly what /events/failures exists to surface.
@@ -323,10 +311,10 @@ def _usage_entry_numbers(entry):
     still surfaces instead of being absorbed."""
     try:
         values = (
-            int(entry.get("launches", 0) or 0),
-            float(entry.get("totalSeconds", 0) or 0),
-            float(entry.get("activeSeconds", 0) or 0),
-            float(entry.get("foregroundSeconds", 0) or 0),
+            int(entry.get('launches', 0) or 0),
+            float(entry.get('totalSeconds', 0) or 0),
+            float(entry.get('activeSeconds', 0) or 0),
+            float(entry.get('foregroundSeconds', 0) or 0),
         )
     except (TypeError, ValueError):
         return None
@@ -334,13 +322,8 @@ def _usage_entry_numbers(entry):
         return None
     if min(values) < 0:
         launches, total, active, foreground = values
-        return (
-            max(0, launches),
-            max(0.0, total),
-            max(0.0, active),
-            max(0.0, foreground),
-            True,
-        )
+        return (max(0, launches), max(0.0, total), max(0.0, active),
+                max(0.0, foreground), True)
     return values + (False,)
 
 
@@ -348,9 +331,9 @@ def _usage_entry_date(entry):
     """Return the entry's date as YYYY-MM-DD, or None if malformed or outside
     the plausible window. A malformed date must not reach the INSERT: one bad
     row would abort the whole batch."""
-    raw = str(entry.get("date") or "")[:10]
+    raw = str(entry.get('date') or '')[:10]
     try:
-        parsed = datetime.strptime(raw, "%Y-%m-%d").date()
+        parsed = datetime.strptime(raw, '%Y-%m-%d').date()
     except ValueError:
         return None
     today = datetime.now(timezone.utc).date()
@@ -365,7 +348,7 @@ def _squash_serial(value):
     Used only for placeholder matching, so that "Default string",
     "Defaultstring" and "DEFAULT_STRING" collapse to one key. Real serials are
     compared verbatim everywhere else."""
-    return re.sub(r"[^a-z0-9]", "", (value or "").lower())
+    return re.sub(r'[^a-z0-9]', '', (value or '').lower())
 
 
 def _reported_hostnames(payload):
@@ -385,14 +368,14 @@ def _reported_hostnames(payload):
         if isinstance(value, str) and value.strip():
             names.add(value.strip())
 
-    meta = payload.get("metadata")
+    meta = payload.get('metadata')
     if isinstance(meta, dict):
-        additional = meta.get("additional")
+        additional = meta.get('additional')
         if isinstance(additional, dict):
-            add(additional.get("deviceName"))
-            add(additional.get("device_name"))
+            add(additional.get('deviceName'))
+            add(additional.get('device_name'))
 
-    modules_data = payload.get("modules", payload)
+    modules_data = payload.get('modules', payload)
     if not isinstance(modules_data, dict):
         return names
 
@@ -402,205 +385,149 @@ def _reported_hostnames(payload):
             value = value[0]
         return value if isinstance(value, dict) else {}
 
-    inventory = unwrap("inventory")
-    add(inventory.get("deviceName"))
-    add(inventory.get("device_name"))
-    add(inventory.get("computer_name"))
+    inventory = unwrap('inventory')
+    add(inventory.get('deviceName'))
+    add(inventory.get('device_name'))
+    add(inventory.get('computer_name'))
 
-    hardware_system = unwrap("hardware").get("system")
+    hardware_system = unwrap('hardware').get('system')
     if isinstance(hardware_system, dict):
-        add(hardware_system.get("computer_name"))
-        add(hardware_system.get("hostname"))
+        add(hardware_system.get('computer_name'))
+        add(hardware_system.get('hostname'))
 
-    add(unwrap("network").get("hostname"))
-    add(unwrap("system").get("hostname"))
+    add(unwrap('network').get('hostname'))
+    add(unwrap('system').get('hostname'))
     return names
 
 
 @router.get("/events", dependencies=[Depends(verify_authentication)], tags=["events"])
 def get_events(
-    limit: int = Query(
-        default=100, ge=1, le=1000, description="Maximum number of events to return"
-    ),
-    offset: int = Query(
-        default=0, ge=0, description="Number of events to skip (for pagination)"
-    ),
-    startDate: str = Query(
-        default=None, description="Filter events after this ISO8601 date"
-    ),
-    endDate: str = Query(
-        default=None, description="Filter events before this ISO8601 date"
-    ),
-    type: str = Query(
-        default=None,
-        description="Filter by event type (success, warning, error, info, system)",
-    ),
+    limit: int = Query(default=100, ge=1, le=1000, description="Maximum number of events to return"),
+    offset: int = Query(default=0, ge=0, description="Number of events to skip (for pagination)"),
+    startDate: str = Query(default=None, description="Filter events after this ISO8601 date"),
+    endDate: str = Query(default=None, description="Filter events before this ISO8601 date"),
+    type: str = Query(default=None, description="Filter by event type (success, warning, error, info, system)")
 ):
     """
     Get recent events with device names (optimized for dashboard).
-
+    
     Returns lightweight event list with device context for fast dashboard rendering.
     **Note:** Full event payload is NOT included - use `/api/events/{id}/payload` for details.
-
+    
     **Query Parameters:**
     - limit: Maximum events to return (1-1000, default 100)
     - offset: Number of events to skip (for pagination, default 0)
     - startDate: Filter events after this ISO8601 date (optional)
     - endDate: Filter events before this ISO8601 date (optional)
     - type: Filter by event type(s). Single value (e.g. `error`) or comma-separated (e.g. `success,warning,error,system`)
-
+    
     **Response includes:**
     - Event ID, type, message, timestamp
     - Device serial number and name
     - Total count for pagination
     """
     try:
-        _ckey = (limit, offset, startDate or "", endDate or "", type or "")
+        _ckey = (limit, offset, startDate or '', endDate or '', type or '')
         _cached = cache_get("events", _ckey)
         if _cached is not None:
             return _cached
         _t0 = _time.monotonic()
         conn = get_db_connection()
         cursor = conn.cursor()
-
+        
         # Parse date parameters
         start_date = None
         end_date = None
         if startDate:
             try:
-                start_date = datetime.fromisoformat(startDate.replace("Z", "+00:00"))
+                start_date = datetime.fromisoformat(startDate.replace('Z', '+00:00'))
             except ValueError as e:
                 logger.warning(f"Invalid startDate format: {startDate}, error: {e}")
         if endDate:
             try:
-                end_date = datetime.fromisoformat(endDate.replace("Z", "+00:00"))
+                end_date = datetime.fromisoformat(endDate.replace('Z', '+00:00'))
             except ValueError as e:
                 logger.warning(f"Invalid endDate format: {endDate}, error: {e}")
-
+        
         # Validate event type filter — supports single value or comma-separated list
-        VALID_EVENT_TYPES = ["success", "warning", "error", "info", "system"]
+        VALID_EVENT_TYPES = ['success', 'warning', 'error', 'info', 'system']
         event_types = None  # None means no filter (all types)
         if type:
-            parts = [t.strip().lower() for t in type.split(",") if t.strip()]
+            parts = [t.strip().lower() for t in type.split(',') if t.strip()]
             valid = [t for t in parts if t in VALID_EVENT_TYPES]
             if valid:
                 event_types = valid
             elif parts:
                 logger.warning(f"Invalid event type filter: {type}")
-
+        
         # Get total count first for pagination info
         count_query = load_sql("events/count_events")
-        cursor.execute(
-            count_query,
-            {
-                "start_date": start_date,
-                "end_date": end_date,
-                "event_types": event_types,
-            },
-        )
+        cursor.execute(count_query, {"start_date": start_date, "end_date": end_date, "event_types": event_types})
         total_count = cursor.fetchone()[0]
-
+        
         # JOIN with inventory to get device names and assetTag in single query
         query = load_sql("events/list_events")
-        cursor.execute(
-            query,
-            {
-                "limit": limit,
-                "offset": offset,
-                "start_date": start_date,
-                "end_date": end_date,
-                "event_types": event_types,
-            },
-        )
-
+        cursor.execute(query, {
+            "limit": limit, 
+            "offset": offset,
+            "start_date": start_date,
+            "end_date": end_date,
+            "event_types": event_types
+        })
+        
         rows = cursor.fetchall()
         conn.close()
-
+        
         events = []
         for row in rows:
-            (
-                event_id,
-                device_id,
-                device_name,
-                asset_tag,
-                event_type,
-                message,
-                timestamp,
-                platform,
-            ) = row
-            events.append(
-                {
-                    # Essential fields for events page
-                    "id": event_id,
-                    "device": device_id,  # Serial number (used for links)
-                    "deviceName": (
-                        device_name
-                        if (device_name and device_name.lower() != "unknown")
-                        else device_id
-                    ),  # Friendly name from inventory
-                    "assetTag": asset_tag,  # Asset tag for display
-                    "kind": event_type,  # Event type (success/warning/error/info)
-                    "message": message,  # User-friendly message
-                    "ts": timestamp.isoformat() if timestamp else None,  # Timestamp
-                    "platform": platform,  # Platform from system.operatingSystem.name
-                    # Legacy compatibility fields (minimal)
-                    "serialNumber": device_id,
-                    "eventType": event_type,
-                    "timestamp": timestamp.isoformat() if timestamp else None,
-                }
-            )
-
+            event_id, device_id, device_name, asset_tag, event_type, message, timestamp, platform = row
+            events.append({
+                # Essential fields for events page
+                "id": event_id,
+                "device": device_id,  # Serial number (used for links)
+                "deviceName": device_name if (device_name and device_name.lower() != "unknown") else device_id,  # Friendly name from inventory
+                "assetTag": asset_tag,  # Asset tag for display
+                "kind": event_type,  # Event type (success/warning/error/info)
+                "message": message,  # User-friendly message
+                "ts": timestamp.isoformat() if timestamp else None,  # Timestamp
+                "platform": platform,  # Platform from system.operatingSystem.name
+                # Legacy compatibility fields (minimal)
+                "serialNumber": device_id,
+                "eventType": event_type,
+                "timestamp": timestamp.isoformat() if timestamp else None
+            })
+        
         _result = {
             "success": True,
-            "events": events,
+            "events": events, 
             "total": total_count,
             "totalEvents": total_count,
             "count": len(events),
             "limit": limit,
-            "offset": offset,
+            "offset": offset
         }
         cache_set("events", _result, _ckey)
-        logger.info(
-            f"[PERF] /api/events: {_time.monotonic()-_t0:.3f}s ({len(events)} events)"
-        )
+        logger.info(f"[PERF] /api/events: {_time.monotonic()-_t0:.3f}s ({len(events)} events)")
         return _result
-
+        
     except Exception as e:
         logger.error(f"Failed to get events: {e}")
-        raise HTTPException(
-            status_code=500, detail=f"Failed to retrieve events: {str(e)}"
-        )
+        raise HTTPException(status_code=500, detail=f"Failed to retrieve events: {str(e)}")
 
-
-@router.get(
-    "/events/failures", dependencies=[Depends(verify_authentication)], tags=["events"]
-)
+@router.get("/events/failures", dependencies=[Depends(verify_authentication)], tags=["events"])
 def get_ingest_failures(
-    limit: int = Query(
-        default=100, ge=1, le=1000, description="Maximum number of failures to return"
-    ),
-    offset: int = Query(
-        default=0, ge=0, description="Number of failures to skip (for pagination)"
-    ),
-    serial: Optional[str] = Query(
-        default=None, description="Filter by serial number (case-insensitive substring)"
-    ),
-    reason: Optional[str] = Query(
-        default=None, description="Filter by rejection reason code"
-    ),
-    hours: int = Query(
-        default=168,
-        ge=1,
-        le=2160,
-        description="Look-back window in hours (default 7 days)",
-    ),
+    limit: int = Query(default=100, ge=1, le=1000, description="Maximum number of failures to return"),
+    offset: int = Query(default=0, ge=0, description="Number of failures to skip (for pagination)"),
+    serial: Optional[str] = Query(default=None, description="Filter by serial number (case-insensitive substring)"),
+    reason: Optional[str] = Query(default=None, description="Filter by rejection reason code"),
+    hours: int = Query(default=168, ge=1, le=2160, description="Look-back window in hours (default 7 days)"),
     outcome: str = Query(
         default="rejected",
         pattern="^(rejected|retried|accepted|all)$",
         description="rejected (default) = turned away and nothing has arrived "
-        "since; retried = the upload dropped but the client's "
-        "retry landed; accepted = kept but repaired on the way in; "
-        "all = every recorded row",
+                    "since; retried = the upload dropped but the client's "
+                    "retry landed; accepted = kept but repaired on the way in; "
+                    "all = every recorded row",
     ),
 ):
     """
@@ -659,7 +586,7 @@ def get_ingest_failures(
     so the other sides are one click away rather than invisible.
     """
     try:
-        _ckey = (limit, offset, serial or "", reason or "", hours, outcome)
+        _ckey = (limit, offset, serial or '', reason or '', hours, outcome)
         _cached = cache_get("events_failures", _ckey)
         if _cached is not None:
             return _cached
@@ -710,46 +637,30 @@ def get_ingest_failures(
 
         failures = []
         for row in rows:
-            (
-                fid,
-                occurred_at,
-                failure_type,
-                fail_reason,
-                detail,
-                status_code,
-                endpoint,
-                client_ip,
-                user_agent,
-                serial_number,
-                device_uuid,
-                device_name,
-                platform,
-                client_version,
-                retried,
-            ) = row
-            failures.append(
-                {
-                    "id": fid,
-                    "ts": occurred_at.isoformat() if occurred_at else None,
-                    "failureType": failure_type,
-                    "reason": fail_reason,
-                    "detail": detail,
-                    "statusCode": status_code,
-                    "outcome": (
-                        "accepted"
-                        if status_code is not None and status_code < 400
-                        else "retried" if retried else "rejected"
-                    ),
-                    "endpoint": endpoint,
-                    "clientIp": client_ip,
-                    "userAgent": user_agent,
-                    "serialNumber": serial_number,
-                    "deviceUuid": device_uuid,
-                    "deviceName": device_name,
-                    "platform": platform,
-                    "clientVersion": client_version,
-                }
-            )
+            (fid, occurred_at, failure_type, fail_reason, detail, status_code,
+             endpoint, client_ip, user_agent, serial_number, device_uuid,
+             device_name, platform, client_version, retried) = row
+            failures.append({
+                "id": fid,
+                "ts": occurred_at.isoformat() if occurred_at else None,
+                "failureType": failure_type,
+                "reason": fail_reason,
+                "detail": detail,
+                "statusCode": status_code,
+                "outcome": (
+                    "accepted" if status_code is not None and status_code < 400
+                    else "retried" if retried
+                    else "rejected"
+                ),
+                "endpoint": endpoint,
+                "clientIp": client_ip,
+                "userAgent": user_agent,
+                "serialNumber": serial_number,
+                "deviceUuid": device_uuid,
+                "deviceName": device_name,
+                "platform": platform,
+                "clientVersion": client_version,
+            })
 
         _result = {
             "success": True,
@@ -768,98 +679,73 @@ def get_ingest_failures(
 
     except Exception as e:
         logger.error(f"Failed to get ingest failures: {e}")
-        raise HTTPException(
-            status_code=500, detail=f"Failed to retrieve ingest failures: {str(e)}"
-        )
+        raise HTTPException(status_code=500, detail=f"Failed to retrieve ingest failures: {str(e)}")
 
-
-@router.get(
-    "/events/{event_id}/payload",
-    dependencies=[Depends(verify_authentication)],
-    tags=["events"],
-)
+@router.get("/events/{event_id}/payload", dependencies=[Depends(verify_authentication)], tags=["events"])
 def get_event_payload(event_id: int):
     """
     Get the FULL payload for a specific event including related module data.
-
+    
     This endpoint is called when user clicks to expand an event in the dashboard.
     It fetches the event details AND the actual module data from the module tables.
     """
     try:
         conn = get_db_connection()
         cursor = conn.cursor()
-
+        
         # First get the event details and device_id
-        cursor.execute(
-            """
+        cursor.execute("""
             SELECT details, device_id, timestamp
             FROM events 
             WHERE id = %s
-        """,
-            (event_id,),
-        )
-
+        """, (event_id,))
+        
         row = cursor.fetchone()
-
+        
         if not row:
             conn.close()
             raise HTTPException(status_code=404, detail=f"Event {event_id} not found")
-
+        
         details, device_id, event_timestamp = row
-
+        
         # If details is a string, try to parse as JSON
         if isinstance(details, str):
             try:
                 details = json.loads(details)
             except json.JSONDecodeError:
                 details = {"raw": details}
-
+        
         # Build full payload with actual module data
-        full_payload = (
-            details.copy() if isinstance(details, dict) else {"metadata": details}
-        )
-
+        full_payload = details.copy() if isinstance(details, dict) else {"metadata": details}
+        
         # Get the modules list from the event details
         modules_list = []
         if isinstance(details, dict):
-            modules_list = details.get("modules", [])
+            modules_list = details.get('modules', [])
             if isinstance(modules_list, str):
                 modules_list = [modules_list]
-
+        
         # Fetch actual data from each module table mentioned in this event
         module_data = {}
         for module_name in modules_list:
             try:
                 table_name = module_name.lower()
                 # Validate table name to prevent SQL injection
-                valid_tables = [
-                    "applications",
-                    "hardware",
-                    "installs",
-                    "inventory",
-                    "management",
-                    "network",
-                    "peripherals",
-                    "security",
-                    "system",
-                    "identity",
-                ]
+                valid_tables = ['applications', 'hardware', 'installs', 'inventory', 
+                               'management', 'network', 'peripherals', 'security', 'system', 'identity']
                 if table_name not in valid_tables:
                     continue
-
+                
                 # Fetch the module data for this device around the event timestamp
                 # Use a time window to find the closest module data to the event
-                cursor.execute(
-                    f"""
+                cursor.execute(f"""
                     SELECT data, collected_at
                     FROM {table_name}
                     WHERE device_id = %s
                     ORDER BY ABS(EXTRACT(EPOCH FROM (collected_at - %s::timestamp)))
                     LIMIT 1
-                """,
-                    (device_id, event_timestamp),
-                )
-
+                """, (device_id, event_timestamp))
+                
                 module_row = cursor.fetchone()
                 if module_row:
                     module_content = module_row[0]
@@ -869,40 +755,35 @@ def get_event_payload(event_id: int):
                         except json.JSONDecodeError:
                             pass
                     module_data[module_name] = module_content
-
+                    
             except Exception as module_error:
-                logger.warning(
-                    f"Failed to fetch {module_name} data for event {event_id}: {module_error}"
-                )
+                logger.warning(f"Failed to fetch {module_name} data for event {event_id}: {module_error}")
                 continue
-
+        
         conn.close()
-
+        
         # Include the actual module data in the payload
         if module_data:
-            full_payload["moduleData"] = module_data
-
+            full_payload['moduleData'] = module_data
+        
         return {"payload": full_payload}
-
+        
     except HTTPException:
         raise
     except Exception as e:
         logger.error(f"Failed to get event payload: {e}")
-        raise HTTPException(
-            status_code=500, detail=f"Failed to retrieve event payload: {str(e)}"
-        )
-
+        raise HTTPException(status_code=500, detail=f"Failed to retrieve event payload: {str(e)}")
 
 @router.post("/events", dependencies=[Depends(verify_authentication)], tags=["events"])
 async def submit_events(request: Request):
     """
     Submit device events and unified module data.
-
+    
     This endpoint handles:
     - Device registration/update
     - Module data storage (system, hardware, installs, network, etc.)
     - Event creation for tracking
-
+    
     Expected payload structure:
     {
         "metadata": {
@@ -946,19 +827,17 @@ async def submit_events(request: Request):
         raw_body = await request.body()
     except ClientDisconnect as disconnect_error:
         _reject_ingest(
-            request,
-            None,
+            request, None,
             reason="upload_aborted",
             detail="Client disconnected before the request body arrived. "
-            + _transport_note(request, None, disconnect_error),
+                   + _transport_note(request, None, disconnect_error),
         )
     except Exception as body_error:
         _reject_ingest(
-            request,
-            None,
+            request, None,
             reason="body_unreadable",
             detail=f"Request body could not be read: {body_error} "
-            + _transport_note(request, None, body_error),
+                   + _transport_note(request, None, body_error),
         )
 
     return await run_in_threadpool(_process_submission, request, raw_body)
@@ -973,10 +852,10 @@ def _process_submission(request: Request, raw_body):
     try:
         if not raw_body:
             _reject_ingest(
-                request,
-                None,
+                request, None,
                 reason="empty_body",
-                detail="Request body was empty. " + _transport_note(request, 0, None),
+                detail="Request body was empty. "
+                       + _transport_note(request, 0, None),
             )
 
         # raw_body stays the bytes as they arrived; body is what the JSON
@@ -988,11 +867,10 @@ def _process_submission(request: Request, raw_body):
             body = _decompress_body(request, raw_body)
         except Exception as decode_error:
             _reject_ingest(
-                request,
-                None,
+                request, None,
                 reason="body_unreadable",
                 detail=f"Request body could not be decoded: {decode_error} "
-                + _transport_note(request, len(raw_body), decode_error),
+                       + _transport_note(request, len(raw_body), decode_error),
             )
 
         try:
@@ -1009,7 +887,7 @@ def _process_submission(request: Request, raw_body):
                     reason="nul_in_payload",
                     status_code=200,
                     detail="Payload contained NUL code points, which Postgres "
-                    "jsonb cannot store; stripped before writing.",
+                           "jsonb cannot store; stripped before writing.",
                     endpoint=request.url.path,
                     client_ip=resolve_client_ip(request),
                     user_agent=request.headers.get("user-agent"),
@@ -1023,16 +901,15 @@ def _process_submission(request: Request, raw_body):
             # upload wearing a parse error's clothes; _transport_note is what
             # tells the two apart on the failures page.
             _reject_ingest(
-                request,
-                None,
+                request, None,
                 reason="malformed_json",
                 detail=f"Request body is not valid JSON: {parse_error} "
-                + _transport_note(
-                    request,
-                    len(raw_body),
-                    parse_error,
-                    decompressed=(len(body) if body is not raw_body else None),
-                ),
+                       + _transport_note(
+                           request, len(raw_body), parse_error,
+                           decompressed=(
+                               len(body) if body is not raw_body else None
+                           ),
+                       ),
             )
 
         # Validate top-level structure via Pydantic
@@ -1040,25 +917,20 @@ def _process_submission(request: Request, raw_body):
             submission = EventSubmission.model_validate(payload)
         except Exception as validation_err:
             _reject_ingest(
-                request,
-                payload,
+                request, payload,
                 reason="invalid_payload",
                 status_code=422,
                 detail=f"Invalid payload: {validation_err}",
             )
-
+        
         # Extract metadata - support both snake_case and camelCase for Windows client compatibility
         meta = submission.metadata
         device_uuid = meta.device_id or meta.deviceId
         serial_number = meta.serial_number or meta.serialNumber
-        collected_at = (
-            meta.collected_at
-            or meta.collectedAt
-            or datetime.now(timezone.utc).isoformat()
-        )
-        client_version = meta.client_version or meta.clientVersion or "unknown"
-        platform = meta.platform or "Unknown"
-        collection_type = meta.collection_type or meta.collectionType or "Full"
+        collected_at = meta.collected_at or meta.collectedAt or datetime.now(timezone.utc).isoformat()
+        client_version = meta.client_version or meta.clientVersion or 'unknown'
+        platform = meta.platform or 'Unknown'
+        collection_type = meta.collection_type or meta.collectionType or 'Full'
         enabled_modules = meta.enabled_modules or meta.enabledModules or []
 
         # Several representations of the same submission are alive at this
@@ -1076,14 +948,13 @@ def _process_submission(request: Request, raw_body):
         # submit_events still holds them while it awaits this worker. What
         # this frees is the decompressed copy and the validated model.
         del raw_body, body, submission, meta
-
+        
         # VALIDATION: Reject empty / sentinel / hostname-shaped serial numbers
         # This prevents database pollution from client bugs and crafted payloads.
         # A real `-1` device in prod is what motivated the sentinel block below.
         if not serial_number or not serial_number.strip():
             _reject_ingest(
-                request,
-                payload,
+                request, payload,
                 reason="empty_serial",
                 detail="Invalid serial number: empty or whitespace-only.",
             )
@@ -1092,48 +963,29 @@ def _process_submission(request: Request, raw_body):
         # match the run-together forms real BIOSes report ("Defaultstring",
         # "SystemSerialNumber", "ToBeFilledByOEM").
         normalized = _squash_serial(serial_number)
-        SENTINEL_SERIALS = {
-            _squash_serial(s)
-            for s in (
-                "-1",
-                "0",
-                "1",
-                "unknown",
-                "none",
-                "null",
-                "n/a",
-                "na",
-                "(empty)",
-                "empty",
-                "default string",
-                "system serial number",
-                "to be filled by o.e.m.",
-                "to be filled by o.e.m",
-                "00000000",
-                "000000000",
-            )
-        }
+        SENTINEL_SERIALS = {_squash_serial(s) for s in (
+            "-1", "0", "1",
+            "unknown", "none", "null", "n/a", "na",
+            "(empty)", "empty",
+            "default string", "system serial number",
+            "to be filled by o.e.m.", "to be filled by o.e.m",
+            "00000000", "000000000",
+        )}
         if normalized in SENTINEL_SERIALS:
-            logger.error(
-                f"Rejected device registration: serial_number '{serial_number}' is a known sentinel value"
-            )
+            logger.error(f"Rejected device registration: serial_number '{serial_number}' is a known sentinel value")
             _reject_ingest(
-                request,
-                payload,
+                request, payload,
                 reason="sentinel_serial",
                 detail=f"Invalid serial number: '{serial_number}' is a sentinel/placeholder value. Device must provide a real hardware serial number.",
             )
 
         # Real hardware serials are typically 6+ chars. Reject pure-numeric serials
         # shorter than 4 chars (catches "-1", "0", "12", etc. even if not in the set above).
-        bare = serial_number.lstrip("-")
+        bare = serial_number.lstrip('-')
         if bare.isdigit() and len(bare) < 4:
-            logger.error(
-                f"Rejected device registration: serial_number '{serial_number}' is too short / numeric-only"
-            )
+            logger.error(f"Rejected device registration: serial_number '{serial_number}' is too short / numeric-only")
             _reject_ingest(
-                request,
-                payload,
+                request, payload,
                 reason="short_serial",
                 detail=f"Invalid serial number: '{serial_number}' is too short to be a real hardware serial.",
             )
@@ -1142,19 +994,16 @@ def _process_submission(request: Request, raw_body):
         # random suffix is padded to the 15-char NetBIOS limit, so the prefix
         # fixes its length and nothing resembles a hardware serial.
         hostname_patterns = [
-            r"^DESKTOP-[A-Z0-9]{7}$",  # e.g. DESKTOP-A1B2C3D
-            r"^LAPTOP-[A-Z0-9]{8}$",  # e.g. LAPTOP-1A7GKLCD
-            r"^WIN-[A-Z0-9]{11}$",  # Windows Server default
+            r'^DESKTOP-[A-Z0-9]{7}$',  # e.g. DESKTOP-A1B2C3D
+            r'^LAPTOP-[A-Z0-9]{8}$',   # e.g. LAPTOP-1A7GKLCD
+            r'^WIN-[A-Z0-9]{11}$',     # Windows Server default
         ]
 
         for pattern in hostname_patterns:
             if re.match(pattern, serial_number, re.IGNORECASE):
-                logger.error(
-                    f"Rejected device registration: serial_number '{serial_number}' matches hostname pattern '{pattern}'"
-                )
+                logger.error(f"Rejected device registration: serial_number '{serial_number}' matches hostname pattern '{pattern}'")
                 _reject_ingest(
-                    request,
-                    payload,
+                    request, payload,
                     reason="hostname_serial",
                     detail=f"Invalid serial number: '{serial_number}' appears to be a hostname. Device must provide hardware serial number (BIOS/chassis serial).",
                 )
@@ -1162,26 +1011,17 @@ def _process_submission(request: Request, raw_body):
         # The real failure -- a client sending its hostname where the hardware
         # serial belongs -- is caught by comparing the two, which no shape
         # heuristic can do without also rejecting genuine serials.
-        if normalized and normalized in {
-            _squash_serial(n) for n in _reported_hostnames(payload)
-        }:
-            logger.error(
-                f"Rejected device registration: serial_number '{serial_number}' matches the hostname the payload reports"
-            )
+        if normalized and normalized in {_squash_serial(n) for n in _reported_hostnames(payload)}:
+            logger.error(f"Rejected device registration: serial_number '{serial_number}' matches the hostname the payload reports")
             _reject_ingest(
-                request,
-                payload,
+                request, payload,
                 reason="serial_equals_hostname",
                 detail=f"Invalid serial number: '{serial_number}' is the device's own hostname, not a hardware serial. Device must provide the BIOS/chassis serial number.",
             )
-
-        logger.debug(
-            f"Processing unified payload for device {serial_number} (UUID: {device_uuid})"
-        )
-        logger.debug(
-            f"Collection type: {collection_type}, Enabled modules: {enabled_modules}"
-        )
-
+        
+        logger.debug(f"Processing unified payload for device {serial_number} (UUID: {device_uuid})")
+        logger.debug(f"Collection type: {collection_type}, Enabled modules: {enabled_modules}")
+        
         # Connect to database
         conn = get_db_connection()
         cursor = conn.cursor()
@@ -1216,97 +1056,66 @@ def _process_submission(request: Request, raw_body):
         try:
             # Check if device exists
             cursor.execute(
-                "SELECT id FROM devices WHERE serial_number = %s", (serial_number,)
+                "SELECT id FROM devices WHERE serial_number = %s",
+                (serial_number,)
             )
             device_exists = cursor.fetchone()
-
+            
             if device_exists:
                 # Update existing device - include client_version and platform
-                cursor.execute(
-                    """
+                cursor.execute("""
                     UPDATE devices 
                     SET device_id = %s, last_seen = %s, updated_at = %s, client_version = %s, platform = %s
                     WHERE serial_number = %s
-                """,
-                    (
-                        device_uuid,
-                        collected_at,
-                        datetime.now(timezone.utc),
-                        client_version,
-                        platform,
-                        serial_number,
-                    ),
-                )
-                logger.debug(
-                    f"Updated existing device: {serial_number} (client v{client_version}, platform: {platform})"
-                )
+                """, (device_uuid, collected_at, datetime.now(timezone.utc), client_version, platform, serial_number))
+                logger.debug(f"Updated existing device: {serial_number} (client v{client_version}, platform: {platform})")
             else:
                 # Insert new device
                 # NOTE: devices.id is VARCHAR and equals serial_number (per schema design)
                 # Try to get device name from metadata.additional (Mac client sends deviceName there)
-                raw_meta = payload.get("metadata", {})
-                initial_name = "Unknown"
+                raw_meta = payload.get('metadata', {})
+                initial_name = 'Unknown'
                 if isinstance(raw_meta, dict):
-                    additional = raw_meta.get("additional", {})
+                    additional = raw_meta.get('additional', {})
                     if isinstance(additional, dict):
-                        meta_name = additional.get("deviceName") or additional.get(
-                            "device_name"
-                        )
+                        meta_name = additional.get('deviceName') or additional.get('device_name')
                         if meta_name and meta_name.strip():
                             initial_name = meta_name.strip()
-
-                cursor.execute(
-                    """
+                
+                cursor.execute("""
                     INSERT INTO devices (id, device_id, serial_number, name, status, last_seen, created_at, updated_at, client_version, platform)
                     VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-                """,
-                    (
-                        serial_number,
-                        device_uuid,
-                        serial_number,
-                        initial_name,
-                        "online",
-                        collected_at,
-                        datetime.now(timezone.utc),
-                        datetime.now(timezone.utc),
-                        client_version,
-                        platform,
-                    ),
-                )
-                logger.info(
-                    f"Created new device: {serial_number} (name: {initial_name}, client v{client_version}, platform: {platform})"
-                )
-
+                """, (serial_number, device_uuid, serial_number, initial_name, 'online', collected_at, datetime.now(timezone.utc), datetime.now(timezone.utc), client_version, platform))
+                logger.info(f"Created new device: {serial_number} (name: {initial_name}, client v{client_version}, platform: {platform})")
+            
             conn.commit()
         except Exception as device_error:
             logger.error(f"Device upsert failed: {device_error}")
             conn.rollback()
             raise
-
+        
         # 2. Process and store module data
         modules_processed = []
         module_tables = {
-            "system": "system",
-            "hardware": "hardware",
-            "network": "network",
-            "installs": "installs",
-            "security": "security",
-            "applications": "applications",
-            "inventory": "inventory",
-            "management": "management",
-            "peripherals": "peripherals",
-            "identity": "identity",
+            'system': 'system',
+            'hardware': 'hardware',
+            'network': 'network',
+            'installs': 'installs',
+            'security': 'security',
+            'applications': 'applications',
+            'inventory': 'inventory',
+            'management': 'management',
+            'peripherals': 'peripherals',
+            'identity': 'identity'
         }
-
+        
         # Get modules from payload (could be at top level or nested under 'modules' key)
-        modules_data = payload.get("modules", payload)
-
+        modules_data = payload.get('modules', payload)
+        
         # Debug: Log available modules in payload
         available_modules = [k for k in modules_data.keys() if k in module_tables]
-        logger.debug(
-            f"Available modules in payload for {serial_number}: {available_modules}"
-        )
-
+        logger.debug(f"Available modules in payload for {serial_number}: {available_modules}")
+        
         for module_name, table_name in module_tables.items():
             if module_name in modules_data and modules_data[module_name]:
                 try:
@@ -1316,20 +1125,20 @@ def _process_submission(request: Request, raw_body):
                     # on the item. Ingest, the dashboard aggregate and the web
                     # each used to decide this for themselves and disagreed; the
                     # stored state is now the single answer they all read.
-                    if module_name == "installs":
+                    if module_name == 'installs':
                         module_data = _stamp_install_items(module_data)
 
                     # STANDARD HANDLING: All modules store in their table with data JSONB
                     # Check if module record exists (device_id in module tables = serial_number per schema)
                     cursor.execute(
                         f"SELECT id FROM {table_name} WHERE device_id = %s",
-                        (serial_number,),
+                        (serial_number,)
                     )
                     module_exists = cursor.fetchone()
-
+                    
                     # Store as JSONB
                     module_json = json.dumps(module_data)
-
+                    
                     if module_exists:
                         # Unchanged-payload fast path: most check-ins resend
                         # identical module data, and rewriting the JSONB every
@@ -1338,72 +1147,42 @@ def _process_submission(request: Request, raw_body):
                         # ~900 live rows. jsonb equality is content-based, so
                         # when nothing changed only the fixed-width timestamp
                         # columns are updated and the TOAST data is reused.
-                        cursor.execute(
-                            f"""
+                        cursor.execute(f"""
                             UPDATE {table_name}
                             SET collected_at = %s, updated_at = %s
                             WHERE device_id = %s AND data = %s::jsonb
-                        """,
-                            (
-                                collected_at,
-                                datetime.now(timezone.utc),
-                                serial_number,
-                                module_json,
-                            ),
-                        )
+                        """, (collected_at, datetime.now(timezone.utc), serial_number, module_json))
                         data_changed = cursor.rowcount == 0
                         if data_changed:
-                            cursor.execute(
-                                f"""
+                            cursor.execute(f"""
                                 UPDATE {table_name}
                                 SET data = %s::jsonb, collected_at = %s, updated_at = %s
                                 WHERE device_id = %s
-                            """,
-                                (
-                                    module_json,
-                                    collected_at,
-                                    datetime.now(timezone.utc),
-                                    serial_number,
-                                ),
-                            )
+                            """, (module_json, collected_at, datetime.now(timezone.utc), serial_number))
                     else:
                         # Insert new module record
                         # NOTE: device_id column references devices.id which equals serial_number
-                        cursor.execute(
-                            f"""
+                        cursor.execute(f"""
                             INSERT INTO {table_name} (device_id, data, collected_at, created_at, updated_at)
                             VALUES (%s, %s::jsonb, %s, %s, %s)
-                        """,
-                            (
-                                serial_number,
-                                module_json,
-                                collected_at,
-                                datetime.now(timezone.utc),
-                                datetime.now(timezone.utc),
-                            ),
-                        )
+                        """, (serial_number, module_json, collected_at, datetime.now(timezone.utc), datetime.now(timezone.utc)))
                         data_changed = True
 
                     # Keep the precomputed dashboard counters in step with the
                     # JSONB payload (columns added in migration 0003).
-                    if module_name == "installs" and data_changed:
+                    if module_name == 'installs' and data_changed:
                         ce, cw, me, mw = _install_issue_counts(module_data)
-                        cursor.execute(
-                            """
+                        cursor.execute("""
                             UPDATE installs
                             SET cimian_errors = %s, cimian_warnings = %s,
                                 munki_errors = %s, munki_warnings = %s
                             WHERE device_id = %s
-                        """,
-                            (ce, cw, me, mw, serial_number),
-                        )
+                        """, (ce, cw, me, mw, serial_number))
 
                     conn.commit()
                     modules_processed.append(module_name)
-                    logger.debug(
-                        f"Stored {module_name} module for device {serial_number}"
-                    )
-
+                    logger.debug(f"Stored {module_name} module for device {serial_number}")
+                    
                     # Extract daily usage history from applications module and UPSERT.
                     #
                     # Both clients send WINDOW DELTAS, not cumulative-today totals:
@@ -1422,20 +1201,16 @@ def _process_submission(request: Request, raw_body):
                     #       deleting, so the same session shouldn't be re-sent.
                     #   (b) /events is rate-limited to 30/min per client.
                     # Long-term fix: payload-level transmission_id dedup (TODO).
-                    if module_name == "applications" and isinstance(module_data, dict):
-                        daily_history = module_data.get("dailyUsageHistory", [])
-                        if daily_history and _usage_client_too_old(
-                            client_version, platform
-                        ):
+                    if module_name == 'applications' and isinstance(module_data, dict):
+                        daily_history = module_data.get('dailyUsageHistory', [])
+                        if daily_history and _usage_client_too_old(client_version, platform):
                             record_ingest_failure(
                                 failure_type="validation",
                                 reason="usage_client_too_old",
                                 status_code=200,
-                                detail=(
-                                    f"dropped {len(daily_history)} usage rows from client "
-                                    f"{platform} {client_version}, older than "
-                                    f"{_usage_min_client_version(platform)}"
-                                ),
+                                detail=(f"dropped {len(daily_history)} usage rows from client "
+                                        f"{platform} {client_version}, older than "
+                                        f"{_usage_min_client_version(platform)}"),
                                 endpoint=request.url.path,
                                 client_ip=resolve_client_ip(request),
                                 user_agent=request.headers.get("user-agent"),
@@ -1450,30 +1225,22 @@ def _process_submission(request: Request, raw_body):
                                 clamped = []
                                 for entry in daily_history:
                                     if not isinstance(entry, dict):
-                                        rejected.append("non-object entry")
+                                        rejected.append('non-object entry')
                                         continue
-                                    app_name = entry.get("appName")
-                                    if not entry.get("date") or not app_name:
+                                    app_name = entry.get('appName')
+                                    if not entry.get('date') or not app_name:
                                         continue
                                     date_val = _usage_entry_date(entry)
                                     if date_val is None:
-                                        rejected.append(
-                                            f"{app_name}@{entry.get('date')}: bad date"
-                                        )
+                                        rejected.append(f"{app_name}@{entry.get('date')}: bad date")
                                         continue
                                     numbers = _usage_entry_numbers(entry)
                                     if numbers is None:
-                                        rejected.append(
-                                            f"{app_name}@{date_val}: non-numeric or non-finite"
-                                        )
+                                        rejected.append(f"{app_name}@{date_val}: non-numeric or non-finite")
                                         continue
-                                    launches, total_s, active_s, fg_s, was_clamped = (
-                                        numbers
-                                    )
+                                    launches, total_s, active_s, fg_s, was_clamped = numbers
                                     if was_clamped:
-                                        clamped.append(
-                                            f"{app_name}@{date_val}: negative clamped to zero"
-                                        )
+                                        clamped.append(f"{app_name}@{date_val}: negative clamped to zero")
                                     # activeSeconds / foregroundSeconds are optional — clients that
                                     # don't yet implement idle-time tracking will omit them and
                                     # contribute 0 to those columns. Same accumulate semantics as
@@ -1496,34 +1263,27 @@ def _process_submission(request: Request, raw_body):
                                     # then dies with 42804 "column active_seconds is of type
                                     # double precision but expression is of type text". That is
                                     # every row of every check-in, not an edge case.
-                                    cursor.execute(
-                                        USAGE_UPSERT_SQL,
-                                        (
-                                            serial_number,
-                                            date_val,
-                                            app_name,
-                                            entry.get("publisher", ""),
-                                            launches,
-                                            total_s,
-                                            active_s,
-                                            USAGE_DAY_SECONDS_CAP,
-                                            fg_s,
-                                            USAGE_DAY_SECONDS_CAP,
-                                            json.dumps(entry.get("users", [])),
-                                            USAGE_DAY_SECONDS_CAP,
-                                            USAGE_DAY_SECONDS_CAP,
-                                            USAGE_DAY_SECONDS_CAP,
-                                            USAGE_DAY_SECONDS_CAP,
-                                        ),
-                                    )
+                                    cursor.execute(USAGE_UPSERT_SQL, (
+                                        serial_number,
+                                        date_val,
+                                        app_name,
+                                        entry.get('publisher', ''),
+                                        launches,
+                                        total_s,
+                                        active_s, USAGE_DAY_SECONDS_CAP,
+                                        fg_s, USAGE_DAY_SECONDS_CAP,
+                                        json.dumps(entry.get('users', [])),
+                                        USAGE_DAY_SECONDS_CAP,
+                                        USAGE_DAY_SECONDS_CAP,
+                                        USAGE_DAY_SECONDS_CAP,
+                                        USAGE_DAY_SECONDS_CAP,
+                                    ))
                                     row = cursor.fetchone()
                                     if row and row[0]:
                                         capped.append(f"{app_name}@{date_val}")
                                     stored += 1
                                 conn.commit()
-                                logger.debug(
-                                    f"Accumulated {stored} daily usage entries for device {serial_number}"
-                                )
+                                logger.debug(f"Accumulated {stored} daily usage entries for device {serial_number}")
                                 if rejected or capped or clamped:
                                     # The payload is still accepted — only the offending rows
                                     # were dropped, clamped, or held at the ceiling — but the
@@ -1535,20 +1295,16 @@ def _process_submission(request: Request, raw_body):
                                         failure_type="validation",
                                         reason="usage_out_of_bounds",
                                         status_code=200,
-                                        detail=(
-                                            f"rejected {len(rejected)} usage rows {rejected[:5]}, "
-                                            f"{len(clamped)} with negatives clamped {clamped[:5]}, "
-                                            f"{len(capped)} at daily active/foreground ceiling {capped[:5]}"
-                                        ),
+                                        detail=(f"rejected {len(rejected)} usage rows {rejected[:5]}, "
+                                                f"{len(clamped)} with negatives clamped {clamped[:5]}, "
+                                                f"{len(capped)} at daily active/foreground ceiling {capped[:5]}"),
                                         endpoint=request.url.path,
                                         client_ip=resolve_client_ip(request),
                                         user_agent=request.headers.get("user-agent"),
                                         identity=extract_ingest_identity(payload),
                                     )
                             except Exception as usage_err:
-                                logger.error(
-                                    f"Failed to store daily usage history for {serial_number}: {usage_err}"
-                                )
+                                logger.error(f"Failed to store daily usage history for {serial_number}: {usage_err}")
                                 conn.rollback()
                                 # Surface the loss. The check-in itself still
                                 # returns 200 and every other module is already
@@ -1566,146 +1322,109 @@ def _process_submission(request: Request, raw_body):
                                     failure_type="server_error",
                                     reason="usage_write_failed",
                                     status_code=500,
-                                    detail=(
-                                        f"{len(daily_history)} usage rows dropped: "
-                                        f"{type(usage_err).__name__}: {usage_err}"
-                                    ),
+                                    detail=(f"{len(daily_history)} usage rows dropped: "
+                                            f"{type(usage_err).__name__}: {usage_err}"),
                                     endpoint=request.url.path,
                                     client_ip=resolve_client_ip(request),
                                     user_agent=request.headers.get("user-agent"),
                                     identity=extract_ingest_identity(payload),
                                 )
-
+                    
                     # Update devices table with OS info if system module
-                    if module_name == "system":
+                    if module_name == 'system':
                         try:
                             # Handle list format
-                            sys_data = (
-                                module_data[0]
-                                if isinstance(module_data, list)
-                                and len(module_data) > 0
-                                else module_data
-                            )
+                            sys_data = module_data[0] if isinstance(module_data, list) and len(module_data) > 0 else module_data
                             if isinstance(sys_data, dict):
-                                os_info = sys_data.get("operatingSystem", {})
-                                os_name = os_info.get("name")
-                                os_version = os_info.get("version") or os_info.get(
-                                    "displayVersion"
-                                )
-
+                                os_info = sys_data.get('operatingSystem', {})
+                                os_name = os_info.get('name')
+                                os_version = os_info.get('version') or os_info.get('displayVersion')
+                                
                                 if os_name:
-                                    cursor.execute(
-                                        """
+                                    cursor.execute("""
                                         UPDATE devices 
                                         SET os_name = %s, os_version = %s, os = %s
                                         WHERE serial_number = %s
-                                    """,
-                                        (os_name, os_version, os_name, serial_number),
-                                    )
+                                    """, (os_name, os_version, os_name, serial_number))
                                     conn.commit()
-                                    logger.debug(
-                                        f"Updated OS info for device {serial_number}: {os_name} {os_version}"
-                                    )
+                                    logger.debug(f"Updated OS info for device {serial_number}: {os_name} {os_version}")
                         except Exception as os_update_error:
-                            logger.error(
-                                f"Failed to update OS info for device {serial_number}: {os_update_error}"
-                            )
+                            logger.error(f"Failed to update OS info for device {serial_number}: {os_update_error}")
                             conn.rollback()
-
+                    
                 except Exception as module_error:
-                    logger.error(
-                        f"Failed to store {module_name} module: {module_error}"
-                    )
+                    logger.error(f"Failed to store {module_name} module: {module_error}")
                     conn.rollback()
                     continue
-
+        
         # 2b. Update device name from module data or metadata
         # Priority: inventory.deviceName > hardware.system.computer_name > network.hostname > system.hostname > metadata.additional.deviceName
         try:
             device_name = None
-
+            
             # Try inventory module first (most authoritative source)
-            inv_data = modules_data.get("inventory")
+            inv_data = modules_data.get('inventory')
             if inv_data:
                 if isinstance(inv_data, list) and inv_data:
                     inv_data = inv_data[0]
                 if isinstance(inv_data, dict):
-                    device_name = (
-                        inv_data.get("deviceName")
-                        or inv_data.get("device_name")
-                        or inv_data.get("computer_name")
-                    )
-
+                    device_name = inv_data.get('deviceName') or inv_data.get('device_name') or inv_data.get('computer_name')
+            
             # Try hardware.system (Mac clients store computer_name/hostname here)
             if not device_name:
-                hw_data = modules_data.get("hardware")
+                hw_data = modules_data.get('hardware')
                 if hw_data:
                     if isinstance(hw_data, list) and hw_data:
                         hw_data = hw_data[0]
                     if isinstance(hw_data, dict):
-                        hw_sys = hw_data.get("system", {})
+                        hw_sys = hw_data.get('system', {})
                         if isinstance(hw_sys, dict):
-                            device_name = hw_sys.get("computer_name") or hw_sys.get(
-                                "hostname"
-                            )
+                            device_name = hw_sys.get('computer_name') or hw_sys.get('hostname')
 
             # Try network module hostname
             if not device_name:
-                net_data = modules_data.get("network")
+                net_data = modules_data.get('network')
                 if net_data:
                     if isinstance(net_data, list) and net_data:
                         net_data = net_data[0]
                     if isinstance(net_data, dict):
-                        device_name = net_data.get("hostname")
+                        device_name = net_data.get('hostname')
 
             # Try system module hostname
             if not device_name:
-                sys_data = modules_data.get("system")
+                sys_data = modules_data.get('system')
                 if sys_data:
                     if isinstance(sys_data, list) and sys_data:
                         sys_data = sys_data[0]
                     if isinstance(sys_data, dict):
-                        device_name = sys_data.get("hostname")
-
+                        device_name = sys_data.get('hostname')
+            
             # Try metadata.additional.deviceName (Mac client sends this)
             if not device_name:
-                raw_meta = payload.get("metadata", {})
+                raw_meta = payload.get('metadata', {})
                 if isinstance(raw_meta, dict):
-                    additional = raw_meta.get("additional", {})
+                    additional = raw_meta.get('additional', {})
                     if isinstance(additional, dict):
-                        device_name = additional.get("deviceName") or additional.get(
-                            "device_name"
-                        )
-
+                        device_name = additional.get('deviceName') or additional.get('device_name')
+            
             # Update device name if we found a real one (not empty/Unknown)
-            if (
-                device_name
-                and device_name.strip()
-                and device_name.strip().lower() != "unknown"
-            ):
-                cursor.execute(
-                    """
+            if device_name and device_name.strip() and device_name.strip().lower() != 'unknown':
+                cursor.execute("""
                     UPDATE devices SET name = %s WHERE serial_number = %s AND (name IS NULL OR name = 'Unknown' OR name = %s)
-                """,
-                    (device_name.strip(), serial_number, serial_number),
-                )
+                """, (device_name.strip(), serial_number, serial_number))
                 conn.commit()
                 if cursor.rowcount > 0:
-                    logger.debug(
-                        f"Updated device name for {serial_number}: {device_name.strip()}"
-                    )
+                    logger.debug(f"Updated device name for {serial_number}: {device_name.strip()}")
         except Exception as name_error:
-            logger.error(
-                f"Failed to update device name for {serial_number}: {name_error}"
-            )
+            logger.error(f"Failed to update device name for {serial_number}: {name_error}")
             conn.rollback()
-
+        
         # 3. Store events from payload with validation
         events_stored = 0
-        payload_events = payload.get("events", [])
-
+        payload_events = payload.get('events', [])
+        
         # Check if installs module is present in payload
-        has_installs_module = "installs" in modules_data and modules_data["installs"]
+        has_installs_module = 'installs' in modules_data and modules_data['installs']
 
         # This payload carries a fresh managed-software run, so the previous run's
         # events no longer describe the device. Clear them before inserting, even
@@ -1723,8 +1442,7 @@ def _process_submission(request: Request, raw_body):
         # InstallsModuleProcessor alone on Windows). Everything else is info or
         # system. This arm can go once retention has aged the unnamed rows out.
         if has_installs_module:
-            cursor.execute(
-                """
+            cursor.execute("""
                 DELETE FROM events
                 WHERE device_id = %s
                   AND timestamp <= %s
@@ -1733,221 +1451,142 @@ def _process_submission(request: Request, raw_body):
                         OR (module_id IS NULL
                             AND event_type IN ('success', 'warning', 'error'))
                       )
-            """,
-                (serial_number, collected_at, list(INSTALLS_EVENT_MODULES)),
-            )
+            """, (serial_number, collected_at, list(INSTALLS_EVENT_MODULES)))
             if cursor.rowcount:
-                logger.info(
-                    f"Superseded {cursor.rowcount} installs event(s) for device {serial_number}"
-                )
+                logger.info(f"Superseded {cursor.rowcount} installs event(s) for device {serial_number}")
 
         for event in payload_events:
             try:
-                event_type = event.get(
-                    "eventType", "info"
-                ).lower()  # Normalize to lowercase
-                message = event.get("message", "Event from device")
-                details = event.get("details", {})
-                module_id = event.get("moduleId") or event.get("module_id") or None
+                event_type = event.get('eventType', 'info').lower()  # Normalize to lowercase
+                message = event.get('message', 'Event from device')
+                details = event.get('details', {})
+                module_id = event.get('moduleId') or event.get('module_id') or None
                 # Clients that predate moduleId on the wire still send the run's
                 # outcome as a success/warning/error event alongside the module;
                 # name it so it is superseded with the rest of the run.
-                if (
-                    not module_id
-                    and has_installs_module
-                    and event_type in {"success", "warning", "error"}
-                ):
-                    module_id = "installs"
+                if not module_id and has_installs_module and event_type in {'success', 'warning', 'error'}:
+                    module_id = 'installs'
 
                 # The run's error/warning event announces problems the module
                 # carries. When ingest suppressed those as transient network
                 # failures and nothing else remains, the event would be the
                 # only place still saying the run failed -- so it goes too.
-                if (
-                    module_id in INSTALLS_EVENT_MODULES
-                    and has_installs_module
-                    and _run_event_is_moot(modules_data["installs"], event_type)
-                ):
-                    logger.info(
-                        f"Dropped {event_type} run event for device {serial_number}: "
-                        "only transient network failures were reported"
-                    )
+                if (module_id in INSTALLS_EVENT_MODULES and has_installs_module
+                        and _run_event_is_moot(modules_data['installs'], event_type)):
+                    logger.info(f"Dropped {event_type} run event for device {serial_number}: "
+                                "only transient network failures were reported")
                     continue
-
+                
                 # VALIDATION: Events containing installs module MUST be success/warning/error
-                if has_installs_module or (
-                    isinstance(details, dict)
-                    and details.get("module_status") in ["success", "warning", "error"]
-                ):
-                    allowed_types = {"success", "warning", "error"}
+                if has_installs_module or (isinstance(details, dict) and details.get('module_status') in ['success', 'warning', 'error']):
+                    allowed_types = {'success', 'warning', 'error'}
                     if event_type not in allowed_types:
-                        logger.warning(
-                            f"Invalid event type '{event_type}' for installs module event, defaulting to 'info'"
-                        )
+                        logger.warning(f"Invalid event type '{event_type}' for installs module event, defaulting to 'info'")
                         # For installs events with invalid type, use 'info' but log the issue
                         # This ensures backward compatibility while flagging the problem
-                        if event_type not in {"info", "system"}:
-                            event_type = "warning"  # Default to warning for installs-related events
-
+                        if event_type not in {'info', 'system'}:
+                            event_type = 'warning'  # Default to warning for installs-related events
+                
                 # Store only the event's own details — full module data lives in the module tables.
                 enhanced_details = details.copy() if isinstance(details, dict) else {}
-
+                
                 # Store enhanced details as JSON
                 details_json = json.dumps(enhanced_details)
 
                 # An os_update event is only sent when the version changed, so the
                 # previous one is superseded here rather than by the sweep above.
-                if module_id == "os_update":
-                    cursor.execute(
-                        """
+                if module_id == 'os_update':
+                    cursor.execute("""
                         DELETE FROM events
                         WHERE device_id = %s AND module_id = 'os_update' AND timestamp <= %s
-                    """,
-                        (serial_number, collected_at),
-                    )
+                    """, (serial_number, collected_at))
 
                 # NOTE: events.device_id references devices.id which equals serial_number
-                cursor.execute(
-                    """
+                cursor.execute("""
                     INSERT INTO events (device_id, event_type, module_id, message, details, timestamp, created_at)
                     VALUES (%s, %s, %s, %s, %s::jsonb, %s, %s)
                     RETURNING id
-                """,
-                    (
-                        serial_number,
-                        event_type,
-                        module_id,
-                        message,
-                        details_json,
-                        collected_at,
-                        datetime.now(timezone.utc),
-                    ),
-                )
-
+                """, (serial_number, event_type, module_id, message, details_json, collected_at, datetime.now(timezone.utc)))
+                
                 event_row = cursor.fetchone()
                 event_id = event_row[0] if event_row else None
-
+                
                 events_stored += 1
-                logger.debug(
-                    f"Stored {event_type} event for device {serial_number}: {message}"
-                )
-
+                logger.debug(f"Stored {event_type} event for device {serial_number}: {message}")
+                
                 # Broadcast event to connected WebSocket clients
                 # Include the message field so frontend shows proper description immediately
                 try:
-                    broadcast_event(
-                        {
-                            "id": (
-                                str(event_id)
-                                if event_id
-                                else str(datetime.now(timezone.utc).timestamp())
-                            ),
-                            "device": serial_number,
-                            "kind": event_type,
-                            "ts": (
-                                collected_at.isoformat()
-                                if hasattr(collected_at, "isoformat")
-                                else str(collected_at)
-                            ),
-                            "message": message,  # Include the formatted message for immediate display
-                            "payload": enhanced_details,
-                        }
-                    )
+                    broadcast_event({
+                        "id": str(event_id) if event_id else str(datetime.now(timezone.utc).timestamp()),
+                        "device": serial_number,
+                        "kind": event_type,
+                        "ts": collected_at.isoformat() if hasattr(collected_at, 'isoformat') else str(collected_at),
+                        "message": message,  # Include the formatted message for immediate display
+                        "payload": enhanced_details
+                    })
                 except Exception as broadcast_error:
                     logger.warning(f"Failed to broadcast event: {broadcast_error}")
-
+                
             except Exception as event_error:
                 logger.error(f"Failed to store event: {event_error}")
                 conn.rollback()
                 continue
-
+        
         # 4. ONLY create a system event if NO events were sent in payload
         # This prevents generic "Data collection" messages when client sends better events
         # SPECIAL CASE: Never create fallback 'info' events when installs module is present
         if events_stored == 0 and not has_installs_module:
             try:
                 collection_message = f"Data collection: {collection_type} ({len(modules_processed)} modules)"
-
+                
                 # Store only summary fields — full module data already lives in the module tables.
-                collection_details = json.dumps(
-                    {
-                        "platform": platform,
-                        "client_version": client_version,
-                        "collection_type": collection_type,
-                        "modules_processed": modules_processed,
-                        "collected_at": collected_at,
-                    }
-                )
-
+                collection_details = json.dumps({
+                    'platform': platform,
+                    'client_version': client_version,
+                    'collection_type': collection_type,
+                    'modules_processed': modules_processed,
+                    'collected_at': collected_at
+                })
+                
                 # NOTE: events.device_id references devices.id which equals serial_number
-                cursor.execute(
-                    """
+                cursor.execute("""
                     INSERT INTO events (device_id, event_type, message, details, timestamp, created_at)
                     VALUES (%s, 'info', %s, %s::jsonb, %s, %s)
                     RETURNING id
-                """,
-                    (
-                        serial_number,
-                        collection_message,
-                        collection_details,
-                        collected_at,
-                        datetime.now(timezone.utc),
-                    ),
-                )
-
+                """, (serial_number, collection_message, collection_details, collected_at, datetime.now(timezone.utc)))
+                
                 event_row = cursor.fetchone()
                 event_id = event_row[0] if event_row else None
-
+                
                 events_stored += 1
-                logger.debug(
-                    f"Created fallback system event for device {serial_number}"
-                )
-
+                logger.debug(f"Created fallback system event for device {serial_number}")
+                
                 # Broadcast fallback event to connected WebSocket clients
                 # Include message field for proper display
                 try:
-                    broadcast_event(
-                        {
-                            "id": (
-                                str(event_id)
-                                if event_id
-                                else str(datetime.now(timezone.utc).timestamp())
-                            ),
-                            "device": serial_number,
-                            "kind": "info",
-                            "ts": (
-                                collected_at.isoformat()
-                                if hasattr(collected_at, "isoformat")
-                                else str(collected_at)
-                            ),
-                            "message": collection_message,  # Include the formatted message
-                            "payload": {
-                                "message": collection_message,
-                                "modules": modules_processed,
-                            },
-                        }
-                    )
+                    broadcast_event({
+                        "id": str(event_id) if event_id else str(datetime.now(timezone.utc).timestamp()),
+                        "device": serial_number,
+                        "kind": "info",
+                        "ts": collected_at.isoformat() if hasattr(collected_at, 'isoformat') else str(collected_at),
+                        "message": collection_message,  # Include the formatted message
+                        "payload": {"message": collection_message, "modules": modules_processed}
+                    })
                 except Exception as broadcast_error:
-                    logger.warning(
-                        f"Failed to broadcast fallback event: {broadcast_error}"
-                    )
+                    logger.warning(f"Failed to broadcast fallback event: {broadcast_error}")
             except Exception as system_event_error:
                 logger.error(f"Failed to create system event: {system_event_error}")
                 conn.rollback()
         elif has_installs_module and events_stored == 0:
-            logger.warning(
-                f"[WARN] INSTALLS MODULE PRESENT but NO events sent - this should not happen! Device: {serial_number}"
-            )
+            logger.warning(f"[WARN] INSTALLS MODULE PRESENT but NO events sent - this should not happen! Device: {serial_number}")
         else:
-            logger.debug(
-                f"Skipped system event creation - {events_stored} events already in payload"
-            )
+            logger.debug(f"Skipped system event creation - {events_stored} events already in payload")
 
         # Record acceptance in server time immediately before the final ingest
         # commit. Client collectedAt belongs to the data and can predate a
         # retry; it cannot answer whether a later upload landed.
-        cursor.execute(
-            """
+        cursor.execute("""
             INSERT INTO device_ingest_state (device_id, last_accepted_at)
             VALUES (%s, NOW())
             ON CONFLICT (device_id) DO UPDATE
@@ -1955,9 +1594,7 @@ def _process_submission(request: Request, raw_body):
                 device_ingest_state.last_accepted_at,
                 EXCLUDED.last_accepted_at
             )
-        """,
-            (serial_number,),
-        )
+        """, (serial_number,))
 
         conn.commit()
 
@@ -1967,7 +1604,6 @@ def _process_submission(request: Request, raw_body):
         # stays async for the WebPubSub broadcast, and an inline multi-second
         # DELETE here previously stalled the event loop and health probes).
         import random
-
         if random.random() < 0.01:
             threading.Thread(target=_run_retention_purge, daemon=True).start()
 
@@ -1979,11 +1615,9 @@ def _process_submission(request: Request, raw_body):
         # multi-second recompute. Read caches expire by TTL instead; admin
         # and settings writes (which must be visible immediately) still call
         # invalidate_caches().
-
-        logger.debug(
-            f"[SUCCESS] Successfully processed device {serial_number}: {len(modules_processed)} modules, {events_stored} events"
-        )
-
+        
+        logger.debug(f"[SUCCESS] Successfully processed device {serial_number}: {len(modules_processed)} modules, {events_stored} events")
+        
         return {
             "success": True,
             "message": f"Complete data storage: {len(modules_processed)} modules, {events_stored} events",
@@ -1992,13 +1626,11 @@ def _process_submission(request: Request, raw_body):
             "modules_processed": modules_processed,
             "events_stored": events_stored,
             "timestamp": datetime.now(timezone.utc).isoformat(),
-            "internal_uuid": device_uuid,
+            "internal_uuid": device_uuid
         }
-
+        
     except HTTPException:
         raise
     except Exception as e:
         logger.error(f"Failed to submit events: {e}", exc_info=True)
-        raise HTTPException(
-            status_code=500, detail=f"Failed to process events: {str(e)}"
-        )
+        raise HTTPException(status_code=500, detail=f"Failed to process events: {str(e)}")
