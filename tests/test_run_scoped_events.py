@@ -6,7 +6,7 @@ own events beside them instead of superseding them. Hours later the dashboard
 still counted the device as erroring, and its Installs tab still carried a red
 "last run failed" box, while the device itself had been clean for two runs.
 
-Ingest is one long async endpoint against a live connection, so these read its
+Ingest is one long endpoint against a live connection, so these read its
 source: what matters is that the delete happens, that it is keyed on the device
 and bounded by the payload's own timestamp, and that events are stored with the
 module they belong to.
@@ -21,11 +21,19 @@ TEXT = SOURCE.read_text(encoding="utf-8")
 
 
 def _submit_events_source() -> str:
+    # submit_events only reads the body; the parse/validate/persist work runs
+    # in _process_submission on the threadpool, so the ingest path is both.
     tree = ast.parse(TEXT)
+    wanted = {"submit_events": ast.AsyncFunctionDef, "_process_submission": ast.FunctionDef}
+    found = {}
     for node in ast.walk(tree):
-        if isinstance(node, ast.AsyncFunctionDef) and node.name == "submit_events":
-            return ast.get_source_segment(TEXT, node) or ""
-    raise AssertionError("submit_events not found")
+        kind = wanted.get(getattr(node, "name", None))
+        if kind is not None and isinstance(node, kind):
+            found[node.name] = ast.get_source_segment(TEXT, node) or ""
+    missing = set(wanted) - set(found)
+    if missing:
+        raise AssertionError(f"ingest functions not found: {sorted(missing)}")
+    return found["submit_events"] + "\n" + found["_process_submission"]
 
 
 @pytest.fixture(scope="module")
