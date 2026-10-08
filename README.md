@@ -34,8 +34,8 @@ Module payloads are stored verbatim as JSONB, one column per module. The client 
 
 Every request is authorized against one of these credentials, then gated by a least-privilege scope (`read` for GETs, `ingest` for telemetry POSTs, `admin` for mutations and admin endpoints):
 
-- **`X-Client-Passphrase`** — the shared fleet passphrase the device agents send. Full access. This is the simplest self-host path.
-- **`X-API-Key`** — per-client keys (`rm_<id>_<secret>`), scope-limited and audited. Mint these for individual integrations and retire the shared passphrase over time.
+- **`X-Client-Passphrase`** — the shared fleet passphrase. Read only: it sits on every managed device, so it cannot post telemetry, mutate or delete.
+- **`X-API-Key`** — per-client keys (`rm_<id>_<secret>`), scope-limited and audited. Device agents send one with `ingest` to post telemetry; mint others for individual integrations and retire the shared passphrase over time.
 - **`Authorization: Bearer <jwt>`** — a federated OIDC token, described below.
 - **`X-Internal-Secret`** — the dashboard BFF → API hop only.
 

@@ -49,7 +49,7 @@ def archive_device(serial_number: str):
     - Keeping historical data while hiding from active reports
     
     **Authentication Required:**
-    - Windows clients: X-API-PASSPHRASE header
+    - API key with the `admin` scope: X-API-Key header (the shared passphrase is read only)
     - Azure resources: X-MS-CLIENT-PRINCIPAL-ID header (Managed Identity)
     """
     try:
@@ -120,7 +120,7 @@ def unarchive_device(serial_number: str):
     - Retain all historical data
     
     **Authentication Required:**
-    - Windows clients: X-API-PASSPHRASE header
+    - API key with the `admin` scope: X-API-Key header (the shared passphrase is read only)
     - Azure resources: X-MS-CLIENT-PRINCIPAL-ID header (Managed Identity)
     """
     try:
@@ -203,7 +203,7 @@ def delete_device(serial_number: str, confirm: bool = Query(False)):
     - confirm: Must be set to true to confirm deletion (safety check)
     
     **Authentication Required:**
-    - Windows clients: X-API-PASSPHRASE header
+    - API key with the `admin` scope: X-API-Key header (the shared passphrase is read only)
     - Azure resources: X-MS-CLIENT-PRINCIPAL-ID header (Managed Identity)
     """
     try:
@@ -1082,7 +1082,7 @@ def clear_stale_installs_errors(
     This is a manual maintenance operation - not automated.
 
     **Authentication Required:**
-    - Windows clients: X-API-PASSPHRASE header
+    - API key with the `admin` scope: X-API-Key header (the shared passphrase is read only)
     - Azure resources: X-MS-CLIENT-PRINCIPAL-ID header (Managed Identity)
     """
     try:
@@ -1237,7 +1237,7 @@ def reclassify_stored_installs(
     table-wide rewrite belongs off the request path of every other caller.
 
     **Authentication Required:**
-    - Windows clients: X-API-PASSPHRASE header
+    - API key with the `admin` scope: X-API-Key header (the shared passphrase is read only)
     - Azure resources: X-MS-CLIENT-PRINCIPAL-ID header (Managed Identity)
     """
     try:
@@ -1433,7 +1433,7 @@ def delete_orphaned_module_rows(
     devices that still exist.
 
     **Authentication Required:**
-    - Windows clients: X-API-PASSPHRASE header
+    - API key with the `admin` scope: X-API-Key header (the shared passphrase is read only)
     - Azure resources: X-MS-CLIENT-PRINCIPAL-ID header (Managed Identity)
     """
     wanted = [d.strip() for d in device_ids.split(",") if d.strip()]
