@@ -127,6 +127,24 @@ def _parse_iso(raw: Any) -> Optional[datetime]:
     return parsed.astimezone(timezone.utc)
 
 
+def utc_install_date(raw: Any) -> Optional[str]:
+    """The OS install date as ISO-8601 with an explicit UTC offset, or None.
+
+    The Windows client derives installDate from a Unix epoch and serialises it
+    without an offset, so the stored value is UTC wall-clock time that reads as
+    local time to anyone who parses it naively. Stamping the offset here makes the
+    basis part of the value instead of an assumption each consumer has to repeat.
+    A value that already carries an offset is converted to UTC; one that cannot be
+    parsed is passed through as collected rather than dropped.
+    """
+    if not raw:
+        return None
+    parsed = _parse_iso(raw)
+    if parsed is None:
+        return str(raw)
+    return parsed.isoformat()
+
+
 # The two agents record their last run in different shapes, and reading only
 # one of them yields None for every device on the other platform -- parity in
 # code and a silent no-op in practice. Cimian carries a sessions[] list with
@@ -3506,6 +3524,9 @@ def get_bulk_system(
                 # installDate moves for a wipe and for a feature update alike; these say
                 # which. None means the client has not reported the field yet, and is not
                 # the same claim as 0, which means the OS has never been upgraded over.
+                # lastInPlaceUpgrade is parsed from the marker's locale-formatted name,
+                # which states no time basis, so it is projected as collected rather
+                # than stamped with a guessed offset.
                 last_in_place_upgrade = (os_info.get('lastInPlaceUpgrade')
                                          or os_info.get('last_in_place_upgrade'))
                 in_place_upgrade_count = os_info.get('inPlaceUpgradeCount')
@@ -3575,7 +3596,7 @@ def get_bulk_system(
                     'locale': locale or None,
                     'timeZone': time_zone or None,
                     'keyboardLayout': keyboard_layouts or None,
-                    'installDate': install_date or None,
+                    'installDate': utc_install_date(install_date),
                     'featureUpdate': feature_update or None,
                     'lastInPlaceUpgrade': last_in_place_upgrade or None,
                     'inPlaceUpgradeCount': in_place_upgrade_count,
