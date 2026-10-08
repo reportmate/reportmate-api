@@ -116,13 +116,25 @@ _NOISY_LOGGERS = (
     "urllib3",
     "asyncio",
 )
+_LOG_LEVEL_NAMES = ("CRITICAL", "ERROR", "WARNING", "INFO", "DEBUG")
+_requested_log_level = os.getenv("LOG_LEVEL", "").strip().upper()
+# An empty or misspelt LOG_LEVEL must not stop the API from importing:
+# basicConfig raises ValueError on an unknown level name, which would take
+# every worker down at startup. Fall back to INFO and say so once.
+_log_level = (
+    _requested_log_level if _requested_log_level in _LOG_LEVEL_NAMES else "INFO"
+)
 logging.basicConfig(
-    level=os.getenv("LOG_LEVEL", "INFO").upper(),
+    level=_log_level,
     handlers=[_log_handler],
     force=True,
 )
 for _noisy in _NOISY_LOGGERS:
     logging.getLogger(_noisy).setLevel(_THIRD_PARTY_LOG_LEVEL)
+if _requested_log_level and _requested_log_level != _log_level:
+    logging.getLogger(__name__).warning(
+        f"Ignoring unknown LOG_LEVEL {_requested_log_level!r}; using INFO"
+    )
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
