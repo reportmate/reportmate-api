@@ -3087,6 +3087,29 @@ def _detect_mdm_provider_from_url(url: str) -> str:
     return ''
 
 
+_TRUTHY = (True, 'true', '1', 'yes', 'True', 'YES', 'Yes')
+
+
+def _mdm_info(management_data) -> dict:
+    """Return the Mac mdm_info block (mdmclient dumpManagementStatus) or {}."""
+    if not isinstance(management_data, dict):
+        return {}
+    info = management_data.get('mdm_info') or management_data.get('mdmInfo')
+    return info if isinstance(info, dict) else {}
+
+
+def _mdm_info_reports_managed(management_data) -> bool:
+    """True when mdmclient says the device is managed via MDM.
+
+    A Mac can carry mdm_info.managed_via_mdm=true while its mdm_enrollment and
+    mdm_certificate blocks are absent, which leaves nothing to name a provider
+    from. Such a device is managed by an MDM we cannot identify, not Unmanaged.
+    """
+    info = _mdm_info(management_data)
+    return (info.get('managed_via_mdm') if 'managed_via_mdm' in info
+            else info.get('managedViaMdm')) in _TRUTHY
+
+
 @router.get("/management", dependencies=[Depends(verify_authentication)], tags=["fleet"])
 def get_bulk_management(
     include_archived: bool = Query(default=False, alias="includeArchived", description="Include archived devices in results"),
@@ -3159,6 +3182,10 @@ def get_bulk_management(
                 # Mac osquery returns string "true"/"false", Windows returns boolean
                 is_enrolled_raw = mdm_enrollment.get('isEnrolled') or mdm_enrollment.get('is_enrolled') or mdm_enrollment.get('enrolled')
                 is_enrolled = is_enrolled_raw in (True, 'true', '1', 'yes', 'True')
+                managed_via_mdm = _mdm_info_reports_managed(management_data)
+                if not is_enrolled and is_enrolled_raw is None and managed_via_mdm:
+                    # No enrolment block to read, but mdmclient says managed.
+                    is_enrolled = True
                 enrollment_status = 'Enrolled' if is_enrolled else 'Not Enrolled'
                 
                 # Provider detection - the active MDM server/check-in URL is
@@ -3170,6 +3197,11 @@ def get_bulk_management(
                     server_url = mdm_enrollment.get('server_url') or mdm_enrollment.get('serverUrl') or ''
                     checkin_url = mdm_enrollment.get('checkin_url') or mdm_enrollment.get('checkinUrl') or ''
                     provider = _detect_mdm_provider_from_url(f"{server_url} {checkin_url}")
+                if not provider:
+                    # mdmclient's own server URL is as current as the enrolment
+                    # block and survives that block going missing.
+                    provider = _detect_mdm_provider_from_url(
+                        str(_mdm_info(management_data).get('mdm_server_url_full') or ''))
                 if not provider:
                     # Fall back to certificate data (Mac) - may be stale after migration
                     cert_issuer = mdm_certificate.get('certificate_issuer') or mdm_certificate.get('certificateIssuer')
@@ -3200,9 +3232,10 @@ def get_bulk_management(
                     if has_intune_data or 'entra' in enrollment_type_raw.lower():
                         provider = 'Microsoft Intune'
                 if not provider:
-                    # Device reports an MDM enrollment but no provider could be
-                    # identified from any source - surface it as Unmanaged.
-                    provider = 'Unmanaged'
+                    # No provider could be identified from any source. A device
+                    # that mdmclient reports as managed is still managed, so it
+                    # is an unknown MDM rather than Unmanaged.
+                    provider = 'Unknown MDM' if managed_via_mdm else 'Unmanaged'
                 
                 # Enrollment type - support Mac and Windows patterns
                 enrollment_type = mdm_enrollment.get('enrollmentType') or mdm_enrollment.get('enrollment_type')
