@@ -14,6 +14,7 @@ from dependencies import (
     cache_get, cache_set, get_db_connection, load_sql, logger,
     verify_authentication, infer_platform,
 )
+from device_status import derive_device_status
 from routers.inventory_state import fetch_inventory_states, is_stored, normalize_serial
 
 router = APIRouter(tags=["statistics"])
@@ -135,15 +136,7 @@ def _compute_dashboard_data(events_limit: int, include_archived: bool):
                 else "Unknown"
             )
 
-            # Status from last_seen
-            status = "online"
-            if last_seen:
-                ls = last_seen if last_seen.tzinfo else last_seen.replace(tzinfo=timezone.utc)
-                diff_s = (now_utc - ls).total_seconds()
-                if diff_s > 86400:
-                    status = "offline"
-                elif diff_s > 3600:
-                    status = "idle"
+            status = derive_device_status(last_seen, now_utc)
 
             # Inventory from batch lookup
             inv_device_name = device_name
