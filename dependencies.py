@@ -396,12 +396,17 @@ def assert_auth_enabled_for_prod() -> None:
 #   ingest -- POST telemetry (events, device upsert)
 #   admin  -- mutations, deletes, and admin endpoints
 #
-# Legacy credentials (shared passphrase, internal secret, managed identity)
-# are granted ALL scopes for backward compatibility, so nothing in the fleet
-# breaks. Only per-client API keys are scope-limited; migrate callers onto
-# scoped keys over time, then retire the shared passphrase.
+# The internal secret and managed identity keep ALL scopes: both are held only
+# by server-side callers (the web proxy enforces its own admin role).
+#
+# The shared passphrase is granted read only. It is provisioned to every
+# endpoint, so it cannot be trusted with mutations or deletes, and the
+# collectors already post telemetry with their API key, which resolves ahead
+# of the passphrase. Ingest and admin need a scoped API key or the internal
+# secret. Migrate remaining readers onto scoped keys, then retire it.
 
 ALL_SCOPES = ("read", "ingest", "admin")
+PASSPHRASE_SCOPES = ("read",)
 API_KEY_PREFIX = "rm"
 
 
@@ -824,11 +829,11 @@ async def verify_authentication(
     3. API Key: X-API-Key (per-client, scope-limited).
     3.5 OIDC bearer: Authorization: Bearer <jwt> (federated SSO, IdP-agnostic,
        scope-limited via IdP roles) -- secretless; inert until configured.
-    4. Passphrase: X-API-PASSPHRASE / X-Client-Passphrase (clients, functions) -- legacy, full access.
+    4. Passphrase: X-API-PASSPHRASE / X-Client-Passphrase (clients, functions) -- legacy, read only.
 
-    Legacy credentials receive ALL scopes for backward compatibility; per-client
-    API keys carry only their granted scopes. This keeps the deployed fleet
-    working while callers migrate onto scoped keys.
+    The internal secret and managed identity receive ALL scopes; the shared
+    passphrase receives ``read`` only; per-client API keys carry only their
+    granted scopes.
     """
     if DISABLE_AUTH:
         logger.debug(
@@ -947,7 +952,7 @@ async def verify_authentication(
                     status_code=401, detail="Invalid or unaccepted bearer token"
                 )
 
-    # Method 4: Passphrase (Windows/macOS clients, alert functions) -- legacy, full access.
+    # Method 4: Passphrase (Windows/macOS clients, alert functions) -- legacy, read only.
     # Note: `auth is None` (not elif) so a failed-but-accompanied API key above
     # falls through to the passphrase instead of locking the fleet out.
     if auth is None and (x_api_passphrase or x_client_passphrase):
@@ -994,7 +999,7 @@ async def verify_authentication(
             "method": "passphrase",
             "user_agent": user_agent,
             "client_ip": client_host,
-            "scopes": list(ALL_SCOPES),
+            "scopes": list(PASSPHRASE_SCOPES),
         }
 
     if auth is None:

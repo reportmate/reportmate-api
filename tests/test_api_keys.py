@@ -189,13 +189,14 @@ def test_invalid_api_key_is_401(monkeypatch):
     assert c.get("/data", headers={"X-API-Key": bad}).status_code == 401
 
 
-def test_legacy_passphrase_keeps_full_access(monkeypatch):
+def test_legacy_passphrase_is_read_only(monkeypatch):
     monkeypatch.setattr(dependencies, "DISABLE_AUTH", False)
     monkeypatch.setattr(dependencies, "REPORTMATE_PASSPHRASE", "legacy-secret")
     c = _client()
     h = {"X-Client-Passphrase": "legacy-secret"}
-    # Legacy credential is granted ALL scopes -> read, ingest, admin all pass.
+    # The shared passphrase is provisioned to every endpoint, so it reads and
+    # nothing more: ingest, deletes and admin routes need a scoped credential.
     assert c.get("/data", headers=h).status_code == 200
-    assert c.post("/data", headers=h).status_code == 200
-    assert c.delete("/data/1", headers=h).status_code == 200
-    assert c.get("/admin/thing", headers=h).status_code == 200
+    assert c.post("/data", headers=h).status_code == 403
+    assert c.delete("/data/1", headers=h).status_code == 403
+    assert c.get("/admin/thing", headers=h).status_code == 403

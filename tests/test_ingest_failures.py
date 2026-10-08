@@ -28,7 +28,9 @@ PAYLOAD = {
     }
 }
 
-AUTH = {"X-Client-Passphrase": "test-passphrase"}
+# The shared passphrase is read-only, so ingest tests post as a server-side
+# caller; scope enforcement itself is covered in test_auth / test_api_keys.
+AUTH = {"X-Internal-Secret": "test-internal-secret"}
 
 
 class RecordingCursor:
@@ -730,10 +732,15 @@ def test_rate_limited_ingest_is_recorded(monkeypatch):
         GlobalRateLimitMiddleware._allow("dev:TESTSERIAL0001", 120)
 
     client = TestClient(app)
+    # A device credential, not the internal secret: the internal secret is
+    # exempt from throttling, and the limiter answers before auth runs.
     resp = client.post(
         "/api/v1/events",
         json=PAYLOAD,
-        headers={**AUTH, "X-Device-Serial": "TESTSERIAL0001"},
+        headers={
+            "X-Client-Passphrase": "test-passphrase",
+            "X-Device-Serial": "TESTSERIAL0001",
+        },
     )
     assert resp.status_code == 429
 

@@ -13,7 +13,9 @@ PAYLOAD = {
     }
 }
 
-AUTH = {"X-Client-Passphrase": "test-passphrase"}
+# The shared passphrase is read-only, so ingest tests post as a server-side
+# caller; scope enforcement itself is covered in test_auth / test_api_keys.
+AUTH = {"X-Internal-Secret": "test-internal-secret"}
 
 
 class ReplayCursor:

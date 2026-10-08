@@ -2,9 +2,9 @@
 Admin endpoints for managing per-client API keys.
 
 All routes live under ``/admin`` so the central scope gate in
-``verify_authentication`` requires the ``admin`` scope. A holder of the legacy
-shared passphrase (full access) can mint the first keys, avoiding any
-chicken-and-egg bootstrap problem.
+``verify_authentication`` requires the ``admin`` scope. The shared passphrase
+is read only, so the first keys are minted with the internal secret (or a
+managed identity), which keep full access.
 """
 
 import json
