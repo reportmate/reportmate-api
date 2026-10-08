@@ -177,6 +177,16 @@ def test_read_returns_the_document(client, monkeypatch):
     assert body["collectedAt"] == stamp.isoformat()
 
 
+def test_read_decodes_the_document_from_text(client, monkeypatch):
+    stamp = datetime(2026, 10, 1, tzinfo=timezone.utc)
+    conn = _use(monkeypatch, FakeConn(rows=[('"compliant"', "mdm", stamp, stamp)]))
+    resp = client.get("/api/v1/device/SER1/extension/risk")
+    assert resp.status_code == 200
+    assert resp.json()["data"] == "compliant"
+    read_sql = [c[0] for c in conn.calls if c[0].startswith("SELECT e.data")][0]
+    assert read_sql.startswith("SELECT e.data::text,")
+
+
 def test_read_of_missing_data_is_404(client, monkeypatch):
     _use(monkeypatch, FakeConn(rows=[]))
     assert client.get("/api/v1/device/SER1/extension/risk").status_code == 404
@@ -305,6 +315,18 @@ def test_upsert_sql_inserts_then_replaces(monkeypatch):
         assert (json.loads(data) if isinstance(data, str) else data) == {"v": 2}
         assert source == "b"
         assert collected_at == datetime(2026, 1, 1, tzinfo=timezone.utc)
+
+        # A bare JSON string is valid data; reading it as text keeps it from
+        # being decoded twice.
+        cur.execute(
+            mod.EXTENSION_UPSERT_SQL,
+            mod._upsert_params("EXT-TEST", "risk", "compliant", "c", None, now),
+        )
+        cur.execute(
+            "SELECT data::text FROM extension_data "
+            "WHERE device_id = 'EXT-TEST' AND extension_name = 'risk'"
+        )
+        assert json.loads(cur.fetchone()[0]) == "compliant"
     finally:
         cur.execute("DELETE FROM extension_data WHERE device_id = 'EXT-TEST'")
         conn.commit()

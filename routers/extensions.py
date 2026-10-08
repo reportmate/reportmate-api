@@ -158,8 +158,11 @@ def get_device_extension(serial_number: str, extension_name: str):
     conn = get_db_connection()
     try:
         cursor = conn.cursor()
+        # data is read as text and decoded here. pg8000 hands JSONB back
+        # already decoded, so a document that is a bare JSON string would
+        # arrive as a str and be fed to json.loads a second time.
         cursor.execute(
-            "SELECT e.data, e.source, e.collected_at, e.updated_at "
+            "SELECT e.data::text, e.source, e.collected_at, e.updated_at "
             "FROM extension_data e JOIN devices d ON d.id = e.device_id "
             "WHERE (d.serial_number = %s OR d.id = %s) AND e.extension_name = %s",
             (serial_number, serial_number, name),
