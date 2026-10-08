@@ -77,6 +77,14 @@ def test_no_policy_write_is_uncorroborated_but_still_returned():
     assert record["autopilotPolicyDate"] is None
 
 
+def test_a_malformed_autopilot_config_is_ignored_not_fatal():
+    record = one(
+        [system("S1")], [{"serialNumber": "S1", "autopilotConfig": "Registered"}]
+    )
+    assert record["corroborated"] is False
+    assert record["autopilotPolicyDate"] is None
+
+
 def test_no_install_date_leaves_corroboration_unknown():
     record = one([system("S1", install_date=None)], [management("S1")])
     assert record["wipedAt"] is None

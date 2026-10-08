@@ -150,10 +150,14 @@ def derive_records(
     from, and every reporting device has one. Management and installs are joined on
     serial number and may be missing for any given device.
     """
+    # autopilotConfig is passed through from what the client sent, so one device
+    # reporting it in another shape must not fail the record for the whole fleet.
     autopilot_by_serial = {
-        d["serialNumber"]: (d.get("autopilotConfig") or {})
+        d["serialNumber"]: d.get("autopilotConfig")
         for d in management
-        if isinstance(d, dict) and d.get("serialNumber")
+        if isinstance(d, dict)
+        and d.get("serialNumber")
+        and isinstance(d.get("autopilotConfig"), dict)
     }
     cimian_by_serial = {
         d["serialNumber"]: ((d.get("modules") or {}).get("installs") or {}).get(
