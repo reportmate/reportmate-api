@@ -38,6 +38,7 @@ from routers import (
     api_keys,
     devices,
     events,
+    extensions,
     fleet,
     health,
     inventory_state,
@@ -127,6 +128,10 @@ API requests are subject to rate limiting. Contact support for increased limits.
             "name": "settings",
             "description": "Server-side org settings: inventory mapping and security rules",
         },
+        {
+            "name": "extensions",
+            "description": "Data outside systems attach to a device by serial number",
+        },
     ],
 )
 
@@ -207,6 +212,7 @@ for _router_mod in (
     api_keys,
     auth_config,
     inventory_state,
+    extensions,
 ):
     app.include_router(_router_mod.router, prefix="/api/v1")
 

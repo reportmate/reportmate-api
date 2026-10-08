@@ -50,3 +50,7 @@ def test_no_claim_of_a_cascade_survives():
     body = _delete_device_body()
     assert "CASCADE will delete" not in body
     assert "cascading delete via foreign keys" not in body
+
+
+def test_extension_data_is_deleted():
+    assert "DELETE FROM extension_data WHERE device_id = %s" in _delete_device_body()
