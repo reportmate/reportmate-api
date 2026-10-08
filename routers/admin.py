@@ -255,6 +255,9 @@ def delete_device(serial_number: str, confirm: bool = Query(False)):
         cursor.execute("DELETE FROM usage_history WHERE device_id = %s", (device_id,))
         usage_history_deleted = cursor.rowcount
 
+        cursor.execute("DELETE FROM extension_data WHERE device_id = %s", (device_id,))
+        extensions_deleted = cursor.rowcount
+
         module_rows_deleted = 0
         for table in _MODULE_TABLES:
             try:
@@ -285,6 +288,7 @@ def delete_device(serial_number: str, confirm: bool = Query(False)):
         logger.warning(f"   - Archived status: {is_archived}")
         logger.warning(f"   - Events deleted: {events_deleted}")
         logger.warning(f"   - Usage history rows deleted: {usage_history_deleted}")
+        logger.warning(f"   - Extension rows deleted: {extensions_deleted}")
         logger.warning(f"   - Modules deleted: {module_rows_deleted} records across {len([k for k, v in module_counts.items() if v > 0])} tables")
 
         return {
@@ -297,6 +301,7 @@ def delete_device(serial_number: str, confirm: bool = Query(False)):
             "deletedData": {
                 "events": events_deleted,
                 "usageHistory": usage_history_deleted,
+                "extensions": extensions_deleted,
                 "modules": module_counts,
                 "totalModuleRecords": module_rows_deleted
             },

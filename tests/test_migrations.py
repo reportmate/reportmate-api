@@ -32,6 +32,7 @@ def test_baseline_renders_offline():
     assert "device_ingest_state" in sql
     assert "last_accepted_at" in sql
     assert "device_inventory_state" in sql
+    assert "extension_data" in sql
     # 0008 drops the module GIN indexes the baseline created; both sides must
     # render so the drop is versioned and reversible rather than ad hoc.
     assert "CREATE INDEX IF NOT EXISTS idx_applications_data_gin" in sql
@@ -90,8 +91,9 @@ def test_upgrade_creates_app_tables_and_stamps_version(migrated):
     cur.execute(
         "SELECT count(*) FROM information_schema.tables "
         "WHERE table_name IN ('usage_history','api_keys','api_key_audit',"
-        "'app_settings','idempotency_keys','device_ingest_state')"
+        "'app_settings','idempotency_keys','device_ingest_state',"
+        "'extension_data')"
     )
-    assert cur.fetchone()[0] == 6
+    assert cur.fetchone()[0] == 7
     cur.close()
     conn.close()
