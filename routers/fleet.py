@@ -2641,6 +2641,13 @@ def get_bulk_installs_full(
                         'version': cimian_data.get('version'),
                         'status': cimian_data.get('status'),
                         'sessions': cimian_data.get('sessions', [])[:5],  # Only last 5 sessions
+                        # Session summary counters. sessions above is truncated to
+                        # five, so a consumer cannot recount from it; without these
+                        # the bulk endpoint reads totalSessions as 0 on every device
+                        # while the per-device endpoint returns the real count.
+                        'totalSessions': cimian_data.get('totalSessions'),
+                        'lastSessionTime': cimian_data.get('lastSessionTime'),
+                        'lastRun': cimian_data.get('lastRun'),
                     }
                 
                 # Include Munki data if present (macOS)
