@@ -20,6 +20,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
 
 from pagination import add_pagination_headers
 from log_tails import strip_log_tails
+from device_status import derive_device_status
 from routers.inventory_state import fetch_inventory_states, normalize_serial
 
 from dependencies import (
@@ -113,7 +114,6 @@ def get_all_devices(
             d.serial_number, 
             d.last_seen,
             d.created_at,
-            d.status,
             d.model,
             d.manufacturer,
             d.os,
@@ -148,6 +148,7 @@ def get_all_devices(
 
         rows = cursor.fetchall()
         inventory_states = fetch_inventory_states(conn)
+        now_utc = datetime.now(timezone.utc)
 
         devices: List[Dict[str, Any]] = []
 
@@ -159,7 +160,6 @@ def get_all_devices(
                 serial_number,
                 last_seen,
                 created_at,
-                status,
                 _model,
                 _manufacturer,
                 os,
@@ -258,7 +258,7 @@ def get_all_devices(
                 "lastSeen": last_seen.isoformat() if last_seen else None,
                 "createdAt": created_at.isoformat() if created_at else None,
                 "registrationDate": created_at.isoformat() if created_at else None,
-                "status": status,
+                "status": derive_device_status(last_seen, now_utc),
                 "archived": archived,
                 "archivedAt": archived_at.isoformat() if archived_at else None,
                 "platform": device_platform,
@@ -363,7 +363,7 @@ def get_device_by_serial(serial_number: str):
         # Query uses correct schema columns - include archived status, client_version, and platform
         cursor.execute(
             """
-            SELECT id, device_id, name, serial_number, last_seen, status, 
+            SELECT id, device_id, name, serial_number, last_seen,
                    model, manufacturer, os, os_name, os_version, platform, created_at,
                    archived, archived_at, client_version
             FROM devices 
@@ -383,7 +383,6 @@ def get_device_by_serial(serial_number: str):
             device_name,
             serial_num,
             last_seen,
-            status,
             model,
             manufacturer,
             os,
@@ -492,6 +491,7 @@ def get_device_by_serial(serial_number: str):
                 "lastSeen": last_seen.isoformat() if last_seen else None,
                 "createdAt": created_at.isoformat() if created_at else None,
                 "registrationDate": created_at.isoformat() if created_at else None,
+                "status": derive_device_status(last_seen),
                 "archived": archived or False,
                 "archivedAt": archived_at.isoformat() if archived_at else None,
                 "inventoryState": inventory_state,
@@ -729,7 +729,7 @@ def get_device_info_fast(serial_number: str):
         cursor.execute(
             """
             SELECT id, device_id, serial_number, last_seen, created_at,
-                   archived, archived_at, client_version, platform, status
+                   archived, archived_at, client_version, platform
             FROM devices 
             WHERE serial_number = %s OR id = %s
         """,
@@ -751,7 +751,6 @@ def get_device_info_fast(serial_number: str):
             archived_at,
             client_version,
             platform,
-            status,
         ) = device_row
 
         # Get only the modules needed for InfoTab (6 widgets)
@@ -814,7 +813,7 @@ def get_device_info_fast(serial_number: str):
                 "lastSeen": last_seen.isoformat() if last_seen else None,
                 "createdAt": created_at.isoformat() if created_at else None,
                 "registrationDate": created_at.isoformat() if created_at else None,
-                "status": status,
+                "status": derive_device_status(last_seen),
                 "archived": archived or False,
                 "archivedAt": archived_at.isoformat() if archived_at else None,
                 "clientVersion": client_version,
