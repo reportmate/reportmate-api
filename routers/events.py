@@ -22,6 +22,7 @@ from install_status import (
     run_event_is_moot as _run_event_is_moot,
     stamp_items as _stamp_install_items,
 )
+from log_tails import stamp_log_summaries as _stamp_log_summaries
 
 from dependencies import (
     broadcast_event, cache_get, cache_set, get_db_connection,
@@ -1086,6 +1087,15 @@ async def submit_events(request: Request):
                     # stored state is now the single answer they all read.
                     if module_name == 'installs':
                         module_data = _stamp_install_items(module_data)
+
+                    # Count each log root's error and warning lines once, here,
+                    # so the dashboard can aggregate them per tool in SQL
+                    # without reading the tails (log_tails.summarize_root).
+                    if module_name == 'management':
+                        try:
+                            module_data = _stamp_log_summaries(module_data)
+                        except Exception as summary_error:
+                            logger.warning(f"Skipped log level summary for {serial_number}: {summary_error}")
 
                     # STANDARD HANDLING: All modules store in their table with data JSONB
                     # Check if module record exists (device_id in module tables = serial_number per schema)

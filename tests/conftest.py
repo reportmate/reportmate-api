@@ -20,6 +20,10 @@ os.environ.setdefault(
 )
 os.environ["REPORTMATE_PASSPHRASE"] = "test-passphrase"
 os.environ["API_INTERNAL_SECRET"] = "test-internal-secret"
+# The app refreshes the dashboard insight cards in the background after
+# startup; under TestClient that would reach for a database the unit tests do
+# not have.
+os.environ.setdefault("INSIGHTS_BACKGROUND_REFRESH", "false")
 
 
 import pytest
