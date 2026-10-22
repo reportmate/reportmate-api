@@ -221,6 +221,9 @@ MANAGEMENT = {
     "SAMPLE2": {"mdmEnrollment": {"isEnrolled": False}},
     "SAMPLE8": {"mdm_enrollment": {"is_enrolled": True}},
     "SAMPLE9": {"mdmEnrollment": {}},
+    # Silent past the 7-day cutoff, and never seen at all: both land in 7d+.
+    "SAMPLE10": {"mdmEnrollment": {"isEnrolled": False}},
+    "SAMPLE7": {"mdmEnrollment": {"isEnrolled": False}},
     "SAMPLE11": {"mdmEnrollment": {"isEnrolled": False}},
 }
 
@@ -508,9 +511,9 @@ def test_protection_gaps(insights):
 
 def test_unmanaged_devices(insights):
     card = insights.compute_insights("all", False)["cards"]["unmanagedDevices"]
-    assert card["devices"] == 4
-    assert card["unmanaged"]["count"] == 2
-    assert card["unmanaged"]["pct"] == 50
+    assert card["devices"] == 6
+    assert card["unmanaged"]["count"] == 4
+    assert card["unmanaged"]["pct"] == 67
     assert card["unmanaged"]["link"] == {
         "path": "/management",
         "params": {"enrolled": "0"},
@@ -518,15 +521,36 @@ def test_unmanaged_devices(insights):
     assert {b["key"]: b["count"] for b in card["lastSeen"]} == {
         "24h": 1,
         "1-7d": 1,
-        "7d+": 0,
+        "7d+": 2,
     }
-    assert [d["serialNumber"] for d in card["recent"]] == ["SAMPLE2", "SAMPLE9"]
+    assert [d["serialNumber"] for d in card["recent"]] == [
+        "SAMPLE2", "SAMPLE9", "SAMPLE10", "SAMPLE7",
+    ]
+    assert card["recent"][3]["lastSeen"] is None
     assert card["recent"][0]["link"] == {"path": "/device/SAMPLE2", "params": {}}
+
+
+def test_unmanaged_last_seen_cutoffs_are_24_hours_and_7_days(insights, monkeypatch):
+    conn = _connect()
+    cur = conn.cursor()
+    cur.execute("UPDATE devices SET last_seen = NOW() - INTERVAL '23 hours' WHERE serial_number = 'SAMPLE2'")
+    cur.execute("UPDATE devices SET last_seen = NOW() - INTERVAL '25 hours' WHERE serial_number = 'SAMPLE9'")
+    cur.execute("UPDATE devices SET last_seen = NOW() - INTERVAL '167 hours' WHERE serial_number = 'SAMPLE10'")
+    conn.commit()
+    try:
+        card = insights.compute_insights("all", False)["cards"]["unmanagedDevices"]
+        assert {b["key"]: b["count"] for b in card["lastSeen"]} == {"24h": 1, "1-7d": 2, "7d+": 1}
+    finally:
+        cur.execute("UPDATE devices SET last_seen = %s WHERE serial_number = 'SAMPLE2'", (NOW,))
+        cur.execute("UPDATE devices SET last_seen = %s WHERE serial_number = 'SAMPLE9'", (ago(days=3),))
+        cur.execute("UPDATE devices SET last_seen = %s WHERE serial_number = 'SAMPLE10'", (ago(days=10),))
+        conn.commit()
+        conn.close()
 
 
 def test_unmanaged_devices_platform_filter(insights):
     card = insights.compute_insights("Windows", False)["cards"]["unmanagedDevices"]
-    assert (card["devices"], card["unmanaged"]["count"]) == (2, 1)
+    assert (card["devices"], card["unmanaged"]["count"]) == (3, 2)
 
 
 def test_hardware_at_risk(insights):
@@ -664,4 +688,4 @@ def test_connectivity_problems(insights):
 
 def test_include_archived_widens_the_fleet(insights):
     card = insights.compute_insights("all", True)["cards"]["unmanagedDevices"]
-    assert card["unmanaged"]["count"] == 3
+    assert card["unmanaged"]["count"] == 5
