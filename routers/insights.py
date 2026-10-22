@@ -51,6 +51,7 @@ MAX_ENTRIES = int(os.getenv("INSIGHTS_CACHE_MAX_ENTRIES", "256"))
 
 APP_USAGE = "appUsage"
 TOOL_DEVICES = "managementToolLogs/devices"
+MANAGEMENT_LOGS = "management/logs/fleet"
 CARDS = tuple(dashboard_insights.CARD_KEYS) + (APP_USAGE,)
 REFRESH_PLATFORMS = ("all", "macOS", "Windows")
 
@@ -85,6 +86,9 @@ def _semaphore() -> asyncio.Semaphore:
 
 
 def _computation(key: CacheKey) -> Callable[[], Dict[str, Any]]:
+    if key[0] == MANAGEMENT_LOGS:
+        _, hours, tool, level, message, platform = key
+        return lambda: dashboard_insights.compute_management_logs(hours, tool, level, message, platform)
     if key[0] == TOOL_DEVICES:
         _, tool, level, hours, platform = key
         return lambda: dashboard_insights.compute_tool_devices(tool, level, hours, platform)
@@ -153,6 +157,7 @@ def _default_keys() -> List[CacheKey]:
     for platform in REFRESH_PLATFORMS:
         keys.extend((card, platform, False) for card in dashboard_insights.CARD_KEYS)
         keys.append((APP_USAGE, platform, (), (), dashboard_insights.USAGE_DAYS))
+        keys.append((MANAGEMENT_LOGS, 24, None, None, None, platform))
     return keys
 
 
@@ -384,3 +389,49 @@ async def get_dashboard_insight(
     result, state, age = await get_cached((card, scope, include_archived))
     _headers(response, state, age)
     return _envelope(requested, scope, include_archived, result)
+
+
+@router.get(
+    "/management/logs/fleet",
+    dependencies=[Depends(verify_authentication)],
+    tags=["fleet"],
+)
+async def get_management_logs_fleet(
+    response: Response,
+    hours: int = Query(default=24, description="24 or 168"),
+    tool: Optional[str] = Query(default=None, max_length=64, pattern=r"^[A-Za-z0-9_.-]+$",
+                                description="Log root key (installs, bootstrap, reports, ...)"),
+    level: Optional[str] = Query(default=None, pattern="^(error|warning)$"),
+    message: Optional[str] = Query(default=None, pattern=r"^[0-9a-f]{12}$",
+                                   description="A message id from this report or the dashboard card"),
+    platform: str = Query(default="all", description="all, macOS or Windows"),
+):
+    """
+    The fleet Management Tools Logs report: the management tools' error and
+    warning lines across the fleet over the last 24 hours or 7 days. The MDM
+    agent's logs are left out, as on the dashboard card.
+
+    Returns ``{hours, platform, filters {tool, level, message}, generatedAt,
+    tools, messages, devices, devicesTruncated}``:
+
+    - ``tools[]``: ``{tool, name, platform, devices, devicesWithErrors,
+      devicesWithWarnings, errorLines, warningLines, lastAt, trend[{hour,
+      errors, warnings}], link, warningsLink}``, one trend point per UTC hour.
+    - ``messages[]``: ``{id, message, tool, name, devices, lines, lastAt,
+      link}``, normalised error messages, most devices first (top 50).
+    - ``devices[]``: ``{serialNumber, deviceName, platform, tool, name, errors,
+      warnings, lastAt, link}``, one row per device and tool with lines in the
+      window, narrowed by ``tool``, ``level`` and ``message`` (up to 1000).
+
+    ``tool`` and ``message`` narrow ``messages`` and ``devices``; ``tools``
+    always lists every tool. Built from the levelSummary ingest stores on each
+    log root and cached like the dashboard cards. GET /management/logs/{tool}
+    (the raw lines of one tool) is unchanged.
+    """
+    if hours not in dashboard_insights.LOGS_REPORT_HOURS:
+        raise HTTPException(status_code=422, detail="hours must be 24 or 168")
+    scope = _platform(platform)
+    key = (MANAGEMENT_LOGS, hours, (tool or "").lower() or None, level, message, scope)
+    result, state, age = await get_cached(key)
+    _headers(response, state, age)
+    return result

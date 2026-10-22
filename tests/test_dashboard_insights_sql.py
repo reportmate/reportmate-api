@@ -347,25 +347,30 @@ INSTALLS = {
 
 IDENTITY = {
     "SAMPLE1": {
-        "users": [{"isAdmin": True}, {"isAdmin": True}, {"isAdmin": False}],
+        "users": [{"username": "admin", "isAdmin": True}, {"username": "SAMPLE-tech", "isAdmin": True},
+                  {"username": "student", "isAdmin": False}],
         "directoryServices": {},
     },
-    "SAMPLE2": {"users": [{"isAdmin": True}], "platformSSOUsers": {"deviceRegistered": True}},
-    "SAMPLE3": {"users": [{"isAdmin": True}], "directoryServices": {"activeDirectory": {"bound": True}}},
+    "SAMPLE2": {"users": [{"username": "admin", "isAdmin": True}], "platformSSOUsers": {"deviceRegistered": True}},
+    "SAMPLE3": {"users": [{"username": "admin", "isAdmin": True}],
+                "directoryServices": {"activeDirectory": {"bound": True}}},
     "SAMPLE4": {"users": [], "directoryServices": {"activeDirectory": {"isDomainJoined": True}},
                 "domainTrust": {"trustStatus": "Broken"}},
     "SAMPLE10": {"users": [], "directoryServices": {"workgroup": "WORKGROUP"}},
     "SAMPLE8": {
         "domainTrust": {"trustStatus": "Healthy"},
-        "users": [{"isAdmin": True}] * 4,
+        "users": [{"username": "Admin", "isAdmin": True}, {"username": "winadmins", "isAdmin": True},
+                  {"username": "x1", "isAdmin": True}, {"username": "x2", "isAdmin": True}],
+        "windowsHello": {"statusDisplay": "Disabled (policy)"},
         "directoryServices": {
             "activeDirectory": {"bound": True},
             "azureAd": {"isAadJoined": True},
         },
     },
     "SAMPLE9": {
-        "userAccounts": [{"isAdmin": True}],
+        "userAccounts": [{"userName": "winadmins", "isAdmin": True}],
         "directory_services": {"azure_ad": {"joined": True}},
+        "windowsHello": {"statusDisplay": "Enabled"},
     },
 }
 
@@ -645,9 +650,10 @@ def test_management_tool_logs(insights):
     munki = tools["Munki"]
     assert (munki["devices"], munki["devicesWithErrors"], munki["devicesWithWarnings"]) == (2, 2, 2)
     assert munki["errorLines"] == 4
-    assert munki["link"] == {"path": "/devices", "params": {"tool": "installs", "level": "error", "platform": "macOS"}}
+    assert munki["link"] == {"path": "/management/logs",
+                             "params": {"tool": "installs", "level": "error", "hours": "24", "platform": "macOS"}}
     assert tools["Cimian"]["devicesWithErrors"] == 1
-    assert tools["BootstrapMate"]["link"]["params"] == {"tool": "bootstrap", "level": "error"}
+    assert tools["BootstrapMate"]["link"]["params"] == {"tool": "bootstrap", "level": "error", "hours": "24"}
     assert card["tools"][0]["name"] == "Munki"
 
     top = card["topErrors"][0]
@@ -695,7 +701,7 @@ def test_directory_services(insights):
     assert all("children" not in seg for k, seg in segments.items() if k != "domain")
     assert segments["cloud"]["link"] == {"path": "/identity", "params": {"directory": "cloud"}}
     assert segments["domain"]["children"][2]["link"]["params"] == {"directory": "broken"}
-    assert (card["extraAdmins"]["count"], card["shared"]["count"], card["assigned"]["count"]) == (2, 1, 2)
+    assert (card["shared"]["count"], card["assigned"]["count"]) == (1, 2)
 
 
 def test_directory_services_follows_the_platform_toggle(insights):
@@ -704,7 +710,7 @@ def test_directory_services_follows_the_platform_toggle(insights):
         "cloud": 1, "domain": 1, "standard": 0, "unjoined": 1,
     }
     assert card["segments"][3]["link"]["params"] == {"directory": "unjoined", "platform": "Windows"}
-    assert card["extraAdmins"]["link"]["params"] == {"admins": "extra", "platform": "Windows"}
+    assert card["shared"]["link"]["params"] == {"usage": "shared", "platform": "Windows"}
 
 
 def test_app_usage(insights):
@@ -779,3 +785,65 @@ def test_all_scope_runs_one_statement_per_platform(insights, monkeypatch):
     monkeypatch.setattr(insights, "card_sql", spy)
     insights.compute_card("managementToolLogs", "all")
     assert seen.count("management_tool_errors") == len(insights.FLEET_PLATFORMS)
+
+
+def test_user_accounts(insights):
+    card = insights.compute_card("userAccounts")
+    assert card["total"] == 7
+    assert [(a["key"], a["label"], a["count"]) for a in card["authentication"]] == [
+        ("modern", "Modern", 2), ("legacy", "Legacy", 2), ("standard", "Standard", 3),
+    ]
+    assert card["authentication"][0]["link"] == {"path": "/identity", "params": {"auth": "modern"}}
+    assert [(a["name"], a["devices"]) for a in card["adminAccounts"]] == [
+        ("Admin", 4), ("winadmins", 2), ("SAMPLE-tech", 1), ("x1", 1), ("x2", 1),
+    ]
+    assert card["adminAccounts"][1]["link"] == {"path": "/identity", "params": {"admin": "winadmins"}}
+    assert card["extraAdmins"] == {"count": 2, "link": {"path": "/identity", "params": {"admins": "extra"}}}
+    win = insights.compute_card("userAccounts", "Windows")
+    assert [a["count"] for a in win["authentication"]] == [1, 1, 1]
+    assert win["extraAdmins"]["link"]["params"] == {"admins": "extra", "platform": "Windows"}
+    assert "extraAdmins" not in insights.compute_card("directoryServices")
+
+
+def test_management_logs_report(insights):
+    report = insights.compute_management_logs(24)
+    assert "error" not in report
+    tools = {t["name"]: t for t in report["tools"]}
+    assert set(tools) == {"Munki", "Cimian", "BootstrapMate"}
+    munki = tools["Munki"]
+    assert (munki["devicesWithErrors"], munki["errorLines"], munki["warningLines"]) == (2, 4, 2)
+    assert len(munki["trend"]) == 24 and sum(p["errors"] for p in munki["trend"]) == 4
+    assert munki["lastAt"] == ago(hours=1).strftime("%Y-%m-%dT%H:00:00Z")
+    assert munki["link"] == {"path": "/management/logs",
+                             "params": {"tool": "installs", "level": "error", "hours": "24", "platform": "macOS"}}
+
+    download = next(m for m in report["messages"] if m["message"].startswith("Download of SAMPLE App failed"))
+    assert (download["devices"], download["tool"]) == (2, "installs")
+    assert download["id"] == insights.message_id("installs", download["message"])
+    assert download["link"]["params"]["message"] == download["id"]
+
+    assert [(d["serialNumber"], d["tool"]) for d in report["devices"]] == [
+        ("SAMPLE1", "installs"), ("SAMPLE2", "installs"), ("SAMPLE8", "installs"), ("SAMPLE8", "bootstrap"),
+    ]
+    assert report["devices"][0]["link"] == {
+        "path": "/device/SAMPLE1", "params": {"tab": "management", "tool": "installs", "level": "error"}}
+
+    by_message = insights.compute_management_logs(24, message=download["id"])
+    assert [d["serialNumber"] for d in by_message["devices"]] == ["SAMPLE1", "SAMPLE2"]
+    assert [m["id"] for m in by_message["messages"]] == [download["id"]]
+    assert [d["serialNumber"] for d in insights.compute_management_logs(24, tool="bootstrap")["devices"]] == ["SAMPLE8"]
+    assert [d["serialNumber"] for d in insights.compute_management_logs(24, level="warning")["devices"]] == [
+        "SAMPLE1", "SAMPLE2"]
+    assert insights.compute_management_logs(24, message="000000000000")["devices"] == []
+    mac = insights.compute_management_logs(168, platform="macOS")
+    assert {t["name"] for t in mac["tools"]} == {"Munki"} and len(mac["tools"][0]["trend"]) == 168
+    assert mac["tools"][0]["errorLines"] == 5
+
+
+def test_management_logs_report_merged_from_parts_matches_one_query(insights, monkeypatch):
+    def strip(r):
+        return {k: v for k, v in r.items() if k not in ("generatedAt", "computeSeconds")}
+
+    merged = strip(insights.compute_management_logs(168))
+    monkeypatch.setattr(insights, "QUERY_MERGE", {})
+    assert strip(insights.compute_management_logs(168)) == merged

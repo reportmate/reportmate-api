@@ -20,5 +20,5 @@ SELECT cn, MIN(days) AS days, COUNT(DISTINCT serial) AS devices
 FROM expiring
 WHERE cn IS NOT NULL AND days BETWEEN 0 AND %(window_days)s
 GROUP BY cn
-ORDER BY MIN(days), cn
+ORDER BY MIN(days), cn COLLATE "C"
 LIMIT %(limit)s

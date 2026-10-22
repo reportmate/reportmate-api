@@ -30,5 +30,5 @@ WHERE jsonb_typeof(it) = 'object'
   AND v.want <> ''
   AND v.have <> v.want
 GROUP BY v.name
-ORDER BY devices DESC, v.name
+ORDER BY devices DESC, v.name COLLATE "C"
 LIMIT %(limit)s

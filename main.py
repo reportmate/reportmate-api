@@ -203,10 +203,12 @@ app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 for _router_mod in (
     health,
     devices,
+    # Before fleet: GET /management/logs/fleet would otherwise be taken by
+    # fleet's GET /management/logs/{tool} as a tool named "fleet".
+    insights,
     fleet,
     events,
     statistics,
-    insights,
     admin,
     settings,
     api_keys,

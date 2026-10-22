@@ -5,5 +5,5 @@ SELECT m.serial,
        m.platform, m.total_bytes, m.free_bytes, m.free_ratio
 FROM measured m
 LEFT JOIN inventory inv ON inv.device_id = m.id
-ORDER BY m.free_ratio ASC, m.serial
+ORDER BY m.free_ratio ASC, m.serial COLLATE "C"
 LIMIT %(limit)s

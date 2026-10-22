@@ -77,6 +77,7 @@ CARD_KEYS = (
     "softwareRisk",
     "expiringCertificates",
     "directoryServices",
+    "userAccounts",
     "connectivityProblems",
 )
 
@@ -230,6 +231,14 @@ QUERY_MERGE: Dict[str, Dict[str, Any]] = {
     "silent_devices": {"kind": "sum"},
     "certificates": {"kind": "sum"},
     "directory_services": {"kind": "sum"},
+    "user_accounts": {"kind": "sum"},
+    "user_account_admins": {"kind": "group", "key": ("name_key",), "sum": ("devices",), "least": ("name",),
+                            "sort": lambda r: (-_int(r.get("devices")), r["name_key"])},
+    "management_logs_tools": {"kind": "concat"},
+    "management_logs_trend": {"kind": "concat"},
+    "management_logs_devices": {"kind": "concat",
+                                "sort": lambda r: (-_int(r.get("errors")), -_int(r.get("warnings")),
+                                                   _neg_hour(r.get("last_hour")), r["serial"], r["tool"])},
     "network_problems": {"kind": "sum"},
     "management_tool_errors": {"kind": "concat"},
     "install_agent_runs": {"kind": "concat"},
@@ -242,7 +251,7 @@ QUERY_MERGE: Dict[str, Dict[str, Any]] = {
     "install_items_behind": {"kind": "group", "key": ("name",), "sum": ("devices",),
                              "sort": lambda r: (-_int(r.get("devices")), r["name"])},
     "management_tool_messages": {"kind": "group", "key": ("message", "tool"), "sum": ("devices", "lines"),
-                                 "union": ("platforms",), "least": ("sample_serial",),
+                                 "union": ("platforms",), "least": ("sample_serial",), "max": ("last_hour",),
                                  "sort": lambda r: (-_int(r.get("devices")), -_int(r.get("lines")), r["message"])},
     "certificates_soonest": {"kind": "group", "key": ("cn",), "sum": ("devices",), "min": ("days",),
                              "sort": lambda r: (float(r.get("days") or 0), r["cn"])},
@@ -281,6 +290,10 @@ def merge_rows(parts: Sequence[List[Dict[str, Any]]], spec: Dict[str, Any], limi
                 g[c] = min(v for v in (g.get(c), r.get(c)) if v is not None) if (g.get(c) is not None or r.get(c) is not None) else None
             for c in spec.get("union", ()):
                 g[c] = sorted(set(g.get(c) or []) | set(r.get(c) or []))
+            for c in spec.get("max", ()):
+                if c in g or c in r:
+                    vals = [v for v in (g.get(c), r.get(c)) if v]
+                    g[c] = max(vals) if vals else None
             for c in spec.get("least", ()):
                 vals = [v for v in (g.get(c), r.get(c)) if v]
                 g[c] = min(vals) if vals else None
@@ -407,9 +420,23 @@ def _tool_platform_specific(tool: str) -> bool:
     return bool(names) and names[0] != names[1]
 
 
-def _tool_link(tool: str, level: str, platform: Optional[str]) -> Dict[str, Any]:
-    return link("/devices", tool=tool, level=level,
+def _tool_link(tool: str, level: str, platform: Optional[str], message: Optional[str] = None,
+               hours: int = 24) -> Dict[str, Any]:
+    """The fleet Management Tools Logs report, filtered to a tool and level
+    (and a message). Munki and Cimian share a log root key, so a platform-
+    specific product carries its platform too."""
+    return link(LOGS_REPORT_PATH, tool=tool, level=level, message=message, hours=hours,
                 platform=platform if _tool_platform_specific(tool) else None)
+
+
+LOGS_REPORT_PATH = "/management/logs"
+
+
+def message_id(tool: str, text: str) -> str:
+    """A stable id for a normalised message of a tool (the report message= param)."""
+    import hashlib
+
+    return hashlib.sha1(f"{tool}\n{text}".encode("utf-8")).hexdigest()[:12]
 
 
 def tool_device_link(serial: str, tool: str, level: str = "error") -> Dict[str, Any]:
@@ -446,9 +473,38 @@ def shape_management_tools(rows: Sequence[Dict[str, Any]], messages: Sequence[Di
         t["warningsLink"] = _tool_link(t["tool"], "warning", t["platform"])
     return {
         "windowHours": TOOL_WINDOW_HOURS,
+        "link": link(LOGS_REPORT_PATH, hours=TOOL_WINDOW_HOURS),
         "tools": ordered,
         "topErrors": top_tool_messages(messages),
     }
+
+
+def group_tool_messages(messages: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Stored messages grouped by tool and normalised text, most devices first.
+    Each group keeps the stored texts behind it (``raw``) for device lookups."""
+    from log_tails import strip_message_prefix
+
+    grouped: Dict[Any, Dict[str, Any]] = {}
+    for m in messages:
+        tool = m.get("tool") or ""
+        stored = m.get("message") or ""
+        text = strip_message_prefix(stored)
+        if not text:
+            continue
+        g = grouped.setdefault((tool, text), {"tool": tool, "message": text, "devices": 0, "lines": 0,
+                                              "platforms": set(), "sample": m.get("sample_serial"),
+                                              "last": None, "raw": set()})
+        g["devices"] += _int(m.get("devices"))
+        g["lines"] += _int(m.get("lines"))
+        g["platforms"].update(p for p in (m.get("platforms") or []) if p)
+        g["raw"].add(stored)
+        if m.get("last_hour") and (g["last"] is None or m["last_hour"] > g["last"]):
+            g["last"] = m["last_hour"]
+        if m.get("sample_serial") and (not g["sample"] or m["sample_serial"] < g["sample"]):
+            g["sample"] = m["sample_serial"]
+    for g in grouped.values():
+        g["id"] = message_id(g["tool"], g["message"])
+    return sorted(grouped.values(), key=lambda g: (-g["devices"], -g["lines"], g["tool"], g["message"]))
 
 
 def top_tool_messages(messages: Sequence[Dict[str, Any]], limit: int = TOP_N) -> List[Dict[str, Any]]:
@@ -476,12 +532,13 @@ def top_tool_messages(messages: Sequence[Dict[str, Any]], limit: int = TOP_N) ->
         single = platforms[0] if len(platforms) == 1 else None
         names = [] if not platforms else sorted({tool_product(g["tool"], p) for p in platforms})
         out.append({
+            "id": message_id(g["tool"], g["message"]),
             "message": g["message"],
             "tool": g["tool"],
             "name": " / ".join(names) if names else tool_product(g["tool"], None),
             "devices": g["devices"],
             "lines": g["lines"],
-            "link": _tool_link(g["tool"], "error", single),
+            "link": _tool_link(g["tool"], "error", single, message=message_id(g["tool"], g["message"])),
             "sampleDevice": {
                 "serialNumber": g["sample"],
                 "link": tool_device_link(g["sample"], g["tool"]),
@@ -1055,7 +1112,6 @@ def shape_directory_services(row: Dict[str, Any], platform: str = "all") -> Dict
     return {
         "total": _int(row.get("devices")),
         "segments": segments,
-        "extraAdmins": {"count": _int(row.get("extra_admins")), "link": link("/identity", admins="extra", platform=p)},
         "shared": {"count": _int(row.get("shared")), "link": link("/identity", usage="shared", platform=p)},
         "assigned": {"count": _int(row.get("assigned")), "link": link("/identity", usage="assigned", platform=p)},
     }
@@ -1063,6 +1119,38 @@ def shape_directory_services(row: Dict[str, Any], platform: str = "all") -> Dict
 
 def card_directory_services(run: Runner, scope: InsightsScope) -> Dict[str, Any]:
     return shape_directory_services(run("directory_services")[0], scope.platform)
+
+
+# ── User Accounts ───────────────────────────────────────────────
+
+#: The Identity report Authentication donut, in its order: (key, label, column).
+AUTH_SEGMENTS = (
+    ("modern", "Modern", "modern"),
+    ("legacy", "Legacy", "legacy"),
+    ("standard", "Standard", "standard"),
+)
+
+
+def shape_user_accounts(row: Dict[str, Any], admins: Sequence[Dict[str, Any]], platform: str = "all") -> Dict[str, Any]:
+    p = _scoped(platform)
+    return {
+        "total": _int(row.get("devices")),
+        "authentication": [
+            {"key": key, "label": label, "count": _int(row.get(col)),
+             "link": link("/identity", auth=key, platform=p)}
+            for key, label, col in AUTH_SEGMENTS
+        ],
+        "adminAccounts": [
+            {"name": a["name"], "devices": _int(a.get("devices")),
+             "link": link("/identity", admin=a["name"], platform=p)}
+            for a in admins
+        ],
+        "extraAdmins": {"count": _int(row.get("extra_admins")), "link": link("/identity", admins="extra", platform=p)},
+    }
+
+
+def card_user_accounts(run: Runner, scope: InsightsScope) -> Dict[str, Any]:
+    return shape_user_accounts(run("user_accounts")[0], run("user_account_admins", limit=TOP_N), scope.platform)
 
 
 # ── Connectivity Problems ────────────────────────────────────
@@ -1101,6 +1189,7 @@ CARD_FUNCTIONS: Dict[str, Callable[..., Dict[str, Any]]] = {
     "softwareRisk": card_software_risk,
     "expiringCertificates": card_certificates,
     "directoryServices": card_directory_services,
+    "userAccounts": card_user_accounts,
     "connectivityProblems": card_connectivity,
 }
 
@@ -1369,4 +1458,153 @@ def compute_tool_devices(tool: str, level: str = "error", hours: int = TOOL_WIND
             except Exception:
                 pass
     result["generatedAt"] = datetime.now(timezone.utc).isoformat()
+    return result
+
+
+def _neg_hour(hour: Optional[str]) -> tuple:
+    """Sort key putting later hours first and no hour last."""
+    return (0, tuple(-ord(ch) for ch in hour)) if hour else (1, ())
+
+
+# ── Fleet Management Tools Logs report ──────────────────────────
+
+LOGS_REPORT_HOURS = (24, 168)
+LOGS_REPORT_MESSAGES = 50
+LOGS_REPORT_DEVICES = 1000
+
+
+def _hour_iso(hour: Optional[str]) -> Optional[str]:
+    return f"{hour}:00:00Z" if hour else None
+
+
+def _window_hours(hours: int, now: Optional[datetime] = None) -> List[str]:
+    end = (now or datetime.now(timezone.utc)).replace(minute=0, second=0, microsecond=0)
+    return [(end - timedelta(hours=h)).strftime("%Y-%m-%dT%H") for h in range(hours - 1, -1, -1)]
+
+
+def shape_management_logs(tool_rows, trend_rows, messages, device_rows, *, hours: int, platform: str,
+                          tool: Optional[str], level: Optional[str], message: Optional[str],
+                          now: Optional[datetime] = None) -> Dict[str, Any]:
+    window = _window_hours(hours, now)
+    tools: Dict[Any, Dict[str, Any]] = {}
+    product_of: Dict[Any, Any] = {}
+    for r in tool_rows:
+        t = r.get("tool") or ""
+        product = tool_product(t, r.get("platform"))
+        key = (t, product)
+        product_of[(t, r.get("platform"))] = key
+        e = tools.setdefault(key, {
+            "tool": t, "name": product,
+            "platform": r.get("platform") if _tool_platform_specific(t) else None,
+            "devices": 0, "devicesWithErrors": 0, "devicesWithWarnings": 0,
+            "errorLines": 0, "warningLines": 0, "lastAt": None, "_trend": {},
+        })
+        e["devices"] += _int(r.get("devices"))
+        e["devicesWithErrors"] += _int(r.get("devices_with_errors"))
+        e["devicesWithWarnings"] += _int(r.get("devices_with_warnings"))
+        e["errorLines"] += _int(r.get("error_lines"))
+        e["warningLines"] += _int(r.get("warning_lines"))
+        last = _hour_iso(r.get("last_hour"))
+        if last and (e["lastAt"] is None or last > e["lastAt"]):
+            e["lastAt"] = last
+    for r in trend_rows:
+        key = product_of.get((r.get("tool") or "", r.get("platform")))
+        if key is None:
+            continue
+        slot = tools[key]["_trend"].setdefault(r["hour"], [0, 0])
+        slot[0] += _int(r.get("errors"))
+        slot[1] += _int(r.get("warnings"))
+    ordered = sorted(tools.values(), key=lambda t: (-t["devicesWithErrors"], -t["errorLines"],
+                                                    -t["devicesWithWarnings"], t["name"]))
+    for t in ordered:
+        series = t.pop("_trend")
+        t["trend"] = [{"hour": _hour_iso(h), "errors": series.get(h, [0, 0])[0], "warnings": series.get(h, [0, 0])[1]}
+                      for h in window]
+        t["link"] = _tool_link(t["tool"], "error", t["platform"], hours=hours)
+        t["warningsLink"] = _tool_link(t["tool"], "warning", t["platform"], hours=hours)
+
+    msgs = []
+    for g in messages[:LOGS_REPORT_MESSAGES]:
+        platforms = sorted(g["platforms"])
+        single = platforms[0] if len(platforms) == 1 else None
+        names = sorted({tool_product(g["tool"], p) for p in platforms}) if platforms else [tool_product(g["tool"], None)]
+        msgs.append({
+            "id": g["id"], "message": g["message"], "tool": g["tool"], "name": " / ".join(names),
+            "devices": g["devices"], "lines": g["lines"], "lastAt": _hour_iso(g["last"]),
+            "link": _tool_link(g["tool"], "error", single, message=g["id"], hours=hours),
+        })
+
+    devices = [
+        {
+            "serialNumber": r["serial"], "deviceName": r.get("name") or r["serial"], "platform": r.get("platform"),
+            "tool": r["tool"], "name": tool_product(r["tool"], r.get("platform")),
+            "errors": _int(r.get("errors")), "warnings": _int(r.get("warnings")),
+            "lastAt": _hour_iso(r.get("last_hour")),
+            "link": tool_device_link(r["serial"], r["tool"], level or ("error" if _int(r.get("errors")) else "warning")),
+        }
+        for r in device_rows
+    ]
+    return {
+        "hours": hours,
+        "platform": platform,
+        "filters": {"tool": tool, "level": level, "message": message},
+        "tools": ordered,
+        "messages": msgs,
+        "devices": devices,
+        "devicesTruncated": len(devices) >= LOGS_REPORT_DEVICES,
+    }
+
+
+def _management_logs(run: Runner, *, hours: int, platform: str, tool: Optional[str], level: Optional[str],
+                     message: Optional[str]) -> Dict[str, Any]:
+    since = window_start_hour(hours=hours)
+    stored = run("management_tool_messages", since_hour=since, limit=5000)
+    grouped = group_tool_messages(stored)
+    if tool:
+        grouped = [g for g in grouped if g["tool"] == tool]
+    texts: List[str] = []
+    if message:
+        texts = sorted({t for g in grouped if g["id"] == message for t in g["raw"]})
+        grouped = [g for g in grouped if g["id"] == message]
+    if message and not texts:
+        device_rows: List[Dict[str, Any]] = []
+    else:
+        device_rows = run("management_logs_devices", since_hour=since, tool=tool,
+                          level="error" if message else level, messages=texts, limit=LOGS_REPORT_DEVICES)
+    return shape_management_logs(
+        run("management_logs_tools", since_hour=since), run("management_logs_trend", since_hour=since),
+        grouped, device_rows, hours=hours, platform=platform, tool=tool, level=level, message=message,
+    )
+
+
+def compute_management_logs(hours: int = 24, tool: Optional[str] = None, level: Optional[str] = None,
+                            message: Optional[str] = None, platform: str = "all") -> Dict[str, Any]:
+    """The fleet Management Tools Logs report. A failure is ``{"error": ...}``."""
+    t0 = _time.monotonic()
+    scope = InsightsScope(platform, False, _has_inventory_state_table())
+    conn = None
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute(f"SET LOCAL statement_timeout = '{int(STATEMENT_TIMEOUT_SECONDS * 1000)}ms'")
+        result = _management_logs(_make_runner(cursor, scope), hours=hours, platform=platform,
+                                  tool=tool, level=level, message=message)
+        logger.info(f"[INSIGHTS] management logs {hours}h tool={tool} level={level} message={message} "
+                    f"platform={platform}: {_time.monotonic() - t0:.3f}s")
+    except Exception as exc:
+        logger.error(f"[INSIGHTS] management logs failed: {exc}")
+        result = {"hours": hours, "platform": platform,
+                  "filters": {"tool": tool, "level": level, "message": message}, "error": _error_text(exc)}
+    finally:
+        if conn is not None:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+            try:
+                conn.close()
+            except Exception:
+                pass
+    result["generatedAt"] = datetime.now(timezone.utc).isoformat()
+    result["computeSeconds"] = round(_time.monotonic() - t0, 3)
     return result
