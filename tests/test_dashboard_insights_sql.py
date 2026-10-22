@@ -706,3 +706,25 @@ def test_include_archived_widens_the_fleet(insights):
 def test_every_card_carries_generated_at(insights):
     for key in insights.CARD_KEYS:
         assert insights.compute_card(key)["generatedAt"]
+
+
+def test_management_tool_error_devices(insights):
+    result = insights.compute_tool_devices("installs", "error", 24, "all")
+    assert [(d["serialNumber"], d["count"]) for d in result["devices"]] == [
+        ("SAMPLE1", 2), ("SAMPLE8", 1), ("SAMPLE2", 1),
+    ]
+    first = result["devices"][0]
+    assert first["deviceName"] == "SAMPLE1-name" and first["platform"] == "macOS"
+    assert first["lastAt"] == ago(hours=1).strftime("%Y-%m-%dT%H:00:00Z")
+    assert first["link"] == {"path": "/device/SAMPLE1",
+                             "params": {"tab": "management", "tool": "installs", "level": "error"}}
+    assert (result["tool"], result["level"], result["hours"]) == ("installs", "error", 24)
+
+    mac = insights.compute_tool_devices("INSTALLS", "error", 24, "macOS")
+    assert [d["serialNumber"] for d in mac["devices"]] == ["SAMPLE1", "SAMPLE2"]
+    warnings = insights.compute_tool_devices("installs", "warning", 24, "all")
+    assert sorted(d["serialNumber"] for d in warnings["devices"]) == ["SAMPLE1", "SAMPLE2"]
+    assert [d["serialNumber"] for d in insights.compute_tool_devices("mdm")["devices"]] == ["SAMPLE1"]
+    week = insights.compute_tool_devices("installs", "error", 168, "macOS")
+    assert [(d["serialNumber"], d["count"]) for d in week["devices"]][0] == ("SAMPLE1", 3)
+    assert insights.compute_tool_devices("nosuchtool")["devices"] == []
