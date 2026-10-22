@@ -1092,7 +1092,10 @@ async def submit_events(request: Request):
                     # so the dashboard can aggregate them per tool in SQL
                     # without reading the tails (log_tails.summarize_root).
                     if module_name == 'management':
-                        module_data = _stamp_log_summaries(module_data)
+                        try:
+                            module_data = _stamp_log_summaries(module_data)
+                        except Exception as summary_error:
+                            logger.warning(f"Skipped log level summary for {serial_number}: {summary_error}")
 
                     # STANDARD HANDLING: All modules store in their table with data JSONB
                     # Check if module record exists (device_id in module tables = serial_number per schema)
