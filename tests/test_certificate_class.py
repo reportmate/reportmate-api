@@ -392,3 +392,8 @@ def test_multi_valued_issuer_names_parse():
         isCA=False,
     )
     assert classify_certificate(cert, "macOS") == SYSTEM_MANAGED
+
+
+def test_packaged_app_authorities_are_a_trust_store():
+    cert = win("Trusted Packaged App Installation Authorities", commonName="SAMPLE Packaging Root")
+    assert classify_certificate(cert, "Windows") == TRUST_STORE

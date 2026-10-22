@@ -74,6 +74,8 @@ _WINDOWS_TRUST_STORES = frozenset(
         "trusteddevices",
         "trusted devices",
         "trustedappgallery",
+        "trusted packaged app installation authorities",
+        "trustedpackagedapp installation authorities",
     }
 )
 
