@@ -379,3 +379,16 @@ def test_device_supplied_class_and_epoch_never_survive():
 @pytest.mark.parametrize("not_after", ["1e400", "9" * 40, 10**30, float("inf"), "99999-01-01", -5])
 def test_out_of_range_expiry_is_dropped(not_after):
     assert "notAfterEpoch" not in stamp_certificate({"notAfter": not_after}, "Windows")
+
+
+def test_multi_valued_issuer_names_parse():
+    issuer = "/DC=net+DC=windows+CN=MS-Organization-Access+OU=" + GUID
+    assert issuer_name({"issuer": issuer}) == "MS-Organization-Access"
+    cert = mac(
+        "/Users/sample/Library/Keychains/login.keychain-db",
+        commonName=GUID,
+        issuer=issuer,
+        hasPrivateKey=True,
+        isCA=False,
+    )
+    assert classify_certificate(cert, "macOS") == SYSTEM_MANAGED

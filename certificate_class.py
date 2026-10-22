@@ -143,7 +143,8 @@ _CA_NAME = re.compile(
     r"(\bCA\b|\bRoot\b|Certification Authority|Certificate Authority|\bIntermediate\b|Issuing CA)",
     re.I,
 )
-_RDN = re.compile(r"(?:^|[,/]\s*)([A-Za-z.]+)\s*=\s*((?:\\.|[^,/])+)")
+# Separators: "," (RFC 4514), "/" (OpenSSL one-line) and "+" (multi-valued RDN).
+_RDN = re.compile(r"(?:^|[,/+]\s*)([A-Za-z.]+)\s*=\s*((?:\\.|[^,/+])+)")
 
 
 def _text(value: Any) -> str:
