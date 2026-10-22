@@ -28,5 +28,5 @@ WHERE jsonb_typeof(it) = 'object'
           AND LOWER(COALESCE(it->>'currentStatus', it->>'mappedStatus', it->>'status', '')) ~ '(error|fail|problem|install.loop)')
   )
 GROUP BY n.name
-ORDER BY devices DESC, n.name
+ORDER BY devices DESC, n.name COLLATE "C"
 LIMIT %(limit)s

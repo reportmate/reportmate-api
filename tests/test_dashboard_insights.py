@@ -228,7 +228,7 @@ def test_directory_services_shape_and_links():
     row = {"devices": 9, "cloud_joined": 3, "domain_joined": 4, "trusted": 2, "unconfirmed": 1, "broken": 1,
            "standard": 1, "unjoined": 1, "extra_admins": 2, "shared": 1, "assigned": 5}
     card = di.shape_directory_services(row, "macOS")
-    assert set(card) == {"total", "segments", "extraAdmins", "shared", "assigned"}
+    assert set(card) == {"total", "segments", "shared", "assigned"}
     assert card["total"] == 9
     assert [(s["key"], s["label"]) for s in card["segments"]] == [
         ("cloud", "Cloud Joined"), ("domain", "Domain Joined"), ("standard", "Standard"), ("unjoined", "Unjoined"),
@@ -262,8 +262,8 @@ def test_management_tools_products_merge_and_links():
     assert names == ["Munki", "BootstrapMate", "Cimian"]
     boot = card["tools"][1]
     assert (boot["devices"], boot["devicesWithErrors"], boot["platform"]) == (8, 2, None)
-    assert boot["link"] == {"path": "/devices", "params": {"tool": "bootstrap", "level": "error"}}
-    assert card["tools"][0]["link"]["params"] == {"tool": "installs", "level": "error", "platform": "macOS"}
+    assert boot["link"] == {"path": "/management/logs", "params": {"tool": "bootstrap", "level": "error", "hours": "24"}}
+    assert card["tools"][0]["link"]["params"] == {"tool": "installs", "level": "error", "hours": "24", "platform": "macOS"}
     assert card["tools"][0]["warningsLink"]["params"]["level"] == "warning"
     top = card["topErrors"][0]
     assert (top["name"], top["devices"]) == ("Munki", 2)
@@ -291,9 +291,9 @@ def test_top_messages_strip_old_prefixes_and_merge_duplicates():
         ("bootstrap", "Device registration failed for <guid>", 1, 1),
     ]
     assert top[0]["sampleDevice"]["serialNumber"] == "SAMPLE2"
-    assert top[0]["link"]["params"] == {"tool": "reports", "level": "error"}
+    assert top[0]["link"]["params"] == {"tool": "reports", "level": "error", "message": top[0]["id"], "hours": "24"}
     assert top[1]["name"] == "Cimian / Munki"
-    assert top[1]["link"]["params"] == {"tool": "installs", "level": "error"}
+    assert top[1]["link"]["params"] == {"tool": "installs", "level": "error", "message": top[1]["id"], "hours": "24"}
 
 
 def test_normalize_message_strips_stamp_offset_and_level():
@@ -676,12 +676,14 @@ def test_refresh_pass_fills_every_default_card_one_at_a_time(monkeypatch):
 
     monkeypatch.setattr(di, "compute_card", compute)
     monkeypatch.setattr(di, "compute_app_usage", lambda *a: {"apps": [], "generatedAt": "x"})
+    monkeypatch.setattr(di, "compute_management_logs", lambda *a: {"tools": [], "generatedAt": "x"})
     monkeypatch.setattr(insights_router, "REFRESH_STAGGER_SECONDS", 0)
     asyncio.run(insights_router.refresh_pass())
     assert peak[0] == 1
     assert len(seen) == 3 * len(di.CARD_KEYS)
     for platform in ("all", "macOS", "Windows"):
         assert ("appUsage", platform, (), (), 30) in insights_router._entries
+        assert ("management/logs/fleet", 24, None, None, None, platform) in insights_router._entries
         for card in di.CARD_KEYS:
             assert (card, platform, False) in insights_router._entries
     insights_router.reset_cache()
@@ -812,3 +814,60 @@ def test_os_currency_still_answers_as_an_alias(client, calls):
     assert r.json()["data"]["card"] == "updateDebt"
     combined = client.get("/api/v1/dashboard/insights", headers=AUTH).json()["cards"]
     assert combined["osCurrency"] == combined["updateDebt"]
+
+
+def test_user_accounts_shape():
+    card = di.shape_user_accounts({"devices": 5, "modern": 2, "legacy": 1, "standard": 2, "extra_admins": 3},
+                                  [{"name": "admin", "devices": 4}], "macOS")
+    assert [a["key"] for a in card["authentication"]] == ["modern", "legacy", "standard"]
+    assert card["authentication"][2]["link"] == {"path": "/identity", "params": {"auth": "standard", "platform": "macOS"}}
+    assert card["adminAccounts"] == [{"name": "admin", "devices": 4,
+                                      "link": {"path": "/identity", "params": {"admin": "admin", "platform": "macOS"}}}]
+    assert card["extraAdmins"]["count"] == 3
+
+
+def test_tool_logs_card_links_open_the_fleet_report():
+    card = di.shape_management_tools([], [{"message": "Boom <n>", "tool": "reports", "platforms": ["macOS"],
+                                           "devices": 1, "lines": 1, "sample_serial": "SAMPLE1"}])
+    assert card["link"] == {"path": "/management/logs", "params": {"hours": "24"}}
+    top = card["topErrors"][0]
+    assert top["id"] == di.message_id("reports", "Boom <n>") and len(top["id"]) == 12
+    assert top["link"] == {"path": "/management/logs",
+                           "params": {"tool": "reports", "level": "error", "message": top["id"], "hours": "24"}}
+
+
+def test_management_logs_shape_fills_the_trend_window():
+    from datetime import datetime, timezone
+
+    now = datetime(2026, 10, 22, 13, 44, tzinfo=timezone.utc)
+    report = di.shape_management_logs(
+        [{"tool": "reports", "platform": "macOS", "devices": 3, "devices_with_errors": 1, "devices_with_warnings": 0,
+          "error_lines": 2, "warning_lines": 0, "last_hour": "2026-10-22T12"}],
+        [{"tool": "reports", "platform": "macOS", "hour": "2026-10-22T12", "errors": 2, "warnings": 0}],
+        [], [], hours=24, platform="all", tool=None, level=None, message=None, now=now)
+    trend = report["tools"][0]["trend"]
+    assert len(trend) == 24 and trend[-1]["hour"] == "2026-10-22T13:00:00Z"
+    assert trend[-2] == {"hour": "2026-10-22T12:00:00Z", "errors": 2, "warnings": 0}
+    assert report["tools"][0]["lastAt"] == "2026-10-22T12:00:00Z"
+
+
+def test_management_logs_fleet_route_wins_over_the_tool_route(client, monkeypatch):
+    seen = []
+
+    def compute(hours, tool, level, message, platform):
+        seen.append((hours, tool, level, message, platform))
+        return {"hours": hours, "tools": [], "messages": [], "devices": [], "generatedAt": "x"}
+
+    monkeypatch.setattr(di, "compute_management_logs", compute)
+    url = "/api/v1/management/logs/fleet"
+    assert client.get(url).status_code == 401
+    assert client.get(f"{url}?hours=48", headers=AUTH).status_code == 422
+    assert client.get(f"{url}?message=nothex", headers=AUTH).status_code == 422
+    r = client.get(f"{url}?hours=168&tool=Installs&level=error&message=0123456789ab&platform=macos", headers=AUTH)
+    assert r.status_code == 200 and r.headers["X-Insights-Cache"] == "miss"
+    assert client.get(f"{url}?hours=168&tool=installs&level=error&message=0123456789ab&platform=macOS",
+                      headers=AUTH).headers["X-Insights-Cache"] == "fresh"
+    assert seen == [(168, "installs", "error", "0123456789ab", "macOS")]
+    # /management/logs/<tool> still reaches the raw-lines sweep, not this report.
+    client.get("/api/v1/management/logs/installs", headers=AUTH)
+    assert len(seen) == 1

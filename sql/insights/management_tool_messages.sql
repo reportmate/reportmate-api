@@ -7,7 +7,8 @@ SELECT e->>'m' AS message, r.tool,
        ARRAY_AGG(DISTINCT r.platform) AS platforms,
        COUNT(DISTINCT r.serial) AS devices,
        SUM(CASE WHEN jsonb_typeof(e->'n') = 'number' THEN (e->>'n')::int ELSE 0 END) AS lines,
-       MIN(r.serial) AS sample_serial
+       MIN(r.serial COLLATE "C") AS sample_serial,
+       MAX(e->>'last') AS last_hour
 FROM roots r
 CROSS JOIN LATERAL jsonb_array_elements(
     CASE WHEN jsonb_typeof(r.s->'errors') = 'array' THEN r.s->'errors' ELSE '[]'::jsonb END) e
@@ -15,5 +16,5 @@ WHERE jsonb_typeof(e) = 'object'
   AND COALESCE(e->>'m', '') <> ''
   AND COALESCE(e->>'last', '') >= %(since_hour)s
 GROUP BY 1, 2
-ORDER BY devices DESC, lines DESC, message
+ORDER BY devices DESC, lines DESC, (e->>'m') COLLATE "C"
 LIMIT %(limit)s

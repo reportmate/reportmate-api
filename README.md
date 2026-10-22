@@ -65,7 +65,7 @@ Only asymmetric signatures (`RS*`/`ES*`) are accepted; `none` and `HS*` are refu
 
 ## Dashboard insights
 
-The dashboard's insight cards come from small cached endpoints, one per card, so a client can request them all at once and draw each card as soon as it arrives. Each card answers one question with a few counts and short top-N lists, so no client downloads a bulk report to draw one. The cards are `installHealth`, `managementToolLogs`, `checkinGaps`, `rebootDebt`, `protectionGaps`, `storage`, `updateDebt`, `softwareRisk`, `expiringCertificates`, `directoryServices`, `connectivityProblems` and `appUsage`. The old names `managementToolErrors` (for `managementToolLogs`) and `osCurrency` (for `updateDebt`) still answer for one release. Update Debt is OS Currency plus the devices with pending and deferred updates; Reboot Debt counts uptime only. Request one card for one platform:
+The dashboard's insight cards come from small cached endpoints, one per card, so a client can request them all at once and draw each card as soon as it arrives. Each card answers one question with a few counts and short top-N lists, so no client downloads a bulk report to draw one. The cards are `installHealth`, `managementToolLogs`, `checkinGaps`, `rebootDebt`, `protectionGaps`, `storage`, `updateDebt`, `softwareRisk`, `expiringCertificates`, `directoryServices`, `userAccounts`, `connectivityProblems` and `appUsage`. The old names `managementToolErrors` (for `managementToolLogs`) and `osCurrency` (for `updateDebt`) still answer for one release. Update Debt is OS Currency plus the devices with pending and deferred updates; Reboot Debt counts uptime only. Request one card for one platform:
 
 ```
 curl -H "X-API-Key: $REPORTMATE_KEY" "http://localhost:8000/api/v1/dashboard/insights/storage?platform=macOS"
@@ -101,7 +101,17 @@ curl -H "X-API-Key: $REPORTMATE_KEY" "http://localhost:8000/api/v1/dashboard/ins
 
 `tool` is the log root key from the card's link, `level` is `error` or `warning`, and `hours` is 1 to 168. The response is `{tool, level, hours, platform, generatedAt, devices}`. Each device has `serialNumber`, `deviceName`, `platform`, `count`, `lastAt` (the start of the latest UTC hour with such a line) and a `link` to its log viewer. It is cached like the cards.
 
-The Directory Services card uses the Identity report's Directory Services classification and names: Cloud Joined, Domain Joined (split into Trusted, Unconfirmed and Broken by domain trust), Standard and Unjoined. The card is `{total, segments, extraAdmins, shared, assigned}`. Its segments are `cloud`, `domain` (with `children` `trusted`, `unconfirmed` and `broken`), `standard` and `unjoined`, each with the report's label, and each links to `/identity?directory=<key>`.
+User Accounts is built from the Identity report's own rules. Authentication is Modern (Platform SSO registered, or Windows Hello not disabled), Legacy (bound to Active Directory or LDAP) or Standard, each linking to `/identity?auth=<key>`. It lists the five administrator account names on the most devices, each linking to `/identity?admin=<name>`, and counts the devices with more than one local admin (`/identity?admins=extra`).
+
+The fleet Management Tools Logs report reads the same summaries, over 24 hours or 7 days. This lists the tools, the common error messages and the devices behind them, here narrowed to errors in Munki and Cimian over 7 days:
+
+```
+curl -H "X-API-Key: $REPORTMATE_KEY" "http://localhost:8000/api/v1/management/logs/fleet?hours=168&tool=installs&level=error"
+```
+
+The response is `{hours, platform, filters, generatedAt, tools, messages, devices, devicesTruncated}`. Each tool has its device and line counts, `lastAt` and an hourly `trend`. Each message has a stable `id`, which `message=` takes to list only the devices that logged it. The card's links open this report at `/management/logs`. `GET /api/v1/management/logs/{tool}` still returns one tool's raw lines.
+
+The Directory Services card uses the Identity report's Directory Services classification and names: Cloud Joined, Domain Joined (split into Trusted, Unconfirmed and Broken by domain trust), Standard and Unjoined. The card is `{total, segments, shared, assigned}`. Its segments are `cloud`, `domain` (with `children` `trusted`, `unconfirmed` and `broken`), `standard` and `unjoined`, each with the report's label, and each links to `/identity?directory=<key>`.
 
 These environment variables tune it: `INSIGHTS_CACHE_TTL_SECONDS` (300), `INSIGHTS_ERROR_TTL_SECONDS` (60), `INSIGHTS_REFRESH_INTERVAL_SECONDS` (240), `INSIGHTS_REFRESH_STAGGER_SECONDS` (1), `INSIGHTS_BACKGROUND_REFRESH` (true), `INSIGHTS_WARM_DELAY_SECONDS` (15), `INSIGHTS_STATEMENT_TIMEOUT_SECONDS` (20), `INSIGHTS_CONCURRENCY` (3, capped at a quarter of `DB_POOL_MAX`, which bounds on-demand computations) and `INSIGHTS_CACHE_MAX_ENTRIES` (256).
 
