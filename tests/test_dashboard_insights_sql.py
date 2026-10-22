@@ -551,9 +551,10 @@ def test_every_card_computes(insights):
 
 def test_reboot_debt(insights):
     card = insights.compute_insights("all", False)["cards"]["rebootDebt"]
-    assert card["devices"] == 10
+    # SAMPLE12 is in storage: the System report lists it, so the card counts it.
+    assert card["devices"] == 11
     buckets = {b["key"]: b["count"] for b in card["uptimeBuckets"]}
-    assert buckets == {"lt1d": 1, "1-3d": 5, "3-7d": 1, "1-2w": 0, "2-4w": 1, "30d+": 1}
+    assert buckets == {"lt1d": 1, "1-3d": 5, "3-7d": 1, "1-2w": 0, "2-4w": 1, "30d+": 2}
     assert "pendingUpdates" not in card and "deferredUpdates" not in card
     assert card["uptime30dPlus"]["link"] == {
         "path": "/system",
@@ -597,7 +598,7 @@ def test_os_currency(insights):
     card = insights.compute_insights("all", False)["cards"]["updateDebt"]
     assert card["pendingUpdates"] == {"count": 3, "link": {"path": "/system", "params": {"pending": "1-5,6-10,10+"}}}
     assert card["deferredUpdates"] == {"count": 1, "link": {"path": "/system", "params": {"deferred": "1"}}}
-    assert card["rated"] == 10
+    assert card["rated"] == 11
     assert card["behind"]["count"] == 2
     assert card["unsupportedMac"]["count"] == 1
     assert card["windows10"]["count"] == 1
@@ -609,7 +610,7 @@ def test_os_currency(insights):
     mac = insights.compute_insights("macOS", False)["cards"]["updateDebt"]
     assert (mac["pendingUpdates"]["count"], mac["deferredUpdates"]["count"]) == (1, 1)
     assert (mac["rated"], mac["behind"]["count"], mac["windows10"]["count"]) == (
-        7,
+        8,
         1,
         0,
     )
@@ -742,10 +743,11 @@ def test_directory_services(insights):
 
 def test_directory_services_follows_the_platform_toggle(insights):
     card = insights.compute_card("directoryServices", "Windows")
-    assert {seg["key"]: seg["count"] for seg in card["segments"]} == {
-        "cloud": 1, "domain": 1, "standard": 0, "unjoined": 1,
-    }
-    assert card["segments"][3]["link"]["params"] == {"directory": "unjoined", "platform": "Windows"}
+    # No zero rows: Windows has no Standard device here, so no standard segment,
+    # and the only domain-joined Windows device is trusted.
+    assert {seg["key"]: seg["count"] for seg in card["segments"]} == {"cloud": 1, "domain": 1, "unjoined": 1}
+    assert [c["key"] for c in card["segments"][1]["children"]] == ["trusted"]
+    assert card["segments"][2]["link"]["params"] == {"directory": "unjoined", "platform": "Windows"}
     assert card["shared"]["link"]["params"] == {"usage": "shared", "platform": "Windows"}
 
 
@@ -883,3 +885,26 @@ def test_management_logs_report_merged_from_parts_matches_one_query(insights, mo
     merged = strip(insights.compute_management_logs(168))
     monkeypatch.setattr(insights, "QUERY_MERGE", {})
     assert strip(insights.compute_management_logs(168)) == merged
+
+
+def test_cards_count_the_devices_their_reports_list(insights):
+    """A stored device (SAMPLE12) is listed by the System, Security, Identity
+    and other reports, so cards linking there count it. The /devices status
+    pills never call a stored device stale or missing, so Check-in Gaps does not."""
+    from datetime import timedelta
+
+    conn = _connect()
+    cur = conn.cursor()
+    cur.execute("UPDATE devices SET last_seen = %s WHERE serial_number = 'SAMPLE12'", (NOW - timedelta(days=30),))
+    cur.execute("INSERT INTO identity (device_id, data) VALUES ('SAMPLE12', %s::jsonb)",
+                ('{"users": [], "platformSSOUsers": {"deviceRegistered": true}}',))
+    conn.commit()
+    try:
+        assert insights.compute_card("userAccounts")["total"] == 8
+        assert insights.compute_card("directoryServices")["total"] == 8
+        assert insights.compute_card("checkinGaps")["missing"]["count"] == 2
+    finally:
+        cur.execute("DELETE FROM identity WHERE device_id = 'SAMPLE12'")
+        cur.execute("UPDATE devices SET last_seen = %s WHERE serial_number = 'SAMPLE12'", (NOW,))
+        conn.commit()
+        conn.close()

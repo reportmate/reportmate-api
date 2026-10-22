@@ -871,3 +871,31 @@ def test_management_logs_fleet_route_wins_over_the_tool_route(client, monkeypatc
     # /management/logs/<tool> still reaches the raw-lines sweep, not this report.
     client.get("/api/v1/management/logs/installs", headers=AUTH)
     assert len(seen) == 1
+
+
+# ── No zero rows in breakdowns ──────────────────────────────────
+
+
+def test_zero_rows_are_left_out_of_breakdowns():
+    accounts = di.shape_user_accounts({"devices": 5, "modern": 2, "legacy": 0, "standard": 3, "extra_admins": 0}, [])
+    assert [a["key"] for a in accounts["authentication"]] == ["modern", "standard"]
+
+    directory = di.shape_directory_services({"devices": 4, "cloud_joined": 0, "domain_joined": 3, "trusted": 3,
+                                             "unconfirmed": 0, "broken": 0, "standard": 1, "unjoined": 0})
+    assert [s["key"] for s in directory["segments"]] == ["domain", "standard"]
+    assert [c["key"] for c in directory["segments"][0]["children"]] == ["trusted"]
+
+    gaps = di.shape_protection_gaps({"devices": 4, "encryption_off": 0, "firewall_off": 1, "antivirus_total": 2,
+                                     "antivirus_off": 0, "sip_total": 0, "sip_off": 0, "secure_boot_total": 2,
+                                     "secure_boot_off": 0})
+    assert [g["key"] for g in gaps["gaps"]] == ["firewall"]
+
+    storage = di.shape_storage(
+        [{"platform": "macOS", "devices": 2, "free_lt5": 0, "free_5_10": 0, "free_10_20": 0, "free_20_plus": 2},
+         {"platform": "Windows", "devices": 1, "free_lt5": 1, "free_5_10": 0, "free_10_20": 0, "free_20_plus": 0}], [])
+    assert [p["platform"] for p in storage["lowStorage"]["byPlatform"]] == ["Windows"]
+    # Fixed buckets keep their zeros: an empty bucket says something.
+    assert [b["count"] for b in storage["freeSpace"]] == [1, 0, 0, 2]
+
+    health = di.shape_install_health({"munki_devices": 3, "cimian_devices": 0}, [], {}, [])
+    assert [a["agent"] for a in health["byAgent"]] == ["munki"]

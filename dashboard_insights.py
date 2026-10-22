@@ -150,6 +150,13 @@ _NOT_STORED = (
     "WHERE st.serial_number = UPPER(d.serial_number) AND st.state = 'storage')"
 )
 
+#: A card counts the devices its link opens. The reports list stored devices
+#: (an inventory system says they are on a shelf) like any other, so the cards
+#: count them too. Only these queries leave them out, because their reports do:
+#: the /devices status pills never call a stored device stale or missing, and
+#: /installs?stale=1 lists silent agents on devices not in storage.
+STORED_EXCLUDED_QUERIES = frozenset({"silent_devices", "install_agent_runs"})
+
 
 @dataclass(frozen=True)
 class InsightsScope:
@@ -165,9 +172,8 @@ class InsightsScope:
 def card_sql(name: str, scope: InsightsScope, select: Optional[str] = None) -> str:
     """A card query with the shared fleet scope and boolean vocabularies filled
     in. ``select`` names a fragment that replaces /*STORAGE_SELECT*/."""
-    fleet = load_sql("insights/fleet").replace(
-        "/*NOT_STORED*/", _NOT_STORED if scope.has_inventory_state else "TRUE"
-    )
+    exclude_stored = scope.has_inventory_state and name in STORED_EXCLUDED_QUERIES
+    fleet = load_sql("insights/fleet").replace("/*NOT_STORED*/", _NOT_STORED if exclude_stored else "TRUE")
     text = load_sql(f"insights/{name}").replace("/*MANAGEMENT_ROOTS*/", load_sql("insights/management_roots"))
     if select:
         text = text.replace("/*STORAGE_SELECT*/", load_sql(f"insights/{select}"))
@@ -363,7 +369,7 @@ def shape_protection_gaps(row: Dict[str, Any]) -> Dict[str, Any]:
             "link": link("/security", **{key: "off"}),
         }
         for key, label, col, total_col in _PROTECTIONS
-        if _int(row.get(total_col)) > 0
+        if _int(row.get(total_col)) > 0 and _int(row.get(col)) > 0
     ]
     order = {key: i for i, (key, *_rest) in enumerate(_PROTECTIONS)}
     gaps.sort(key=lambda g: (-g["count"], order[g["key"]]))
@@ -591,6 +597,7 @@ def shape_storage(platform_rows: Sequence[Dict[str, Any]], fullest: Sequence[Dic
                 {"platform": r.get("platform") or "Unknown", "count": low(r),
                  "link": link("/hardware", storage="low", platform=r.get("platform") or "Unknown")}
                 for r in platform_rows
+                if low(r) > 0
             ],
         },
         "capacity": [
@@ -662,7 +669,7 @@ def shape_install_health(
     pend = {r.get("agent"): r for r in pending}
     agents = []
     for key, name, plat in INSTALL_AGENTS:
-        if platform not in ("all", plat):
+        if platform not in ("all", plat) or _int(counts.get(f"{key}_devices")) == 0:
             continue
         agents.append({
             "agent": key,
@@ -1106,11 +1113,15 @@ def shape_directory_services(row: Dict[str, Any], platform: str = "all") -> Dict
         return {"key": key, "label": label, "count": _int(row.get(col)),
                 "link": link("/identity", directory=key, platform=p)}
 
+    # Breakdowns carry no zero rows: a category with no devices is not drawn.
     segments = []
     for key, label, col in DIRECTORY_SEGMENTS:
         entry = segment(key, label, col)
+        if not entry["count"]:
+            continue
         if key == "domain":
-            entry["children"] = [segment(k, l, c) for k, l, c in DIRECTORY_TRUST]
+            children = [segment(k, l, c) for k, l, c in DIRECTORY_TRUST]
+            entry["children"] = [c for c in children if c["count"]]
         segments.append(entry)
     return {
         "total": _int(row.get("devices")),
@@ -1142,6 +1153,7 @@ def shape_user_accounts(row: Dict[str, Any], admins: Sequence[Dict[str, Any]], p
             {"key": key, "label": label, "count": _int(row.get(col)),
              "link": link("/identity", auth=key, platform=p)}
             for key, label, col in AUTH_SEGMENTS
+            if _int(row.get(col)) > 0
         ],
         "adminAccounts": [
             {"name": a["name"], "devices": _int(a.get("devices")),

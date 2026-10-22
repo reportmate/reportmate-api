@@ -1,8 +1,9 @@
 -- The device scope every insight card counts over. Not a query on its own:
 -- dashboard_insights.py substitutes it for /*FLEET*/ in the WITH of every card query.
 -- Same exclusions as the bulk reports (TEST- serials, localhost, archived
--- unless asked), plus stored devices, which the dashboard keeps out of every
--- fleet count. Platform is normalised once here so a card can filter on it.
+-- unless asked). Stored devices are left out only where the report a card
+-- links to leaves them out (STORED_EXCLUDED_QUERIES in dashboard_insights.py).
+-- Platform is normalised once here so a card can filter on it.
 SELECT d.id,
        d.serial_number AS serial,
        d.last_seen,
