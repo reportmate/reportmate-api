@@ -65,7 +65,7 @@ Only asymmetric signatures (`RS*`/`ES*`) are accepted; `none` and `HS*` are refu
 
 ## Dashboard insights
 
-The dashboard's insight cards come from small cached endpoints, one per card, so a client can request them all at once and draw each card as soon as it arrives. Each card answers one question with a few counts and short top-N lists, so no client downloads a bulk report to draw one. The cards are `installHealth`, `managementToolLogs`, `checkinGaps`, `rebootDebt`, `protectionGaps`, `storage`, `osCurrency`, `softwareRisk`, `expiringCertificates`, `directoryServices`, `connectivityProblems` and `appUsage`. `managementToolErrors`, the old name of `managementToolLogs`, still answers for one release. Request one card for one platform:
+The dashboard's insight cards come from small cached endpoints, one per card, so a client can request them all at once and draw each card as soon as it arrives. Each card answers one question with a few counts and short top-N lists, so no client downloads a bulk report to draw one. The cards are `installHealth`, `managementToolLogs`, `checkinGaps`, `rebootDebt`, `protectionGaps`, `storage`, `updateDebt`, `softwareRisk`, `expiringCertificates`, `directoryServices`, `connectivityProblems` and `appUsage`. The old names `managementToolErrors` (for `managementToolLogs`) and `osCurrency` (for `updateDebt`) still answer for one release. Update Debt is OS Currency plus the devices with pending and deferred updates; Reboot Debt counts uptime only. Request one card for one platform:
 
 ```
 curl -H "X-API-Key: $REPORTMATE_KEY" "http://localhost:8000/api/v1/dashboard/insights/storage?platform=macOS"

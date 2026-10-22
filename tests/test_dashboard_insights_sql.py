@@ -514,8 +514,7 @@ def test_reboot_debt(insights):
     assert card["devices"] == 10
     buckets = {b["key"]: b["count"] for b in card["uptimeBuckets"]}
     assert buckets == {"lt1d": 1, "1-3d": 5, "3-7d": 1, "1-2w": 0, "2-4w": 1, "30d+": 1}
-    assert card["pendingUpdates"]["count"] == 3
-    assert card["deferredUpdates"]["count"] == 1
+    assert "pendingUpdates" not in card and "deferredUpdates" not in card
     assert card["uptime30dPlus"]["link"] == {
         "path": "/system",
         "params": {"uptime": "30d+"},
@@ -555,7 +554,9 @@ def test_checkin_gaps(insights):
 
 
 def test_os_currency(insights):
-    card = insights.compute_insights("all", False)["cards"]["osCurrency"]
+    card = insights.compute_insights("all", False)["cards"]["updateDebt"]
+    assert card["pendingUpdates"] == {"count": 3, "link": {"path": "/system", "params": {"pending": "1-5,6-10,10+"}}}
+    assert card["deferredUpdates"] == {"count": 1, "link": {"path": "/system", "params": {"deferred": "1"}}}
     assert card["rated"] == 10
     assert card["behind"]["count"] == 2
     assert card["unsupportedMac"]["count"] == 1
@@ -565,7 +566,8 @@ def test_os_currency(insights):
         ("26.2", 1),
     ]
 
-    mac = insights.compute_insights("macOS", False)["cards"]["osCurrency"]
+    mac = insights.compute_insights("macOS", False)["cards"]["updateDebt"]
+    assert (mac["pendingUpdates"]["count"], mac["deferredUpdates"]["count"]) == (1, 1)
     assert (mac["rated"], mac["behind"]["count"], mac["windows10"]["count"]) == (
         7,
         1,

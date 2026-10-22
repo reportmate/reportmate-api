@@ -69,8 +69,7 @@ def test_reboot_debt_shape_and_links():
         "link": {"path": "/system", "params": {"uptime": "30d+"}},
     }
     assert card["uptime2to4w"]["link"]["params"] == {"uptime": "2-4w"}
-    assert card["pendingUpdates"]["link"]["params"] == {"pending": "1-5,6-10,10+"}
-    assert card["deferredUpdates"]["link"]["params"] == {"deferred": "1"}
+    assert "pendingUpdates" not in card and "deferredUpdates" not in card
     assert [b["key"] for b in card["uptimeBuckets"]] == [
         "lt1d",
         "1-3d",
@@ -446,7 +445,7 @@ def test_a_failing_card_does_not_take_the_others_down(monkeypatch):
 
     funcs = {key: ok for key in di.CARD_KEYS}
     funcs["protectionGaps"] = boom
-    funcs["osCurrency"] = slow
+    funcs["updateDebt"] = slow
     monkeypatch.setattr(di, "CARD_FUNCTIONS", funcs)
 
     result = di.compute_insights("all", False)
@@ -454,11 +453,11 @@ def test_a_failing_card_does_not_take_the_others_down(monkeypatch):
     cards = {k: {f: v for f, v in c.items() if f != "computeSeconds"} for k, c in result["cards"].items()}
     assert list(cards) == list(di.CARD_KEYS)
     assert cards["protectionGaps"] == {"error": "Could not compute this card"}
-    assert cards["osCurrency"]["error"].startswith("Timed out after")
+    assert cards["updateDebt"]["error"].startswith("Timed out after")
     assert all(
         cards[k] == {"devices": 1}
         for k in di.CARD_KEYS
-        if k not in ("protectionGaps", "osCurrency")
+        if k not in ("protectionGaps", "updateDebt")
     )
     assert "secret" not in str(cards)
 
@@ -586,9 +585,9 @@ def test_per_card_endpoint_envelope_and_cache(client, calls):
 
 
 def test_per_card_etag_answers_304(client, calls):
-    r = client.get("/api/v1/dashboard/insights/osCurrency", headers=AUTH)
+    r = client.get("/api/v1/dashboard/insights/updateDebt", headers=AUTH)
     etag = r.headers["ETag"]
-    r = client.get("/api/v1/dashboard/insights/osCurrency", headers={**AUTH, "If-None-Match": etag})
+    r = client.get("/api/v1/dashboard/insights/updateDebt", headers={**AUTH, "If-None-Match": etag})
     assert r.status_code == 304
     assert r.content == b""
 
@@ -797,3 +796,19 @@ def test_large_module_documents_are_read_once():
             uses = len(_re.findall(_re.escape(column) + r"\b", code))
             assert "jsonb_to_record" in code, f"{path.name} reads {column} without jsonb_to_record"
             assert uses <= 5, f"{path.name} touches {column} {uses} times"
+
+
+def test_update_debt_adds_pending_and_deferred_to_os_currency():
+    currency = di.os_currency([di.OSRow("macOS", "macOS", "26.3.1", "", "", 5)])
+    card = di.shape_update_debt(currency, {"pending": 4, "deferred": 2})
+    assert card["behind"] == currency["behind"] and card["rated"] == 5
+    assert card["pendingUpdates"] == {"count": 4, "link": {"path": "/system", "params": {"pending": "1-5,6-10,10+"}}}
+    assert card["deferredUpdates"] == {"count": 2, "link": {"path": "/system", "params": {"deferred": "1"}}}
+
+
+def test_os_currency_still_answers_as_an_alias(client, calls):
+    r = client.get("/api/v1/dashboard/insights/osCurrency", headers=AUTH)
+    assert r.status_code == 200 and r.json()["card"] == "osCurrency"
+    assert r.json()["data"]["card"] == "updateDebt"
+    combined = client.get("/api/v1/dashboard/insights", headers=AUTH).json()["cards"]
+    assert combined["osCurrency"] == combined["updateDebt"]

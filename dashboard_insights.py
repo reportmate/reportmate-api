@@ -73,7 +73,7 @@ CARD_KEYS = (
     "managementToolLogs",
     "storage",
     "checkinGaps",
-    "osCurrency",
+    "updateDebt",
     "softwareRisk",
     "expiringCertificates",
     "directoryServices",
@@ -83,7 +83,7 @@ CARD_KEYS = (
 PLATFORMS = ("all", "macOS", "Windows")
 
 #: Old card keys still answered for one release, mapped to their new key.
-CARD_ALIASES = {"managementToolErrors": "managementToolLogs"}
+CARD_ALIASES = {"managementToolErrors": "managementToolLogs", "osCurrency": "updateDebt"}
 
 
 def normalize_platform(value: Optional[str]) -> Optional[str]:
@@ -312,14 +312,6 @@ def shape_reboot_debt(row: Dict[str, Any]) -> Dict[str, Any]:
         "uptime2to4w": {
             "count": _int(row.get("up_2_4w")),
             "link": link("/system", uptime="2-4w"),
-        },
-        "pendingUpdates": {
-            "count": _int(row.get("pending")),
-            "link": link("/system", pending="1-5,6-10,10+"),
-        },
-        "deferredUpdates": {
-            "count": _int(row.get("deferred")),
-            "link": link("/system", deferred=1),
         },
         "uptimeBuckets": [
             {
@@ -933,9 +925,27 @@ def _sort_levels_desc(entries: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     )
 
 
-def card_os_currency(run: Runner, scope: InsightsScope) -> Dict[str, Any]:
+def shape_update_debt(currency: Dict[str, Any], updates: Dict[str, Any]) -> Dict[str, Any]:
+    """Update Debt: OS Currency plus the devices with pending and deferred
+    updates (the counts Reboot & Update Debt used to carry)."""
+    return {
+        **currency,
+        "pendingUpdates": {
+            "count": _int(updates.get("pending")),
+            "link": link("/system", pending="1-5,6-10,10+"),
+        },
+        "deferredUpdates": {
+            "count": _int(updates.get("deferred")),
+            "link": link("/system", deferred=1),
+        },
+    }
+
+
+def card_update_debt(run: Runner, scope: InsightsScope) -> Dict[str, Any]:
     rows = [OSRow.from_sql(r) for r in run("os_versions", platform="all")]
-    return os_currency(rows, scope.platform)
+    # reboot_debt.sql already reduces each system document to its pending and
+    # deferred update counts; this card reads those two columns.
+    return shape_update_debt(os_currency(rows, scope.platform), run("reboot_debt")[0])
 
 
 # ── Software Risk ─────────────────────────────────────────────
@@ -1087,7 +1097,7 @@ CARD_FUNCTIONS: Dict[str, Callable[..., Dict[str, Any]]] = {
     "storage": card_storage,
     "installHealth": card_install_health,
     "checkinGaps": card_checkin_gaps,
-    "osCurrency": card_os_currency,
+    "updateDebt": card_update_debt,
     "softwareRisk": card_software_risk,
     "expiringCertificates": card_certificates,
     "directoryServices": card_directory_services,
