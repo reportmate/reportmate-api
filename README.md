@@ -79,6 +79,8 @@ The name "ReportMate" and the logo are not part of the license grant. Fork the c
 
 PRs are welcome. First-time contributors get pinged by the CLA Assistant bot to sign a one-page CLA — this is what makes the dual-license model legally work. Sign it once and you're set for all future PRs.
 
+Development guide: [wiki](wiki/README.md)
+
 ## The rest of the project
 
 - [`reportmate-app-web`](https://github.com/reportmate/reportmate-app-web) — Next.js dashboard (AGPL-3.0)
