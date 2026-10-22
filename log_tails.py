@@ -160,6 +160,36 @@ _NOISE = (
 )
 
 
+# A leading timestamp in any of the shapes the tools write, raw or already
+# replaced by its placeholder, with an optional UTC offset after it.
+_PREFIX_STAMP = re.compile(
+    r'^\[?(?:<ts>|\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2}(?:[.,:]\d+)?'
+    r'|[A-Z][a-z]{2} \d{1,2} (?:\d{4} )?\d{2}:\d{2}:\d{2})'
+    r'(?:\s*(?:Z|[+-]\d{2}:?\d{2}|[+-]<n>(?::<n>)?))?\]?\s*'
+)
+_PREFIX_OFFSET = re.compile(r'^(?:Z|[+-]\d{2}:?\d{2}|[+-]<n>(?::<n>)?)(?=\s)\s*')
+_LEVEL_WORDS = r'ERROR|ERR|WARNING|WARN|WRN|INFO|INF|DEBUG|DBG|FATAL|CRITICAL|TRACE|VERBOSE|NOTICE'
+_PREFIX_LEVEL = re.compile(
+    r'^(?:\[(?:' + _LEVEL_WORDS + r'|E|W|I|D)\]|(?:' + _LEVEL_WORDS + r')(?=[\s:])):?\s*',
+    re.IGNORECASE,
+)
+_PREFIX_SEPARATOR = re.compile(r'^[|:\-]\s+')
+
+
+def strip_message_prefix(text: str) -> str:
+    """Drop the leading timestamp, UTC offset, level and separators from a log
+    message, raw or normalised: ``<ts> -<n>:<n> [ERR] Device registration
+    failed`` and ``2026-10-22 13:44:00 -07:00 ERROR Device registration
+    failed`` both become ``Device registration failed``."""
+    for _ in range(6):
+        before = text
+        for pattern in (_PREFIX_STAMP, _PREFIX_OFFSET, _PREFIX_LEVEL, _PREFIX_SEPARATOR):
+            text = pattern.sub("", text, count=1)
+        if text == before:
+            break
+    return text.strip()
+
+
 def normalize_message(line: str, width: int = 160) -> str:
     """Collapse a log line to its message shape so the same fault on many
     devices counts once: the leading stamp and level, CMTrace and daemon
@@ -185,9 +215,10 @@ def normalize_message(line: str, width: int = 160) -> str:
     else:
         text = _DAEMON.sub("", text)
     text = _LEADING_STAMP.sub("", text)
+    text = strip_message_prefix(text)
     for pattern, replacement in _NOISE:
         text = pattern.sub(replacement, text)
-    return text.strip()[:width]
+    return strip_message_prefix(text.strip())[:width]
 
 
 # ---------------------------------------------------------------------------

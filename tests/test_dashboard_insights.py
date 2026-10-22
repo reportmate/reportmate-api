@@ -225,22 +225,24 @@ def test_storage_buckets_and_links():
                                   "freeBytes": 20, "totalBytes": 1000, "link": {"path": "/device/SAMPLE1", "params": {}}}
 
 
-def test_directory_join_views():
-    rows = [
-        {"platform": "Windows", "devices": 4, "entra": 1, "domain": 1, "hybrid": 1, "workgroup": 1,
-         "mac_psso": 0, "mac_bound": 0, "mac_unbound": 0, "extra_admins": 2, "shared": 1, "assigned": 3},
-        {"platform": "macOS", "devices": 3, "entra": 0, "domain": 1, "hybrid": 0, "workgroup": 2,
-         "mac_psso": 1, "mac_bound": 1, "mac_unbound": 1, "extra_admins": 1, "shared": 0, "assigned": 3},
+def test_directory_services_shape_and_links():
+    row = {"devices": 9, "cloud_joined": 3, "domain_joined": 4, "trusted": 2, "unconfirmed": 1, "broken": 1,
+           "standard": 1, "unjoined": 1, "extra_admins": 2, "shared": 1, "assigned": 5}
+    card = di.shape_directory_services(row, "macOS")
+    assert set(card) == {"total", "segments", "extraAdmins", "shared", "assigned"}
+    assert card["total"] == 9
+    assert [(s["key"], s["label"]) for s in card["segments"]] == [
+        ("cloud", "Cloud Joined"), ("domain", "Domain Joined"), ("standard", "Standard"), ("unjoined", "Unjoined"),
     ]
-    views = di.shape_directory_join(rows)["views"]
-    assert set(views) == {"all", "windows", "mac"}
-    assert {s["key"]: s["count"] for s in views["all"]["segments"]}["workgroup"] == 3
-    assert [s["key"] for s in views["mac"]["segments"]] == ["psso", "bound", "unbound"]
-    assert views["mac"]["segments"][1]["link"] == {"path": "/identity",
-                                                   "params": {"directory": "bound", "platform": "macOS"}}
-    assert views["windows"]["segments"][0]["link"]["params"] == {"join": "entra", "platform": "Windows"}
-    assert views["all"]["extraAdmins"] == {"count": 3, "link": {"path": "/identity", "params": {"admins": "extra"}}}
-    assert views["windows"]["assigned"]["link"]["params"] == {"usage": "assigned", "platform": "Windows"}
+    domain = card["segments"][1]
+    assert [(c["key"], c["label"], c["count"]) for c in domain["children"]] == [
+        ("trusted", "Trusted", 2), ("unconfirmed", "Unconfirmed", 1), ("broken", "Broken", 1),
+    ]
+    assert domain["link"] == {"path": "/identity", "params": {"directory": "domain", "platform": "macOS"}}
+    assert domain["children"][0]["link"]["params"] == {"directory": "trusted", "platform": "macOS"}
+    everywhere = di.shape_directory_services(row)
+    assert everywhere["segments"][0]["link"]["params"] == {"directory": "cloud"}
+    assert everywhere["assigned"] == {"count": 5, "link": {"path": "/identity", "params": {"usage": "assigned"}}}
 
 
 def test_management_tools_products_merge_and_links():
@@ -253,14 +255,12 @@ def test_management_tools_products_merge_and_links():
          "devices_with_warnings": 0, "error_lines": 2, "warning_lines": 0},
         {"tool": "bootstrap", "platform": "Windows", "mdm_name": None, "devices": 3, "devices_with_errors": 1,
          "devices_with_warnings": 0, "error_lines": 1, "warning_lines": 0},
-        {"tool": "mdm", "platform": "Windows", "mdm_name": "Intune", "devices": 3, "devices_with_errors": 0,
-         "devices_with_warnings": 0, "error_lines": 0, "warning_lines": 0},
     ]
-    messages = [{"message": "Download of <n> failed", "tool": "installs", "platform": "macOS", "mdm_name": None,
+    messages = [{"message": "Download of <n> failed", "tool": "installs", "platforms": ["macOS"],
                  "devices": 2, "lines": 4, "sample_serial": "SAMPLE1"}]
     card = di.shape_management_tools(rows, messages)
     names = [t["name"] for t in card["tools"]]
-    assert names == ["Munki", "BootstrapMate", "Cimian", "Intune"]
+    assert names == ["Munki", "BootstrapMate", "Cimian"]
     boot = card["tools"][1]
     assert (boot["devices"], boot["devicesWithErrors"], boot["platform"]) == (8, 2, None)
     assert boot["link"] == {"path": "/devices", "params": {"tool": "bootstrap", "level": "error"}}
@@ -270,6 +270,40 @@ def test_management_tools_products_merge_and_links():
     assert (top["name"], top["devices"]) == ("Munki", 2)
     assert top["sampleDevice"]["link"] == {"path": "/device/SAMPLE1",
                                            "params": {"tab": "management", "tool": "installs", "level": "error"}}
+
+
+def test_top_messages_strip_old_prefixes_and_merge_duplicates():
+    messages = [
+        {"message": "<ts> -<n>:<n> [ERR] Device registration failed for <guid>", "tool": "reports",
+         "platforms": ["Windows"], "devices": 3, "lines": 9, "sample_serial": "SAMPLE9"},
+        {"message": "<ts> +<n>:<n> [ERR] Device registration failed for <guid>", "tool": "reports",
+         "platforms": ["macOS"], "devices": 2, "lines": 2, "sample_serial": "SAMPLE2"},
+        {"message": "Device registration failed for <guid>", "tool": "reports",
+         "platforms": ["Windows"], "devices": 1, "lines": 1, "sample_serial": "SAMPLE5"},
+        {"message": "Device registration failed for <guid>", "tool": "bootstrap",
+         "platforms": ["Windows"], "devices": 1, "lines": 1, "sample_serial": "SAMPLE4"},
+        {"message": "ERROR: Download of <n> failed", "tool": "installs",
+         "platforms": ["macOS", "Windows"], "devices": 4, "lines": 4, "sample_serial": "SAMPLE1"},
+    ]
+    top = di.top_tool_messages(messages)
+    assert [(m["tool"], m["message"], m["devices"], m["lines"]) for m in top] == [
+        ("reports", "Device registration failed for <guid>", 6, 12),
+        ("installs", "Download of <n> failed", 4, 4),
+        ("bootstrap", "Device registration failed for <guid>", 1, 1),
+    ]
+    assert top[0]["sampleDevice"]["serialNumber"] == "SAMPLE2"
+    assert top[0]["link"]["params"] == {"tool": "reports", "level": "error"}
+    assert top[1]["name"] == "Cimian / Munki"
+    assert top[1]["link"]["params"] == {"tool": "installs", "level": "error"}
+
+
+def test_normalize_message_strips_stamp_offset_and_level():
+    from log_tails import normalize_message
+
+    line = "2026-10-22T13:44:00.123 -07:00 [ERR] Device registration failed for 3f2504e0-4f89-11d3-9a0c-0305e82c3301"
+    assert normalize_message(line) == "Device registration failed for <guid>"
+    assert normalize_message("[2026-10-22 13:44:00] ERROR  Download of SAMPLE failed: 404") == "Download of SAMPLE failed: <n>"
+    assert normalize_message("Errors were found in 3 items") == "Errors were found in <n> items"
 
 
 def test_tool_window_start_is_an_hour_key():
@@ -563,7 +597,7 @@ def test_combined_is_assembled_from_the_per_card_cache(client, calls):
     client.get("/api/v1/dashboard/insights/storage", headers=AUTH)
     r = client.get("/api/v1/dashboard/insights", headers=AUTH)
     body = r.json()
-    assert list(body["cards"]) == list(di.CARD_KEYS)
+    assert list(body["cards"]) == list(di.CARD_KEYS) + list(di.CARD_ALIASES)
     assert body["cards"]["storage"]["generatedAt"]
     assert sorted(calls) == sorted((card, "all", False) for card in di.CARD_KEYS)
     r = client.get("/api/v1/dashboard/insights", headers=AUTH)
@@ -673,7 +707,7 @@ def test_tool_devices_endpoint_validates_and_caches(client, monkeypatch):
                 "devices": [], "generatedAt": "2026-10-22T00:00:00+00:00"}
 
     monkeypatch.setattr(di, "compute_tool_devices", compute)
-    url = "/api/v1/dashboard/insights/managementToolErrors/devices"
+    url = "/api/v1/dashboard/insights/managementToolLogs/devices"
     assert client.get(f"{url}?tool=installs").status_code == 401
     assert client.get(url, headers=AUTH).status_code == 422
     assert client.get(f"{url}?tool=installs&level=info", headers=AUTH).status_code == 422
@@ -689,3 +723,19 @@ def test_tool_devices_endpoint_validates_and_caches(client, monkeypatch):
                     headers={**AUTH, "If-None-Match": r.headers["ETag"]})
     assert r2.status_code == 304
     assert seen == [("installs", "warning", 24, "macOS")]
+
+
+def test_old_card_key_and_devices_path_still_answer(client, calls, monkeypatch):
+    r = client.get("/api/v1/dashboard/insights/managementToolErrors", headers=AUTH)
+    assert r.status_code == 200
+    assert r.json()["card"] == "managementToolErrors"
+    assert r.json()["data"]["card"] == "managementToolLogs"
+    combined = client.get("/api/v1/dashboard/insights", headers=AUTH).json()["cards"]
+    assert combined["managementToolErrors"] == combined["managementToolLogs"]
+    assert "directoryServices" in combined and "directoryJoin" not in combined
+    assert calls.count(("managementToolLogs", "all", False)) == 1
+
+    monkeypatch.setattr(di, "compute_tool_devices", lambda tool, level, hours, platform: {
+        "tool": tool, "level": level, "hours": hours, "platform": platform, "devices": [], "generatedAt": "x"})
+    old = client.get("/api/v1/dashboard/insights/managementToolErrors/devices?tool=installs", headers=AUTH)
+    assert old.status_code == 200 and old.json()["tool"] == "installs"
