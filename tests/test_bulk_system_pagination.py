@@ -177,6 +177,29 @@ def test_the_in_place_upgrade_marker_is_projected(client):
     assert device["inPlaceUpgradeCount"] == 1
 
 
+def test_install_date_carries_an_explicit_utc_offset(client):
+    """The client serialises installDate from a Unix epoch with no offset. A
+    consumer that parses it naively reads UTC as local time, so the projection
+    states the basis instead of leaving every reader to assume it."""
+    device = client.get("/api/v1/system", headers=AUTH).json()[0]
+    assert device["installDate"] == "2026-08-25T20:07:17+00:00"
+
+
+@pytest.mark.parametrize("raw, projected", [
+    ("2026-08-25T20:07:17", "2026-08-25T20:07:17+00:00"),
+    ("2026-08-25T20:07:17Z", "2026-08-25T20:07:17+00:00"),
+    ("2026-08-25T20:07:17.250", "2026-08-25T20:07:17.250000+00:00"),
+    ("2026-08-25T13:07:17-07:00", "2026-08-25T20:07:17+00:00"),
+    ("not a date", "not a date"),
+    ("", None),
+    (None, None),
+])
+def test_install_date_normalisation(raw, projected):
+    from routers.fleet import utc_install_date
+
+    assert utc_install_date(raw) == projected
+
+
 def test_a_never_upgraded_machine_is_zero_not_missing(client, monkeypatch):
     """0 means the OS has never been upgraded over. None means the client has not
     reported the field yet. Collapsing the two would read an old client as proof of a
