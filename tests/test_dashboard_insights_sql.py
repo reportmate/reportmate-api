@@ -517,8 +517,8 @@ def test_unmanaged_devices(insights):
     }
     assert {b["key"]: b["count"] for b in card["lastSeen"]} == {
         "24h": 1,
-        "7d": 1,
-        "silent": 0,
+        "1-7d": 1,
+        "7d+": 0,
     }
     assert [d["serialNumber"] for d in card["recent"]] == ["SAMPLE2", "SAMPLE9"]
     assert card["recent"][0]["link"] == {"path": "/device/SAMPLE2", "params": {}}

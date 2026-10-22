@@ -300,7 +300,7 @@ def shape_unmanaged(
                 "platform": r.get("platform") or "Unknown",
                 "count": _int(r.get("unmanaged")),
                 "devices": _int(r.get("devices")),
-                "link": unenrolled,
+                "link": link("/management", enrolled=0, platform=r.get("platform") or "Unknown"),
             }
             for r in sorted(
                 platform_rows,
@@ -313,19 +313,19 @@ def shape_unmanaged(
                 "key": "24h",
                 "label": "Seen in the last 24 hours",
                 "count": sum(_int(r.get("seen_24h")) for r in platform_rows),
-                "link": unenrolled,
+                "link": link("/management", enrolled=0, lastSeen="24h"),
             },
             {
-                "key": "7d",
+                "key": "1-7d",
                 "label": "Seen 1-7 days ago",
                 "count": sum(_int(r.get("seen_7d")) for r in platform_rows),
-                "link": unenrolled,
+                "link": link("/management", enrolled=0, lastSeen="1-7d"),
             },
             {
-                "key": "silent",
+                "key": "7d+",
                 "label": "Silent over 7 days",
                 "count": sum(_int(r.get("silent")) for r in platform_rows),
-                "link": unenrolled,
+                "link": link("/management", enrolled=0, lastSeen="7d+"),
             },
         ],
         "recent": [
@@ -807,19 +807,19 @@ def shape_local_admins(
                 "key": "2",
                 "label": "2 admins",
                 "count": total("admins_2"),
-                "link": extra,
+                "link": link("/identity", admins="2"),
             },
             {
                 "key": "3",
                 "label": "3 admins",
                 "count": total("admins_3"),
-                "link": extra,
+                "link": link("/identity", admins="3"),
             },
             {
                 "key": "4+",
                 "label": "4 or more admins",
                 "count": total("admins_4_plus"),
-                "link": extra,
+                "link": link("/identity", admins="4+"),
             },
         ],
         "topDevices": [

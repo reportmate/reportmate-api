@@ -135,6 +135,15 @@ def test_unmanaged_percentages_round_like_javascript():
         "path": "/management",
         "params": {"enrolled": "0"},
     }
+    assert [p["link"]["params"] for p in card["byPlatform"]] == [
+        {"enrolled": "0", "platform": "macOS"},
+        {"enrolled": "0", "platform": "Windows"},
+    ]
+    assert [b["link"]["params"] for b in card["lastSeen"]] == [
+        {"enrolled": "0", "lastSeen": "24h"},
+        {"enrolled": "0", "lastSeen": "1-7d"},
+        {"enrolled": "0", "lastSeen": "7d+"},
+    ]
 
 
 def test_install_health_links():
@@ -253,6 +262,11 @@ def test_local_admins_join_links():
         ],
     )
     assert card["extraAdmins"]["link"]["params"] == {"admins": "extra"}
+    assert [b["link"]["params"] for b in card["byAdminCount"]] == [
+        {"admins": "2"},
+        {"admins": "3"},
+        {"admins": "4+"},
+    ]
     assert {j["key"]: j["link"]["params"]["join"] for j in card["join"]} == {
         "entra": "entra",
         "domain": "domain",
@@ -260,7 +274,11 @@ def test_local_admins_join_links():
         "workgroup": "workgroup",
     }
     assert card["workgroup"]["byPlatform"] == [
-        {"platform": "macOS", "count": 3, "link": {"path": "/identity", "params": {"join": "workgroup"}}}
+        {
+            "platform": "macOS",
+            "count": 3,
+            "link": {"path": "/identity", "params": {"join": "workgroup"}},
+        }
     ]
     assert card["topDevices"][0]["link"] == {"path": "/device/SAMPLE1", "params": {}}
 
@@ -317,7 +335,10 @@ def test_connectivity_links():
         "params": {"signal": "weak"},
     }
     assert card["poorQuality"]["measured"] == 3
-    assert card["poorQuality"]["link"] == {"path": "/network", "params": {"quality": "poor"}}
+    assert card["poorQuality"]["link"] == {
+        "path": "/network",
+        "params": {"quality": "poor"},
+    }
     assert card["onVpn"]["link"] == {"path": "/network", "params": {"vpn": "1"}}
 
 
