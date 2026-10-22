@@ -750,3 +750,30 @@ def test_management_tool_error_devices(insights):
     week = insights.compute_tool_devices("installs", "error", 168, "macOS")
     assert [(d["serialNumber"], d["count"]) for d in week["devices"]][0] == ("SAMPLE1", 4)
     assert insights.compute_tool_devices("nosuchtool")["devices"] == []
+
+
+def _without_stamps(card):
+    return {k: v for k, v in card.items() if k not in ("generatedAt", "computeSeconds")}
+
+
+def test_all_scope_merged_from_platform_parts_matches_one_fleet_query(insights, monkeypatch):
+    """The whole-fleet view is computed one platform at a time and merged.
+    Every card must come out exactly as the single fleet-wide query gives it."""
+    merged = {key: _without_stamps(insights.compute_card(key, "all")) for key in insights.CARD_KEYS}
+    monkeypatch.setattr(insights, "QUERY_MERGE", {})
+    direct = {key: _without_stamps(insights.compute_card(key, "all")) for key in insights.CARD_KEYS}
+    assert merged == direct
+    assert not any("error" in card for card in merged.values())
+
+
+def test_all_scope_runs_one_statement_per_platform(insights, monkeypatch):
+    seen = []
+    real = insights.card_sql
+
+    def spy(name, scope, select=None):
+        seen.append(select or name)
+        return real(name, scope, select)
+
+    monkeypatch.setattr(insights, "card_sql", spy)
+    insights.compute_card("managementToolLogs", "all")
+    assert seen.count("management_tool_errors") == len(insights.FLEET_PLATFORMS)

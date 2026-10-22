@@ -739,3 +739,61 @@ def test_old_card_key_and_devices_path_still_answer(client, calls, monkeypatch):
         "tool": tool, "level": level, "hours": hours, "platform": platform, "devices": [], "generatedAt": "x"})
     old = client.get("/api/v1/dashboard/insights/managementToolErrors/devices?tool=installs", headers=AUTH)
     assert old.status_code == 200 and old.json()["tool"] == "installs"
+
+
+# ── The all scope: per-platform parts and their merge ───────────
+
+
+def test_merge_sum_and_group_and_concat():
+    from decimal import Decimal
+
+    assert di.merge_rows([[{"devices": 2, "x": Decimal("1.5")}], [{"devices": 3, "x": Decimal("1")}], []],
+                         {"kind": "sum"}) == [{"devices": 5, "x": Decimal("2.5")}]
+    assert di.merge_rows([[], [], []], {"kind": "sum"}) == []
+    spec = di.QUERY_MERGE["management_tool_messages"]
+    parts = [
+        [{"message": "m", "tool": "t", "devices": 2, "lines": 5, "platforms": ["macOS"], "sample_serial": "SAMPLE9"}],
+        [{"message": "m", "tool": "t", "devices": 1, "lines": 1, "platforms": ["Windows"], "sample_serial": "SAMPLE3"},
+         {"message": "n", "tool": "t", "devices": 9, "lines": 1, "platforms": ["Windows"], "sample_serial": "SAMPLE4"}],
+    ]
+    assert di.merge_rows(parts, spec, limit=1) == [
+        {"message": "n", "tool": "t", "devices": 9, "lines": 1, "platforms": ["Windows"], "sample_serial": "SAMPLE4"}]
+    merged = di.merge_rows(parts, spec)
+    assert merged[1] == {"message": "m", "tool": "t", "devices": 3, "lines": 6,
+                         "platforms": ["Windows", "macOS"], "sample_serial": "SAMPLE3"}
+    soonest = di.merge_rows([[{"cn": "c", "days": 9, "devices": 1}], [{"cn": "c", "days": 4, "devices": 2}]],
+                            di.QUERY_MERGE["certificates_soonest"])
+    assert soonest == [{"cn": "c", "days": 4, "devices": 3}]
+    assert di.merge_rows([[{"a": 1}], [{"a": 2}]], {"kind": "concat"}) == [{"a": 1}, {"a": 2}]
+
+
+def test_every_split_query_filters_by_platform():
+    """A query merged from platform parts must honour the platform parameter,
+    or each part would count the whole fleet."""
+    from dependencies import load_sql
+
+    roots = load_sql("insights/management_roots")
+    for name in di.QUERY_MERGE:
+        text = load_sql(f"insights/{name}")
+        if name in ("storage", "storage_fullest"):
+            text = load_sql("insights/storage_devices")
+        assert "%(platform)s" in text or ("MANAGEMENT_ROOTS" in text and "%(platform)s" in roots), name
+
+
+def test_large_module_documents_are_read_once():
+    """System and management documents run to megabytes, and every ->
+    access on the column detoasts all of it again: rebootDebt and the tool
+    logs card timed out on the fleet that way. Those queries read the column
+    once through jsonb_to_record and work on the slim row."""
+    import pathlib
+    import re as _re
+
+    folder = pathlib.Path(di.__file__).parent / "sql" / "insights"
+    for path in folder.glob("*.sql"):
+        code = "\n".join(line.split("--")[0] for line in path.read_text().splitlines())
+        for table, column in (("system s", "s.data"), ("management m", "m.data")):
+            if f"JOIN {table}" not in code:
+                continue
+            uses = len(_re.findall(_re.escape(column) + r"\b", code))
+            assert "jsonb_to_record" in code, f"{path.name} reads {column} without jsonb_to_record"
+            assert uses <= 5, f"{path.name} touches {column} {uses} times"
