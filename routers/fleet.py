@@ -2834,6 +2834,8 @@ def get_bulk_security(
                  ssh_status_display, ssh_is_configured, ssh_is_service_running, rdp_enabled,
                  certificate_count, expired_cert_count, expiring_soon_cert_count,
                  user_expired_cert_count, os_root_expired_cert_count,
+                 actionable_cert_count, system_managed_cert_count, trust_store_cert_count,
+                 system_managed_expired_cert_count,
                  cve_count, critical_cve_count, actively_exploited_cve_count,
                  # Protection posture
                  lsa_protection_enabled, lsa_protection_mode, tamper_protected,
@@ -2908,6 +2910,12 @@ def get_bulk_security(
                     'expiringSoonCertCount': expiring_soon_cert_count or 0,
                     'userExpiredCertCount': user_expired_cert_count or 0,
                     'osRootExpiredCertCount': os_root_expired_cert_count or 0,
+                    # Expired and expiring counts above are actionable
+                    # certificates only; these say what the rest hold.
+                    'actionableCertCount': actionable_cert_count or 0,
+                    'systemManagedCertCount': system_managed_cert_count or 0,
+                    'trustStoreCertCount': trust_store_cert_count or 0,
+                    'systemManagedExpiredCertCount': system_managed_expired_cert_count or 0,
                     # Vulnerabilities (unpatched only; total via securityCves array if needed)
                     'cveCount': cve_count or 0,
                     'criticalCveCount': critical_cve_count or 0,
@@ -2948,13 +2956,19 @@ def get_bulk_security(
         raise HTTPException(status_code=500, detail=f"Failed to retrieve bulk security: {str(e)}")
 
 CERT_SEARCH_HARD_LIMIT = 10000
+CERT_CLASS_FILTERS = ("actionable", "system-managed", "trust-store", "hidden", "all")
 
 @router.get("/security/certificates", dependencies=[Depends(verify_authentication)], tags=["fleet"])
 def search_fleet_certificates(
     search: str = Query(default="", description="Search term to match against certificate commonName, issuer, subject, or serialNumber"),
     status: str = Query(default="all", description="Filter by certificate status: all, valid, expired, expiring"),
     limit: int = Query(default=1000, ge=1, le=CERT_SEARCH_HARD_LIMIT, description=f"Maximum results to return (max {CERT_SEARCH_HARD_LIMIT})"),
-    include_archived: bool = Query(default=False, alias="includeArchived", description="Include archived devices in results")
+    include_archived: bool = Query(default=False, alias="includeArchived", description="Include archived devices in results"),
+    cert_class: str = Query(
+        default="actionable",
+        alias="class",
+        description="Certificate class: actionable (default), system-managed, trust-store, hidden (everything not actionable) or all",
+    ),
 ):
     """
     Fleet-wide certificate search endpoint.
@@ -2967,9 +2981,19 @@ def search_fleet_certificates(
     - status: Filter by cert status (all, valid, expired, expiring)
     - limit: Maximum results to return (default 1000, hard cap 10000)
     - includeArchived: Include archived devices
+    - class: actionable (default), system-managed, trust-store, hidden or all.
+      Actionable certificates are the ones someone has to renew; the rest are
+      rotated by the OS or an agent, or are OS trust-store roots
+      (certificate_class.py).
     """
+    cert_class = (cert_class or "actionable").strip().lower()
+    if cert_class not in CERT_CLASS_FILTERS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"class must be one of: {', '.join(CERT_CLASS_FILTERS)}",
+        )
     try:
-        _ckey = (search.strip(), status.strip().lower(), include_archived, limit)
+        _ckey = (search.strip(), status.strip().lower(), include_archived, limit, cert_class)
         _cached = cache_get("security_certs", _ckey)
         if _cached is not None:
             return _cached
@@ -2986,6 +3010,7 @@ def search_fleet_certificates(
             "status": status.strip().lower(),
             "include_archived": include_archived,
             "max_results": limit,
+            "cert_class": cert_class,
         })
         rows = cursor.fetchall()
         conn.close()
@@ -3000,7 +3025,8 @@ def search_fleet_certificates(
                  not_after, not_before, days_until_expiry,
                  is_expired, is_expiring_soon,
                  store_name, store_location, key_algorithm,
-                 cert_serial_number, is_self_signed) = row
+                 cert_serial_number, is_self_signed,
+                 row_class, display_name, issuer_name, keychain_path, thumbprint) = row
                 
                 results.append({
                     'serialNumber': serial_number,
@@ -3020,6 +3046,11 @@ def search_fleet_certificates(
                     'keyAlgorithm': key_algorithm,
                     'certSerialNumber': cert_serial_number,
                     'isSelfSigned': bool(is_self_signed),
+                    'class': row_class,
+                    'displayName': display_name or common_name,
+                    'issuerName': issuer_name or issuer,
+                    'path': keychain_path,
+                    'thumbprint': thumbprint,
                 })
             except Exception as e:
                 logger.warning(f"Error processing certificate row: {e}")

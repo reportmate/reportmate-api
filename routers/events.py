@@ -23,6 +23,7 @@ from install_status import (
     stamp_items as _stamp_install_items,
 )
 from log_tails import stamp_log_summaries as _stamp_log_summaries
+from certificate_class import stamp_certificates as _stamp_certificates
 
 from dependencies import (
     broadcast_event, cache_get, cache_set, get_db_connection,
@@ -1087,6 +1088,14 @@ async def submit_events(request: Request):
                     # stored state is now the single answer they all read.
                     if module_name == 'installs':
                         module_data = _stamp_install_items(module_data)
+
+                    # Classify each certificate once, here: actionable,
+                    # system-managed or trust-store (certificate_class).
+                    if module_name == 'security':
+                        try:
+                            module_data = _stamp_certificates(module_data, platform)
+                        except Exception as cert_error:
+                            logger.warning(f"Skipped certificate classification for {serial_number}: {cert_error}")
 
                     # Count each log root's error and warning lines once, here,
                     # so the dashboard can aggregate them per tool in SQL
