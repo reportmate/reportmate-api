@@ -1375,7 +1375,11 @@ def reclassify_stored_certificates(
                 if not isinstance(data, dict) or not isinstance(data.get("certificates"), list):
                     continue
 
-                stamped = _stamp_certificates(data, platform or "")
+                try:
+                    stamped = _stamp_certificates(data, platform or "")
+                except Exception as row_error:
+                    logger.warning(f"Skipped certificate reclassify for security row {row_id}: {row_error}")
+                    continue
                 for cert in stamped["certificates"]:
                     if isinstance(cert, dict):
                         classes[cert["class"]] = classes.get(cert["class"], 0) + 1

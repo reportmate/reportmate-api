@@ -365,3 +365,17 @@ def test_stamping_is_idempotent():
         {"certificates": [win("Personal", commonName="SAMPLE")]}, "Windows"
     )
     assert stamp_certificates(once, "Windows") == once
+
+
+def test_device_supplied_class_and_epoch_never_survive():
+    stamped = stamp_certificates(
+        {"certificates": [win("Root", commonName="SAMPLE Root", **{"class": "actionable", "notAfterEpoch": 10**30})]},
+        "Windows",
+    )["certificates"][0]
+    assert stamped["class"] == TRUST_STORE
+    assert "notAfterEpoch" not in stamped
+
+
+@pytest.mark.parametrize("not_after", ["1e400", "9" * 40, 10**30, float("inf"), "99999-01-01", -5])
+def test_out_of_range_expiry_is_dropped(not_after):
+    assert "notAfterEpoch" not in stamp_certificate({"notAfter": not_after}, "Windows")

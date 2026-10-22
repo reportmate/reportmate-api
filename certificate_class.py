@@ -290,22 +290,31 @@ def classify_certificate(cert: Dict[str, Any], platform: str = "") -> str:
     return _classify_mac(cert)
 
 
+# Expiry epochs outside 1970..9999 are not dates; dropping them keeps SQL's
+# arithmetic on the epoch inside range.
+_EPOCH_MIN = 0
+_EPOCH_MAX = 253402300799
+
+
 def _not_after_epoch(cert: Dict[str, Any]) -> Optional[int]:
     raw = cert.get("notAfter")
-    if isinstance(raw, (int, float)) and not isinstance(raw, bool):
-        return int(raw)
-    text = _text(raw)
-    if not text:
-        return None
-    if re.fullmatch(r"-?\d+(\.\d+)?", text):
-        return int(float(text))
     try:
-        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
-    except ValueError:
+        if isinstance(raw, (int, float)) and not isinstance(raw, bool):
+            epoch = int(raw)
+        else:
+            text = _text(raw)
+            if not text:
+                return None
+            if re.fullmatch(r"-?\d{1,15}(\.\d+)?", text):
+                epoch = int(float(text))
+            else:
+                parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+                if parsed.tzinfo is None:
+                    parsed = parsed.replace(tzinfo=timezone.utc)
+                epoch = int(parsed.timestamp())
+    except (ValueError, OverflowError, OSError):
         return None
-    if parsed.tzinfo is None:
-        parsed = parsed.replace(tzinfo=timezone.utc)
-    return int(parsed.timestamp())
+    return epoch if _EPOCH_MIN <= epoch <= _EPOCH_MAX else None
 
 
 def stamp_certificate(cert: Dict[str, Any], platform: str = "") -> Dict[str, Any]:
@@ -313,7 +322,11 @@ def stamp_certificate(cert: Dict[str, Any], platform: str = "") -> Dict[str, Any
     ``notAfterEpoch`` set. The epoch lets SQL work out expiry at query time
     rather than trusting ``daysUntilExpiry``, which is frozen at collection."""
     stamped = dict(cert)
-    stamped["class"] = classify_certificate(cert, platform)
+    # Never keep a class or epoch the device sent: the API decides both.
+    try:
+        stamped["class"] = classify_certificate(cert, platform)
+    except Exception:
+        stamped["class"] = ACTIONABLE
     stamped["displayName"] = display_name(cert)
     stamped["issuerName"] = issuer_name(cert)
     epoch = _not_after_epoch(cert)
@@ -324,6 +337,17 @@ def stamp_certificate(cert: Dict[str, Any], platform: str = "") -> Dict[str, Any
     return stamped
 
 
+def _stamp_safely(cert: Dict[str, Any], platform: str) -> Dict[str, Any]:
+    """One odd certificate must not leave the rest, or itself, carrying
+    whatever class the device claimed."""
+    try:
+        return stamp_certificate(cert, platform)
+    except Exception:
+        fallback = {k: v for k, v in cert.items() if k not in ("notAfterEpoch", "displayName", "issuerName")}
+        fallback["class"] = ACTIONABLE
+        return fallback
+
+
 def stamp_certificates(security: Any, platform: str = "") -> Any:
     """Stamp every certificate in a security module payload. Anything that is
     not a dict with a ``certificates`` list is returned unchanged."""
@@ -332,8 +356,5 @@ def stamp_certificates(security: Any, platform: str = "") -> Any:
     ):
         return security
     out = dict(security)
-    out["certificates"] = [
-        stamp_certificate(c, platform) if isinstance(c, dict) else c
-        for c in security["certificates"]
-    ]
+    out["certificates"] = [_stamp_safely(c, platform) if isinstance(c, dict) else c for c in security["certificates"]]
     return out

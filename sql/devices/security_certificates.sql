@@ -20,8 +20,8 @@ WITH certs AS (
         cert,
         COALESCE(cert->>'class', 'actionable') AS cert_class,
         CASE WHEN jsonb_typeof(cert->'notAfterEpoch') = 'number'
-             THEN FLOOR(((cert->>'notAfterEpoch')::numeric - EXTRACT(EPOCH FROM NOW())) / 86400.0)::int
-             WHEN cert->>'daysUntilExpiry' ~ '^\s*-?\d+\s*$'
+             THEN FLOOR((LEAST(GREATEST((cert->>'notAfterEpoch')::numeric, 0), 253402300799) - EXTRACT(EPOCH FROM NOW())) / 86400.0)::int
+             WHEN cert->>'daysUntilExpiry' ~ '^\s*-?\d{1,7}\s*$'
              THEN (cert->>'daysUntilExpiry')::int
              ELSE 0 END AS days,
         jsonb_typeof(cert->'notAfterEpoch') = 'number' AS live,
