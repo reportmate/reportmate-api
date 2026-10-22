@@ -255,9 +255,9 @@ async def get_dashboard_insights(
 
     Returns ``{generatedAt, platform, includeArchived, cards}``. ``cards`` holds
     installHealth, managementToolLogs, checkinGaps, rebootDebt, protectionGaps,
-    storage, osCurrency, softwareRisk, expiringCertificates, directoryServices
-    and connectivityProblems, plus managementToolErrors, the old name of
-    managementToolLogs, kept for one release. Each card carries its own ``generatedAt``, and a
+    storage, updateDebt, softwareRisk, expiringCertificates, directoryServices
+    and connectivityProblems, plus the old names managementToolErrors (for
+    managementToolLogs) and osCurrency (for updateDebt), kept for one release. Each card carries its own ``generatedAt``, and a
     card that failed server-side is ``{"error": "..."}``. App Usage has its own
     endpoint because it takes its own filters.
     """
