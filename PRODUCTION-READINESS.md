@@ -4,31 +4,19 @@ Status of the FastAPI tier against production hardening, and what remains.
 
 ## Done
 
-- **Settings store self-provisions.** The `app_settings` table is created idempotently on startup in `main.py` (`ensure_performance_indexes`) and is also listed in `schemas/run-migrations.ps1` and `schemas/011-app-settings.sql`. No manual step is required for the table to exist on a running container.
-- **Disable-auth is visible.** When `DISABLE_AUTH` is set, the API logs a prominent security warning at startup (in addition to the per-request bypass). This must never be set in production.
-- **Rate limiting, in-memory caching, parameterized SQL, CORS, request validation** are in place.
+- **Schema migrations are versioned.** Alembic owns the schema: migrations live in `alembic/versions` (`0001_baseline.py` onward) and are recorded in the `alembic_version` table. `run_migrations()` in `migrations.py` upgrades to head from the application lifespan in `main.py` before the app serves traffic, replacing the old ad-hoc startup DDL and the hand-maintained migration runner. The `app_settings` table is created idempotently by `0001_baseline.py`, so no manual step is required for it to exist on a running container.
+- **Connection pooling.** `dependencies.py` builds a bounded DBUtils `PooledDB` over pg8000 (`DB_POOL_MIN`, default 2; `DB_POOL_MAX`, default 40, sized to the request threadpool). Connections are returned with a rollback (`reset=True`), and dropped sockets, including a bare `OSError` from a NAT idle drop, are reconnected on borrow through the `failures` list rather than a `SELECT 1` ping, which pg8000 does not support. TCP keepalive holds idle sockets open. `tests/test_db_pool.py` covers it.
+- **Disable-auth is guarded.** When `DISABLE_AUTH` is set, the API logs a prominent security warning at startup, and `assert_auth_enabled_for_prod` refuses to start when `APP_ENV` names a production or staging environment or real auth secrets are configured. It must never be set in production.
+- **Rate limiting, in-memory caching, parameterized SQL, CORS, request validation** are in place. Queries live as `.sql` files under `sql/`.
 
 ## Remaining — priority order
 
-### 1. Connection pooling (highest impact)
+### 1. Auth model still grants full access to legacy credentials
 
-`get_db_connection()` in `dependencies.py` opens a **new pg8000 connection per request** (TLS handshake to Azure Postgres each time). Under conference / fleet load this is the first thing that will saturate.
+`verify_authentication` in `dependencies.py` resolves every request to a principal with a list of scopes. Per-client API keys (`X-API-Key`, managed under `/admin` in `routers/api_keys.py`) and OIDC bearer tokens (`oidc_auth.py`, inert until `ENABLE_OIDC_AUTH` and its issuers and audience are configured) are scope-limited. The legacy credentials, `X-Internal-Secret` and the client passphrase, still receive every scope for backward compatibility, so anything holding them is fully authorized.
 
-This is deliberately **not** changed here because a pooling rewrite must be validated against the live database before a demo — a mis-handled pool (connections not returned on exception, stale sockets) causes outages. Recommended approach when validated:
+Writing org settings with `PUT /api/v1/settings` accepts only the internal secret (`require_internal_secret` in `routers/settings.py`); the admin-role check itself is enforced **upstream** in the Next.js proxy. Treat this as a known v1 constraint. Moving callers onto scoped API keys or OIDC, then narrowing the legacy credentials, closes it.
 
-- Introduce a small bounded pool (e.g. `DB_POOL_SIZE`, default conservative) guarding pg8000 connections behind a thread-safe queue.
-- Retrofit the per-request `conn.close()` call sites to return-to-pool semantics (wrap the connection, or centralize acquire/release in a context manager) — this is the part that needs care, since routers currently call `conn.close()` directly.
-- Add a liveness check (`SELECT 1`) on checkout and discard dead connections.
-- Load-test the bulk endpoints before/after.
+### 2. WebPubSub
 
-### 2. Auth model is a single shared secret
-
-There is no per-user identity or RBAC on the API. Anything holding `X-Internal-Secret` (or the client passphrase) is fully authorized, including writing org settings via `PUT /api/v1/settings`. Settings write-gating is enforced **upstream** in the Next.js proxy (admin role check) — document this and treat it as a known v1 constraint. If stronger control is needed later, forward the session principal in a header and enforce server-side.
-
-### 3. WebPubSub
-
-Confirm `EVENTS_CONNECTION` / WebPubSub is configured in the deployed environment so real-time event updates work, rather than the mock fallback in `routers/health.py`. Otherwise the dashboard falls back to polling.
-
-### 4. Migration runner is stale
-
-`schemas/run-migrations.ps1` lists only a subset of migrations (001–004 + 011). The authoritative provisioning path is the idempotent startup-ensure in `main.py`. Before relying on the runner for a fresh database, reconcile its list with the actual `NNN-*.sql` files (note: some older migrations use non-idempotent `ALTER TABLE`, so a naive glob-all is unsafe).
+Confirm `EVENTS_CONNECTION` is configured in the deployed environment so real-time event updates work. Without it, the negotiate endpoint in `routers/health.py` returns an error instead of a token (or a placeholder URL when the Web PubSub SDK is missing), and the dashboard falls back to polling.
