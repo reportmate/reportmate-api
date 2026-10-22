@@ -253,8 +253,8 @@ QUERY_MERGE: Dict[str, Dict[str, Any]] = {
     "management_tool_messages": {"kind": "group", "key": ("message", "tool"), "sum": ("devices", "lines"),
                                  "union": ("platforms",), "least": ("sample_serial",), "max": ("last_hour",),
                                  "sort": lambda r: (-_int(r.get("devices")), -_int(r.get("lines")), r["message"])},
-    "certificates_soonest": {"kind": "group", "key": ("cn",), "sum": ("devices",), "min": ("days",),
-                             "sort": lambda r: (float(r.get("days") or 0), r["cn"])},
+    "certificates_soonest": {"kind": "group", "key": ("cn", "issuer"), "sum": ("devices",), "min": ("days",),
+                             "sort": lambda r: (float(r.get("days") or 0), r["cn"], r.get("issuer") or "")},
     "os_versions": {"kind": "group",
                     "key": ("os_platform", "os_name", "edition", "display_version", "version", "build", "feature_update"),
                     "sum": ("devices",)},
@@ -1052,6 +1052,8 @@ def shape_certificates(
             "devices": _int(row.get("expiring_devices")),
             "link": link("/security", certs="expiring"),
         },
+        # Devices holding an expired actionable certificate. The key keeps its
+        # old name so existing clients keep reading it.
         "expiredUser": {
             "devices": _int(row.get("expired_user_devices")),
             "link": link("/security", certs="expired"),
@@ -1059,6 +1061,7 @@ def shape_certificates(
         "soonest": [
             {
                 "commonName": r["cn"],
+                "issuer": r.get("issuer") or None,
                 "daysUntilExpiry": int(math.floor(float(r.get("days") or 0) + 0.5)),
                 "devices": _int(r.get("devices")),
                 "link": link("/security", certSearch=r["cn"], certStatus="expiring"),

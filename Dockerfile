@@ -29,6 +29,7 @@ COPY pagination.py .
 COPY rate_limit.py .
 COPY log_tails.py .
 COPY install_status.py .
+COPY certificate_class.py .
 COPY dashboard_insights.py .
 COPY routers/ ./routers/
 COPY sql/ ./sql/

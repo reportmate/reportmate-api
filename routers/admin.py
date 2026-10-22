@@ -8,6 +8,7 @@ from typing import Any, Dict, List, Optional
 from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import StreamingResponse
 
+from certificate_class import stamp_certificates as _stamp_certificates
 from install_status import (
     stamp_items as _stamp_install_items,
     _CIMIAN_ERROR_RE,
@@ -1319,6 +1320,83 @@ def reclassify_stored_installs(
     except Exception as e:
         logger.error(f"Failed to reclassify stored installs: {e}")
         raise HTTPException(status_code=500, detail=f"Failed to reclassify stored installs: {e}")
+
+
+@router.post("/admin/security/certificates/reclassify", dependencies=[Depends(verify_authentication)], tags=["admin"])
+def reclassify_stored_certificates(
+    batch: int = Query(default=100, ge=1, le=500, description="Rows to read per batch; the write is one statement per changed row"),
+    limit: int | None = Query(default=None, ge=1, description="Stop after this many rows, for a rehearsal against part of the fleet"),
+):
+    """
+    Re-run the certificate classifier over stored security rows.
+
+    Ingest stamps every certificate with its class (actionable, system-managed
+    or trust-store), a readable name, the issuer's name and its expiry as an
+    epoch, so a classifier change reaches a device only on its next check-in.
+    This applies the current classifier to what is already stored. It calls the
+    same function ingest calls and is idempotent: a row whose stamps already
+    match is left untouched.
+
+    Batched and manual, never automated: security rows are large and the
+    database is IOPS-constrained.
+    """
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+
+        scanned = 0
+        changed = 0
+        last_id = 0
+        classes: Dict[str, int] = {}
+
+        while True:
+            remaining = None if limit is None else max(0, limit - scanned)
+            if remaining == 0:
+                break
+            size = batch if remaining is None else min(batch, remaining)
+            cursor.execute(
+                """
+                SELECT s.id, s.data, d.platform
+                FROM security s
+                LEFT JOIN devices d ON d.serial_number = s.device_id
+                WHERE s.id > %s
+                ORDER BY s.id
+                LIMIT %s
+                """,
+                (last_id, size),
+            )
+            rows = cursor.fetchall()
+            if not rows:
+                break
+
+            for row_id, data, platform in rows:
+                last_id = row_id
+                scanned += 1
+                if not isinstance(data, dict) or not isinstance(data.get("certificates"), list):
+                    continue
+
+                stamped = _stamp_certificates(data, platform or "")
+                for cert in stamped["certificates"]:
+                    if isinstance(cert, dict):
+                        classes[cert["class"]] = classes.get(cert["class"], 0) + 1
+                if json.dumps(data, sort_keys=True) == json.dumps(stamped, sort_keys=True):
+                    continue
+
+                cursor.execute(
+                    "UPDATE security SET data = %s::jsonb, updated_at = %s WHERE id = %s",
+                    (json.dumps(stamped), datetime.now(timezone.utc), row_id),
+                )
+                changed += 1
+
+            conn.commit()
+
+        conn.close()
+        invalidate_caches()
+        logger.info(f"Reclassified stored certificates: scanned={scanned} changed={changed} classes={classes}")
+        return {"success": True, "scanned": scanned, "changed": changed, "certificates": classes}
+    except Exception as e:
+        logger.error(f"Failed to reclassify stored certificates: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to reclassify stored certificates: {e}")
 
 
 @router.get("/admin/orphans", dependencies=[Depends(verify_authentication)], tags=["admin"])

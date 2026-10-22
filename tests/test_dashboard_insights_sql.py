@@ -168,8 +168,35 @@ SECURITY = {
                 "isExpired": False,
                 "daysUntilExpiry": 45,
             },
+            # Rotates itself daily: never counted, however close its expiry.
+            {
+                "commonName": "0f1e2d3c-4b5a-6978-8a9b-0c1d2e3f4a5b",
+                "class": "system-managed",
+                "isExpiringSoon": True,
+                "isExpired": False,
+                "daysUntilExpiry": 0,
+                "notAfterEpoch": int((NOW + timedelta(hours=12)).timestamp()),
+            },
+            # An expired OS root is not anyone's to renew.
+            {
+                "commonName": "SAMPLE Public Root",
+                "class": "trust-store",
+                "isExpired": True,
+                "daysUntilExpiry": -400,
+            },
+            # Collected as 6 days left, expired since: the epoch wins over the
+            # frozen days, so it counts as expired and not as expiring.
+            {
+                "commonName": "SAMPLE Device",
+                "class": "actionable",
+                "isExpiringSoon": True,
+                "isExpired": False,
+                "daysUntilExpiry": 6,
+                "notAfterEpoch": int((NOW - timedelta(days=10)).timestamp()),
+            },
         ],
-        "certificateSummary": {"userExpiredCount": 1},
+        # The runner's own summary is ignored now; its split never held.
+        "certificateSummary": {"userExpiredCount": 0},
         "securityCves": [
             {"status": "Unpatched", "severity": "Critical", "activelyExploited": True}
         ],
@@ -191,6 +218,14 @@ SECURITY = {
                 "isExpiringSoon": True,
                 "isExpired": True,
                 "daysUntilExpiry": -3,
+            },
+
+            # The same certificate in a second Windows store view counts once.
+            {
+                "commonName": "SAMPLE Wi-Fi",
+                "isExpiringSoon": True,
+                "isExpired": False,
+                "daysUntilExpiry": 5,
             },
         ],
     },
@@ -593,10 +628,11 @@ def test_software_risk(insights):
 def test_expiring_certificates(insights):
     card = insights.compute_insights("all", False)["cards"]["expiringCertificates"]
     assert (card["expiring"]["certificates"], card["expiring"]["devices"]) == (2, 2)
-    assert card["expiredUser"]["devices"] == 1
+    assert card["expiredUser"]["devices"] == 2
     assert card["soonest"] == [
         {
             "commonName": "SAMPLE Wi-Fi",
+            "issuer": None,
             "daysUntilExpiry": 5,
             "devices": 2,
             "link": {

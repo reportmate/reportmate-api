@@ -119,32 +119,20 @@ SELECT DISTINCT ON (d.serial_number)
     -- Remote Access: RDP (Windows)
     COALESCE((sec.data->'rdp'->>'isEnabled')::boolean, false) as rdp_enabled,
 
-    -- Certificates: prefer client-computed summary when present, fall back to JSONB scan
-    COALESCE(
-        (sec.data->'certificateSummary'->>'totalCount')::int,
-        CASE WHEN jsonb_typeof(sec.data->'certificates') = 'array'
-             THEN jsonb_array_length(sec.data->'certificates') END,
-        0
-    ) as certificate_count,
-    COALESCE(
-        (sec.data->'certificateSummary'->>'expiredCount')::int,
-        CASE WHEN jsonb_typeof(sec.data->'certificates') = 'array' THEN
-            (SELECT count(*)::int FROM jsonb_array_elements(sec.data->'certificates') cert
-             WHERE (cert->>'isExpired')::boolean = true)
-        END,
-        0
-    ) as expired_cert_count,
-    COALESCE(
-        (sec.data->'certificateSummary'->>'expiringSoonCount')::int,
-        CASE WHEN jsonb_typeof(sec.data->'certificates') = 'array' THEN
-            (SELECT count(*)::int FROM jsonb_array_elements(sec.data->'certificates') cert
-             WHERE (cert->>'isExpiringSoon')::boolean = true)
-        END,
-        0
-    ) as expiring_soon_cert_count,
-    -- Split expired into user-managed vs OS-bundled roots so the UI can de-noise OS rotations
-    COALESCE((sec.data->'certificateSummary'->>'userExpiredCount')::int, 0) as user_expired_cert_count,
-    COALESCE((sec.data->'certificateSummary'->>'osRootExpiredCount')::int, 0) as os_root_expired_cert_count,
+    -- Certificates: counted from the certificates array, one per distinct
+    -- certificate per device (Windows lists one in several store views), by the
+    -- class certificate_class.py stamped at ingest (unstamped = actionable).
+    -- Expiry is worked out now from notAfterEpoch; daysUntilExpiry and the
+    -- runner's certificateSummary are frozen at collection time.
+    COALESCE(cs.total_count, 0) as certificate_count,
+    COALESCE(cs.actionable_expired, 0) as expired_cert_count,
+    COALESCE(cs.actionable_expiring, 0) as expiring_soon_cert_count,
+    COALESCE(cs.actionable_expired, 0) as user_expired_cert_count,
+    COALESCE(cs.trust_expired, 0) as os_root_expired_cert_count,
+    COALESCE(cs.actionable_count, 0) as actionable_cert_count,
+    COALESCE(cs.system_count, 0) as system_managed_cert_count,
+    COALESCE(cs.trust_count, 0) as trust_store_cert_count,
+    COALESCE(cs.system_expired, 0) as system_managed_expired_cert_count,
 
     -- Vulnerabilities: read from the securityCves array (top-level cveCount was never populated by the client)
     CASE WHEN jsonb_typeof(sec.data->'securityCves') = 'array' THEN COALESCE((
@@ -196,6 +184,38 @@ SELECT DISTINCT ON (d.serial_number)
 FROM devices d
 LEFT JOIN security sec ON d.serial_number = sec.device_id
 LEFT JOIN inventory inv ON d.serial_number = inv.device_id
+LEFT JOIN LATERAL (
+    SELECT
+        COUNT(*)::int AS total_count,
+        COUNT(*) FILTER (WHERE cls = 'actionable')::int AS actionable_count,
+        COUNT(*) FILTER (WHERE cls = 'system-managed')::int AS system_count,
+        COUNT(*) FILTER (WHERE cls = 'trust-store')::int AS trust_count,
+        COUNT(*) FILTER (WHERE cls = 'actionable' AND expired)::int AS actionable_expired,
+        COUNT(*) FILTER (WHERE cls = 'actionable' AND expiring)::int AS actionable_expiring,
+        COUNT(*) FILTER (WHERE cls = 'system-managed' AND expired)::int AS system_expired,
+        COUNT(*) FILTER (WHERE cls = 'trust-store' AND expired)::int AS trust_expired
+    FROM (
+        SELECT DISTINCT ON (cert_key) cls, expired, expiring
+        FROM (
+            SELECT
+                COALESCE(NULLIF(cert->>'thumbprint', ''), NULLIF(cert->>'sha1', ''),
+                         COALESCE(cert->>'serialNumber', '') || '|' || COALESCE(cert->>'issuer', '') || '|' || COALESCE(cert->>'commonName', '')) AS cert_key,
+                COALESCE(cert->>'class', 'actionable') AS cls,
+                CASE WHEN jsonb_typeof(cert->'notAfterEpoch') = 'number'
+                     THEN (cert->>'notAfterEpoch')::numeric < EXTRACT(EPOCH FROM NOW())
+                     ELSE COALESCE(LOWER(cert->>'isExpired') IN ('true', '1'), FALSE) END AS expired,
+                CASE WHEN jsonb_typeof(cert->'notAfterEpoch') = 'number'
+                     THEN (cert->>'notAfterEpoch')::numeric >= EXTRACT(EPOCH FROM NOW())
+                      AND (cert->>'notAfterEpoch')::numeric <= EXTRACT(EPOCH FROM NOW() + INTERVAL '30 days')
+                     ELSE COALESCE(LOWER(cert->>'isExpiringSoon') IN ('true', '1'), FALSE)
+                      AND NOT COALESCE(LOWER(cert->>'isExpired') IN ('true', '1'), FALSE) END AS expiring
+            FROM jsonb_array_elements(
+                CASE WHEN jsonb_typeof(sec.data->'certificates') = 'array' THEN sec.data->'certificates' ELSE '[]'::jsonb END) cert
+            WHERE jsonb_typeof(cert) = 'object'
+        ) raw
+        ORDER BY cert_key, CASE cls WHEN 'actionable' THEN 0 WHEN 'system-managed' THEN 1 ELSE 2 END
+    ) one_per_cert
+) cs ON TRUE
 WHERE d.serial_number IS NOT NULL
     AND d.serial_number NOT LIKE 'TEST-%%'
     AND d.serial_number != 'localhost'
