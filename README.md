@@ -63,6 +63,26 @@ az account get-access-token --resource api://reportmate --query accessToken -o t
 
 Only asymmetric signatures (`RS*`/`ES*`) are accepted; `none` and `HS*` are refused to prevent algorithm-confusion attacks. Full env reference: `ENABLE_OIDC_AUTH`, `OIDC_ISSUERS`, `OIDC_AUDIENCE`, `OIDC_JWKS_URI`, `OIDC_ALGORITHMS`, `OIDC_ROLE_SCOPE_MAP`, `OIDC_DEFAULT_SCOPES`, `OIDC_LEEWAY`.
 
+## Dashboard insights
+
+The dashboard's insight cards (reboot debt, protection gaps, unmanaged devices, hardware at risk, install health, check-in gaps, OS currency, software risk, expiring certificates, local admin exposure, unused software, connectivity problems) come from one endpoint. Each card answers one question with a few counts and a short top-N list, so clients never download a bulk report to draw one. Ask for one platform or the whole fleet:
+
+```
+curl -H "X-API-Key: $REPORTMATE_KEY" "http://localhost:8000/api/v1/dashboard/insights?platform=macOS"
+```
+
+`platform` is `all` (the default), `macOS` or `Windows`, and `includeArchived=true` counts archived devices too. The response is `{generatedAt, platform, includeArchived, computeSeconds, cards}`, with one key per card in `cards`. Every number and list item the apps can click carries a `link` with the report path and the filter parameters it opens, for example:
+
+```
+{"count": 42, "link": {"path": "/system", "params": {"uptime": "30d+"}}}
+```
+
+A card that fails server-side comes back as `{"error": "..."}` and the other cards are unaffected.
+
+The cards are computed with aggregate SQL over the module tables, each card on its own pooled connection under a 20-second statement timeout, three at a time. The result is cached in process for five minutes per `platform` and `includeArchived`. One computation serves every request that arrives while it runs, and once a value exists an expired one is served immediately while a single background refresh replaces it. The `X-Insights-Cache` response header says `fresh`, `stale` or `miss`, and `Age` gives the value's age in seconds. A result with a failed card expires after a minute instead, so the card recovers sooner. The `all` entry is warmed in the background shortly after startup.
+
+These environment variables tune it: `INSIGHTS_CACHE_TTL_SECONDS` (300), `INSIGHTS_ERROR_TTL_SECONDS` (60), `INSIGHTS_STATEMENT_TIMEOUT_SECONDS` (20), `INSIGHTS_CONCURRENCY` (3, capped at a quarter of `DB_POOL_MAX`), `INSIGHTS_WARM_ON_STARTUP` (true) and `INSIGHTS_WARM_DELAY_SECONDS` (15).
+
 ## License
 
 AGPL-3.0. If you self-host this for your own fleet, you're done — use it, change it, run it, that's the whole point.

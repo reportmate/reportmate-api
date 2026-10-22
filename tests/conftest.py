@@ -20,6 +20,9 @@ os.environ.setdefault(
 )
 os.environ["REPORTMATE_PASSPHRASE"] = "test-passphrase"
 os.environ["API_INTERNAL_SECRET"] = "test-internal-secret"
+# The app warms the dashboard insights cache after startup; under TestClient
+# that would reach for a database the unit tests do not have.
+os.environ.setdefault("INSIGHTS_WARM_ON_STARTUP", "false")
 
 
 import pytest

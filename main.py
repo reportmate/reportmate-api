@@ -40,6 +40,7 @@ from routers import (
     events,
     fleet,
     health,
+    insights,
     inventory_state,
     settings,
     statistics,
@@ -66,7 +67,10 @@ async def lifespan(app: FastAPI):
         logger.info("[STARTUP] Database migrations at head")
     except Exception as e:
         logger.error(f"[STARTUP] Migrations failed: {e}")
+    # Fill the dashboard insights cache in the background; startup does not wait.
+    insights.start_warmup()
     yield
+    insights.stop_warmup()
     # Drain the connection pool on shutdown.
     close_db_pool()
 
@@ -202,6 +206,7 @@ for _router_mod in (
     fleet,
     events,
     statistics,
+    insights,
     admin,
     settings,
     api_keys,
@@ -284,6 +289,7 @@ async def root():
             "events_submit": "/api/v1/events (POST)",
             "negotiate": "/api/v1/negotiate",
             "dashboard": "/api/v1/dashboard",
+            "dashboard_insights": "/api/v1/dashboard/insights",
         },
     }
 
