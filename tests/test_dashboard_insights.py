@@ -229,14 +229,19 @@ def test_directory_services_shape_and_links():
     row = {"devices": 9, "cloud_joined": 3, "domain_joined": 4, "trusted": 2, "unconfirmed": 1, "broken": 1,
            "standard": 1, "unjoined": 1, "extra_admins": 2, "shared": 1, "assigned": 5}
     card = di.shape_directory_services(row, "macOS")
-    assert [s["label"] for s in card["segments"]] == ["Cloud Joined", "Domain Joined", "Standard", "Unjoined"]
+    assert set(card) == {"total", "segments", "extraAdmins", "shared", "assigned"}
+    assert card["total"] == 9
+    assert [(s["key"], s["label"]) for s in card["segments"]] == [
+        ("cloud", "Cloud Joined"), ("domain", "Domain Joined"), ("standard", "Standard"), ("unjoined", "Unjoined"),
+    ]
     domain = card["segments"][1]
-    assert [(t["key"], t["count"]) for t in domain["trust"]] == [("Trusted", 2), ("Unconfirmed", 1), ("Broken", 1)]
-    assert domain["link"] == {"path": "/identity", "params": {"directory": "Domain Joined", "platform": "macOS"}}
-    assert domain["trust"][0]["link"]["params"] == {"directory": "Trusted", "platform": "macOS"}
-    assert "views" not in card
+    assert [(c["key"], c["label"], c["count"]) for c in domain["children"]] == [
+        ("trusted", "Trusted", 2), ("unconfirmed", "Unconfirmed", 1), ("broken", "Broken", 1),
+    ]
+    assert domain["link"] == {"path": "/identity", "params": {"directory": "domain", "platform": "macOS"}}
+    assert domain["children"][0]["link"]["params"] == {"directory": "trusted", "platform": "macOS"}
     everywhere = di.shape_directory_services(row)
-    assert everywhere["segments"][0]["link"]["params"] == {"directory": "Cloud Joined"}
+    assert everywhere["segments"][0]["link"]["params"] == {"directory": "cloud"}
     assert everywhere["assigned"] == {"count": 5, "link": {"path": "/identity", "params": {"usage": "assigned"}}}
 
 

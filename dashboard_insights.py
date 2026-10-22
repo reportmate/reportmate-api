@@ -912,18 +912,18 @@ def card_certificates(run: Runner, scope: InsightsScope) -> Dict[str, Any]:
 
 # ── Directory Services ──────────────────────────────────────────
 
-#: The Identity report Directory Services widget: its categories, in its order,
-#: and the trust breakdown of Domain Joined. Keys are the report own labels.
+#: The Identity report Directory Services widget: its categories and labels,
+#: in its order, and the trust breakdown of Domain Joined. (key, label, column)
 DIRECTORY_SEGMENTS = (
-    ("Cloud Joined", "cloud_joined"),
-    ("Domain Joined", "domain_joined"),
-    ("Standard", "standard"),
-    ("Unjoined", "unjoined"),
+    ("cloud", "Cloud Joined", "cloud_joined"),
+    ("domain", "Domain Joined", "domain_joined"),
+    ("standard", "Standard", "standard"),
+    ("unjoined", "Unjoined", "unjoined"),
 )
 DIRECTORY_TRUST = (
-    ("Trusted", "trusted"),
-    ("Unconfirmed", "unconfirmed"),
-    ("Broken", "broken"),
+    ("trusted", "Trusted", "trusted"),
+    ("unconfirmed", "Unconfirmed", "unconfirmed"),
+    ("broken", "Broken", "broken"),
 )
 
 
@@ -934,18 +934,18 @@ def _scoped(platform: str) -> Optional[str]:
 def shape_directory_services(row: Dict[str, Any], platform: str = "all") -> Dict[str, Any]:
     p = _scoped(platform)
 
-    def segment(key: str, col: str) -> Dict[str, Any]:
-        return {"key": key, "label": key, "count": _int(row.get(col)),
+    def segment(key: str, label: str, col: str) -> Dict[str, Any]:
+        return {"key": key, "label": label, "count": _int(row.get(col)),
                 "link": link("/identity", directory=key, platform=p)}
 
     segments = []
-    for key, col in DIRECTORY_SEGMENTS:
-        entry = segment(key, col)
-        if key == "Domain Joined":
-            entry["trust"] = [segment(k, c) for k, c in DIRECTORY_TRUST]
+    for key, label, col in DIRECTORY_SEGMENTS:
+        entry = segment(key, label, col)
+        if key == "domain":
+            entry["children"] = [segment(k, l, c) for k, l, c in DIRECTORY_TRUST]
         segments.append(entry)
     return {
-        "devices": _int(row.get("devices")),
+        "total": _int(row.get("devices")),
         "segments": segments,
         "extraAdmins": {"count": _int(row.get("extra_admins")), "link": link("/identity", admins="extra", platform=p)},
         "shared": {"count": _int(row.get("shared")), "link": link("/identity", usage="shared", platform=p)},

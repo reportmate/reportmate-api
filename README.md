@@ -101,7 +101,7 @@ curl -H "X-API-Key: $REPORTMATE_KEY" "http://localhost:8000/api/v1/dashboard/ins
 
 `tool` is the log root key from the card's link, `level` is `error` or `warning`, and `hours` is 1 to 168. The response is `{tool, level, hours, platform, generatedAt, devices}`. Each device has `serialNumber`, `deviceName`, `platform`, `count`, `lastAt` (the start of the latest UTC hour with such a line) and a `link` to its log viewer. It is cached like the cards.
 
-The Directory Services card uses the Identity report's Directory Services classification and names: Cloud Joined, Domain Joined (split into Trusted, Unconfirmed and Broken by domain trust), Standard and Unjoined. Each segment links to `/identity?directory=<name>`.
+The Directory Services card uses the Identity report's Directory Services classification and names: Cloud Joined, Domain Joined (split into Trusted, Unconfirmed and Broken by domain trust), Standard and Unjoined. The card is `{total, segments, extraAdmins, shared, assigned}`. Its segments are `cloud`, `domain` (with `children` `trusted`, `unconfirmed` and `broken`), `standard` and `unjoined`, each with the report's label, and each links to `/identity?directory=<key>`.
 
 These environment variables tune it: `INSIGHTS_CACHE_TTL_SECONDS` (300), `INSIGHTS_ERROR_TTL_SECONDS` (60), `INSIGHTS_REFRESH_INTERVAL_SECONDS` (240), `INSIGHTS_REFRESH_STAGGER_SECONDS` (1), `INSIGHTS_BACKGROUND_REFRESH` (true), `INSIGHTS_WARM_DELAY_SECONDS` (15), `INSIGHTS_STATEMENT_TIMEOUT_SECONDS` (20), `INSIGHTS_CONCURRENCY` (3, capped at a quarter of `DB_POOL_MAX`, which bounds on-demand computations) and `INSIGHTS_CACHE_MAX_ENTRIES` (256).
 

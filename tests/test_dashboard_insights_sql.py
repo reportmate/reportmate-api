@@ -681,26 +681,27 @@ def test_storage(insights):
 
 def test_directory_services(insights):
     card = insights.compute_card("directoryServices")
-    assert card["devices"] == 7
+    assert card["total"] == 7
     segments = {seg["key"]: seg for seg in card["segments"]}
-    assert [seg["key"] for seg in card["segments"]] == ["Cloud Joined", "Domain Joined", "Standard", "Unjoined"]
-    assert {k: v["count"] for k, v in segments.items()} == {
-        "Cloud Joined": 2, "Domain Joined": 3, "Standard": 1, "Unjoined": 1,
-    }
-    assert {t["key"]: t["count"] for t in segments["Domain Joined"]["trust"]} == {
-        "Trusted": 1, "Unconfirmed": 1, "Broken": 1,
-    }
-    assert segments["Cloud Joined"]["link"] == {"path": "/identity", "params": {"directory": "Cloud Joined"}}
-    assert segments["Domain Joined"]["trust"][2]["link"]["params"] == {"directory": "Broken"}
+    assert [(seg["key"], seg["label"]) for seg in card["segments"]] == [
+        ("cloud", "Cloud Joined"), ("domain", "Domain Joined"), ("standard", "Standard"), ("unjoined", "Unjoined"),
+    ]
+    assert {k: v["count"] for k, v in segments.items()} == {"cloud": 2, "domain": 3, "standard": 1, "unjoined": 1}
+    assert [(c["key"], c["label"], c["count"]) for c in segments["domain"]["children"]] == [
+        ("trusted", "Trusted", 1), ("unconfirmed", "Unconfirmed", 1), ("broken", "Broken", 1),
+    ]
+    assert all("children" not in seg for k, seg in segments.items() if k != "domain")
+    assert segments["cloud"]["link"] == {"path": "/identity", "params": {"directory": "cloud"}}
+    assert segments["domain"]["children"][2]["link"]["params"] == {"directory": "broken"}
     assert (card["extraAdmins"]["count"], card["shared"]["count"], card["assigned"]["count"]) == (2, 1, 2)
 
 
 def test_directory_services_follows_the_platform_toggle(insights):
     card = insights.compute_card("directoryServices", "Windows")
     assert {seg["key"]: seg["count"] for seg in card["segments"]} == {
-        "Cloud Joined": 1, "Domain Joined": 1, "Standard": 0, "Unjoined": 1,
+        "cloud": 1, "domain": 1, "standard": 0, "unjoined": 1,
     }
-    assert card["segments"][3]["link"]["params"] == {"directory": "Unjoined", "platform": "Windows"}
+    assert card["segments"][3]["link"]["params"] == {"directory": "unjoined", "platform": "Windows"}
     assert card["extraAdmins"]["link"]["params"] == {"admins": "extra", "platform": "Windows"}
 
 
