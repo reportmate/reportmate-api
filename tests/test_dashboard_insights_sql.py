@@ -16,6 +16,8 @@ from urllib.parse import urlparse
 
 import pytest
 
+from log_tails import stamp_log_summaries
+
 _TEST_DB = os.getenv("TEST_DATABASE_URL")
 
 pytestmark = pytest.mark.skipif(
@@ -216,36 +218,59 @@ SECURITY = {
     "SAMPLE11": {"fileVault": {"enabled": False}},
 }
 
+def munki_line(when, text):
+    return when.strftime("%b %d %Y %H:%M:%S +0000 ") + text
+
+
+def convention_line(when, level, text):
+    return when.strftime("[%Y-%m-%d %H:%M:%S] ") + f"{level}  {text}"
+
+
+def root(tool, lines, name="", file="run.log"):
+    return {"tool": tool, "name": name, "tails": [{"file": file, "lines": lines}]}
+
+
+# Management log tails. Ingest stamps levelSummary on each root; the seed
+# runs the same stamp so the card reads what production would.
 MANAGEMENT = {
-    "SAMPLE1": {"mdmEnrollment": {"enrolled": "true"}},
-    "SAMPLE2": {"mdmEnrollment": {"isEnrolled": False}},
-    "SAMPLE8": {"mdm_enrollment": {"is_enrolled": True}},
-    "SAMPLE9": {"mdmEnrollment": {}},
-    # Silent past the 7-day cutoff, and never seen at all: both land in 7d+.
-    "SAMPLE10": {"mdmEnrollment": {"isEnrolled": False}},
-    "SAMPLE7": {"mdmEnrollment": {"isEnrolled": False}},
-    "SAMPLE11": {"mdmEnrollment": {"isEnrolled": False}},
+    "SAMPLE1": {"logs": {"roots": [
+        root("installs", [
+            munki_line(ago(hours=1), "ERROR: Download of SAMPLE App failed: 404"),
+            munki_line(ago(hours=2), "ERROR: Could not process item SAMPLE Tool"),
+            munki_line(ago(hours=2), "WARNING: SAMPLE warning"),
+            munki_line(ago(days=3), "ERROR: An old failure outside the window"),
+            munki_line(ago(hours=1), "Finished session"),
+        ], name="Managed Installs"),
+        root("mdm", [ago(hours=2).strftime("%Y-%m-%d %H:%M:%S") + ":123 | IntuneMdmAgent | E | 77 | SAMPLE | check-in failed"],
+             name="Intune"),
+    ]}},
+    "SAMPLE2": {"logs": {"roots": [
+        root("installs", [
+            munki_line(ago(hours=3), "ERROR: Download of SAMPLE App failed: 500"),
+            munki_line(ago(hours=3), "WARNING: Another SAMPLE warning"),
+        ]),
+    ]}},
+    "SAMPLE8": {"logs": {"roots": [
+        root("installs", [convention_line(ago(hours=1), "ERROR", r"Failed to read C:\ProgramData\SAMPLE\cache.json")]),
+        root("bootstrap", ['<![LOG[SAMPLE step failed]LOG]!><time="' + ago(hours=3).strftime("%H:%M:%S") + '.000+000" date="'
+                           + ago(hours=3).strftime("%m-%d-%Y") + '" component="SAMPLE" context="" type="3" thread="1" file="">'],
+             file="bootstrap.log"),
+    ]}},
+    "SAMPLE11": {"logs": {"roots": [root("installs", [munki_line(ago(hours=1), "ERROR: archived device")])]}},
+}
+
+INVENTORY = {
+    "SAMPLE1": {"usage": "Shared", "catalog": "Lab"},
+    "SAMPLE2": {"usage": "Assigned", "catalog": "Staff"},
+    "SAMPLE8": {"usage": "Assigned", "catalog": "Staff"},
 }
 
 HARDWARE = {
-    "SAMPLE1": {
-        "memory": {"totalFormatted": "8 GB"},
-        "processor": "Apple M1",
-        "storage": [{"capacity": 1000, "freeSpace": 50, "isInternal": True}],
-    },
-    "SAMPLE2": {
-        "memory": 17179869184,
-        "processor": {"name": "Intel Core i5"},
-        "storage": [
-            {"size": 1000, "freeSpace": 500},
-            {"capacity": 1000, "freeSpace": 1, "isInternal": False},
-        ],
-    },
-    "SAMPLE8": {
-        "memory": {"physicalMemory": 8589934592},
-        "processor": "Intel Xeon",
-        "storage": "unknown",
-    },
+    "SAMPLE1": {"storage": [{"capacity": 1000, "freeSpace": 30, "isInternal": True}]},
+    "SAMPLE2": {"storage": [{"size": 1000, "freeSpace": 500},
+                            {"capacity": 1000, "freeSpace": 1, "isInternal": False}]},
+    "SAMPLE8": {"storage": [{"capacity": 512e9, "freeSpace": 40e9}]},
+    "SAMPLE9": {"drives": [{"capacity": 2e12, "freeSpace": 3e11}]},
 }
 
 INSTALLS = {
@@ -302,6 +327,7 @@ INSTALLS = {
                         "installedVersion": "1",
                         "latestVersion": "2",
                     },
+                    {"itemName": "Zoom", "reportmateStatus": "pending"},
                     {
                         "itemName": "7zip",
                         "reportmateStatus": "installed",
@@ -320,6 +346,8 @@ IDENTITY = {
         "users": [{"isAdmin": True}, {"isAdmin": True}, {"isAdmin": False}],
         "directoryServices": {},
     },
+    "SAMPLE2": {"users": [{"isAdmin": True}], "platformSSOUsers": {"deviceRegistered": True}},
+    "SAMPLE3": {"users": [{"isAdmin": True}], "directoryServices": {"activeDirectory": {"bound": True}}},
     "SAMPLE8": {
         "users": [{"isAdmin": True}] * 4,
         "directoryServices": {
@@ -346,14 +374,6 @@ NETWORK = {
         "active_connection": {"wifi_signal_strength": 80, "is_vpn_active": False},
         "vpnConnections": [{"name": "SAMPLE VPN", "status": "Connected"}],
     },
-}
-
-APPLICATIONS = {
-    "SAMPLE1": {
-        "installedApplications": [{"name": "Firefox.app"}, {"name": "Slack.app"}]
-    },
-    "SAMPLE2": {"installedApplications": [{"name": "Firefox"}, {"name": "Slack"}]},
-    "SAMPLE8": {"installedApplications": [{"name": "Firefox"}]},
 }
 
 USAGE = [
@@ -409,11 +429,11 @@ def seeded():
     for table, rows in (
         ("system", SYSTEM),
         ("security", SECURITY),
-        ("management", MANAGEMENT),
+        ("management", {k: stamp_log_summaries(v) for k, v in MANAGEMENT.items()}),
+        ("inventory", INVENTORY),
         ("hardware", HARDWARE),
         ("identity", IDENTITY),
         ("network", NETWORK),
-        ("applications", APPLICATIONS),
     ):
         for serial, data in rows.items():
             cur.execute(
@@ -470,7 +490,7 @@ def insights(seeded, monkeypatch):
     import dashboard_insights
 
     monkeypatch.setattr(dashboard_insights, "get_db_connection", lambda: _connect())
-    monkeypatch.setattr(dashboard_insights, "MIN_INSTALLS_FOR_LEAST_USED", 2)
+    monkeypatch.setattr(dashboard_insights, "_inventory_state_checked", None)
     return dashboard_insights
 
 
@@ -507,75 +527,6 @@ def test_protection_gaps(insights):
     assert card["gaps"][0]["key"] == "encryption"
     assert card["withThreats"]["count"] == 1
     assert card["criticalCves"]["count"] == 1
-
-
-def test_unmanaged_devices(insights):
-    card = insights.compute_insights("all", False)["cards"]["unmanagedDevices"]
-    assert card["devices"] == 6
-    assert card["unmanaged"]["count"] == 4
-    assert card["unmanaged"]["pct"] == 67
-    assert card["unmanaged"]["link"] == {
-        "path": "/management",
-        "params": {"enrolled": "0"},
-    }
-    assert {b["key"]: b["count"] for b in card["lastSeen"]} == {
-        "24h": 1,
-        "1-7d": 1,
-        "7d+": 2,
-    }
-    assert [d["serialNumber"] for d in card["recent"]] == [
-        "SAMPLE2", "SAMPLE9", "SAMPLE10", "SAMPLE7",
-    ]
-    assert card["recent"][3]["lastSeen"] is None
-    assert card["recent"][0]["link"] == {"path": "/device/SAMPLE2", "params": {}}
-
-
-def test_unmanaged_last_seen_cutoffs_are_24_hours_and_7_days(insights, monkeypatch):
-    conn = _connect()
-    cur = conn.cursor()
-    cur.execute("UPDATE devices SET last_seen = NOW() - INTERVAL '23 hours' WHERE serial_number = 'SAMPLE2'")
-    cur.execute("UPDATE devices SET last_seen = NOW() - INTERVAL '25 hours' WHERE serial_number = 'SAMPLE9'")
-    cur.execute("UPDATE devices SET last_seen = NOW() - INTERVAL '167 hours' WHERE serial_number = 'SAMPLE10'")
-    conn.commit()
-    try:
-        card = insights.compute_insights("all", False)["cards"]["unmanagedDevices"]
-        assert {b["key"]: b["count"] for b in card["lastSeen"]} == {"24h": 1, "1-7d": 2, "7d+": 1}
-    finally:
-        cur.execute("UPDATE devices SET last_seen = %s WHERE serial_number = 'SAMPLE2'", (NOW,))
-        cur.execute("UPDATE devices SET last_seen = %s WHERE serial_number = 'SAMPLE9'", (ago(days=3),))
-        cur.execute("UPDATE devices SET last_seen = %s WHERE serial_number = 'SAMPLE10'", (ago(days=10),))
-        conn.commit()
-        conn.close()
-
-
-def test_unmanaged_devices_platform_filter(insights):
-    card = insights.compute_insights("Windows", False)["cards"]["unmanagedDevices"]
-    assert (card["devices"], card["unmanaged"]["count"]) == (3, 2)
-
-
-def test_hardware_at_risk(insights):
-    card = insights.compute_insights("all", False)["cards"]["hardwareAtRisk"]
-    assert card["devices"] == 3
-    assert card["lowStorage"]["count"] == 1
-    assert card["lowMemory"]["count"] == 2
-    assert (card["intelMacs"]["count"], card["intelMacs"]["macs"]) == (1, 2)
-
-
-def test_install_health(insights):
-    card = insights.compute_insights("all", False)["cards"]["installHealth"]
-    assert card["withErrors"]["count"] == 2
-    assert card["withWarnings"]["count"] == 1
-    assert card["topFailing"] == [
-        {
-            "name": "Firefox",
-            "devices": 3,
-            "link": {
-                "path": "/installs",
-                "params": {"item": "Firefox", "filter": "errors"},
-            },
-        }
-    ]
-    assert card["silentAgents"]["count"] == 2
 
 
 def test_checkin_gaps(insights):
@@ -641,43 +592,6 @@ def test_expiring_certificates(insights):
     ]
 
 
-def test_local_admin_exposure(insights):
-    card = insights.compute_insights("all", False)["cards"]["localAdminExposure"]
-    assert card["extraAdmins"]["count"] == 2
-    assert {b["key"]: b["count"] for b in card["byAdminCount"]} == {
-        "2": 1,
-        "3": 0,
-        "4+": 1,
-    }
-    assert {j["key"]: j["count"] for j in card["join"]} == {
-        "entra": 1,
-        "domain": 0,
-        "hybrid": 1,
-        "workgroup": 1,
-    }
-    assert [(d["serialNumber"], d["admins"]) for d in card["topDevices"]] == [
-        ("SAMPLE8", 4),
-        ("SAMPLE1", 2),
-    ]
-
-
-def test_unused_software(insights):
-    card = insights.compute_insights("all", False)["cards"]["unusedSoftware"]
-    firefox, slack = insights.fold_name("Firefox"), insights.fold_name("Slack")
-    assert [
-        (a["name"], a["activeDevices"], a["installedDevices"])
-        for a in card["leastUsed"]
-    ] == [
-        (firefox, 1, 3),
-        (slack, 1, 2),
-    ]
-    assert [(a["name"], a["totalHours"]) for a in card["mostUsed"]] == [
-        (slack, 10.0),
-        (firefox, 3.0),
-    ]
-    assert card["mostUsed"][0]["link"]["params"] == {"days": "30"}
-
-
 def test_connectivity_problems(insights):
     card = insights.compute_insights("all", False)["cards"]["connectivityProblems"]
     assert card["devices"] == 3
@@ -686,6 +600,109 @@ def test_connectivity_problems(insights):
     assert card["onVpn"]["count"] == 2
 
 
+def test_install_health(insights):
+    card = insights.compute_card("installHealth")
+    assert (card["withErrors"]["count"], card["withWarnings"]["count"]) == (2, 1)
+    assert (card["errorItems"]["count"], card["warningItems"]["count"]) == (2, 1)
+    assert (card["pending"]["items"], card["pending"]["devices"]) == (1, 1)
+    assert card["pending"]["link"]["params"] == {"filter": "pending"}
+    assert card["silentAgents"]["count"] == 2
+    assert card["topFailing"] == [{
+        "name": "Firefox", "devices": 3,
+        "link": {"path": "/installs", "params": {"item": "Firefox", "filter": "errors"}},
+    }]
+    agents = {a["agent"]: a for a in card["byAgent"]}
+    munki, cimian = agents["munki"], agents["cimian"]
+    assert (munki["devices"], munki["withErrors"]["count"], munki["withWarnings"]["count"]) == (2, 1, 1)
+    assert (cimian["devices"], cimian["withErrors"]["count"], cimian["pending"]["items"]) == (1, 1, 1)
+    assert (munki["silentAgents"]["count"], cimian["silentAgents"]["count"]) == (1, 1)
+    assert munki["withErrors"]["link"]["params"] == {"filter": "errors", "agent": "munki"}
+    assert cimian["pending"]["link"]["params"] == {"filter": "pending", "agent": "cimian"}
+
+
+def test_install_health_platform_drops_the_other_agent(insights):
+    card = insights.compute_card("installHealth", "macOS")
+    assert [a["agent"] for a in card["byAgent"]] == ["munki"]
+    assert card["withErrors"]["count"] == 1
+
+
+def test_management_tool_errors(insights):
+    card = insights.compute_card("managementToolErrors")
+    tools = {t["name"]: t for t in card["tools"]}
+    assert set(tools) == {"Munki", "Cimian", "BootstrapMate", "Intune"}
+    munki = tools["Munki"]
+    assert (munki["devices"], munki["devicesWithErrors"], munki["devicesWithWarnings"]) == (2, 2, 2)
+    assert munki["errorLines"] == 3
+    assert munki["link"] == {"path": "/devices", "params": {"tool": "installs", "level": "error", "platform": "macOS"}}
+    assert tools["Cimian"]["devicesWithErrors"] == 1
+    assert tools["BootstrapMate"]["link"]["params"] == {"tool": "bootstrap", "level": "error"}
+    assert tools["Intune"]["devicesWithErrors"] == 1
+    assert card["tools"][0]["name"] == "Munki"
+
+    top = card["topErrors"][0]
+    assert (top["name"], top["devices"]) == ("Munki", 2)
+    assert "SAMPLE App failed" in top["message"] and "404" not in top["message"]
+    assert top["sampleDevice"]["link"] == {
+        "path": "/device/SAMPLE1",
+        "params": {"tab": "management", "tool": "installs", "level": "error"},
+    }
+    assert all("archived" not in m["message"] for m in card["topErrors"])
+    assert all("old failure" not in m["message"] for m in card["topErrors"])
+
+
+def test_storage(insights):
+    card = insights.compute_card("storage")
+    assert card["devices"] == 4
+    assert {b["key"]: b["count"] for b in card["freeSpace"]} == {"lt5": 1, "5-10": 1, "10-20": 1, "20+": 1}
+    assert card["freeSpace"][0]["link"] == {"path": "/hardware", "params": {"storage": "lt5"}}
+    assert card["lowStorage"]["count"] == 2
+    assert {p["platform"]: p["count"] for p in card["lowStorage"]["byPlatform"]} == {"macOS": 1, "Windows": 1}
+    assert card["lowStorage"]["byPlatform"][0]["link"]["params"] == {"storage": "low", "platform": "macOS"}
+    assert {c["key"]: c["count"] for c in card["capacity"]} == {"le256": 2, "512": 1, "1t": 0, "2t+": 1}
+    assert card["capacity"][3]["link"]["params"] == {"capacity": "2t+"}
+    assert [d["serialNumber"] for d in card["fullest"]] == ["SAMPLE1", "SAMPLE8", "SAMPLE9", "SAMPLE2"]
+    assert card["fullest"][0]["freePct"] == 3.0
+
+
+def test_directory_join(insights):
+    views = insights.compute_card("directoryJoin")["views"]
+
+    def seg(view):
+        return {s["key"]: s["count"] for s in views[view]["segments"]}
+
+    assert seg("all") == {"entra": 1, "domain": 1, "hybrid": 1, "workgroup": 2}
+    assert seg("windows") == {"entra": 1, "domain": 0, "hybrid": 1, "workgroup": 0}
+    assert seg("mac") == {"psso": 1, "bound": 1, "unbound": 1}
+    assert (views["all"]["extraAdmins"]["count"], views["all"]["shared"]["count"],
+            views["all"]["assigned"]["count"]) == (2, 1, 2)
+    assert views["windows"]["extraAdmins"]["count"] == 1
+    assert views["mac"]["assigned"]["count"] == 1
+    assert views["all"]["segments"][3]["link"] == {"path": "/identity", "params": {"join": "workgroup"}}
+    assert views["windows"]["segments"][3]["link"]["params"] == {"join": "workgroup", "platform": "Windows"}
+    assert views["mac"]["segments"][0]["link"]["params"] == {"directory": "psso", "platform": "macOS"}
+    assert views["mac"]["extraAdmins"]["link"]["params"] == {"admins": "extra", "platform": "macOS"}
+    assert views["windows"]["shared"]["link"]["params"] == {"usage": "shared", "platform": "Windows"}
+
+
+def test_app_usage(insights):
+    card = insights.compute_app_usage()
+    assert [(a["name"], a["totalHours"]) for a in card["apps"]] == [
+        (insights.fold_name("Slack"), 10.0), (insights.fold_name("Firefox"), 3.0),
+    ]
+    assert card["available"]["usages"] == [{"value": "Assigned", "devices": 2}, {"value": "Shared", "devices": 1}]
+    assert card["available"]["catalogs"] == [{"value": "Staff", "devices": 2}, {"value": "Lab", "devices": 1}]
+
+    scoped = insights.compute_app_usage("all", ["Assigned"], [], 30)
+    assert [(a["name"], a["totalHours"]) for a in scoped["apps"]] == [(insights.fold_name("Firefox"), 1.0)]
+    assert scoped["apps"][0]["link"]["params"] == {"days": "30", "usages": "Assigned"}
+    assert scoped["filters"] == {"usages": ["Assigned"], "catalogs": []}
+
+
 def test_include_archived_widens_the_fleet(insights):
-    card = insights.compute_insights("all", True)["cards"]["unmanagedDevices"]
-    assert card["unmanaged"]["count"] == 5
+    assert insights.compute_card("protectionGaps", "all", True)["devices"] == 5
+    assert insights.compute_card("protectionGaps", "all", False)["devices"] == 4
+
+
+def test_every_card_carries_generated_at(insights):
+    for key in insights.CARD_KEYS:
+        assert insights.compute_card(key)["generatedAt"]

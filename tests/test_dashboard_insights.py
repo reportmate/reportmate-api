@@ -35,6 +35,9 @@ def test_device_and_app_links_encode_the_path():
         "path": "/applications/usage/Adobe%20Photoshop%202026",
         "params": {"days": "30"},
     }
+    assert di.app_usage_link("SAMPLE", 7, ["Shared", "Lab"], ["Staff"], "macOS")["params"] == {
+        "days": "7", "usages": "Shared,Lab", "catalogs": "Staff", "platform": "macOS",
+    }
 
 
 def test_platform_normalization():
@@ -109,89 +112,6 @@ def test_protection_gaps_worst_first_and_ineligible_rows_dropped():
     assert card["criticalCves"]["link"]["params"] == {"cve": "critical"}
 
 
-def test_unmanaged_percentages_round_like_javascript():
-    rows = [
-        {
-            "platform": "macOS",
-            "devices": 4,
-            "unmanaged": 1,
-            "seen_24h": 1,
-            "seen_7d": 0,
-            "silent": 0,
-        },
-        {
-            "platform": "Windows",
-            "devices": 4,
-            "unmanaged": 0,
-            "seen_24h": 0,
-            "seen_7d": 0,
-            "silent": 0,
-        },
-    ]
-    card = di.shape_unmanaged(rows, [])
-    assert card["unmanaged"]["pct"] == 13  # 12.5 rounds up, as Math.round does
-    assert card["enrolledPct"] == 88
-    assert card["unmanaged"]["link"] == {
-        "path": "/management",
-        "params": {"enrolled": "0"},
-    }
-    assert [p["link"]["params"] for p in card["byPlatform"]] == [
-        {"enrolled": "0", "platform": "macOS"},
-        {"enrolled": "0", "platform": "Windows"},
-    ]
-    assert [b["link"]["params"] for b in card["lastSeen"]] == [
-        {"enrolled": "0", "lastSeen": "24h"},
-        {"enrolled": "0", "lastSeen": "1-7d"},
-        {"enrolled": "0", "lastSeen": "7d+"},
-    ]
-
-
-def test_install_health_links():
-    card = di.shape_install_health(
-        {"devices": 3, "with_errors": 2, "with_warnings": 1},
-        [{"name": "SAMPLE App", "devices": 2}],
-        silent_agents=1,
-    )
-    assert card["withErrors"]["link"]["params"] == {"filter": "errors"}
-    assert card["withWarnings"]["link"]["params"] == {"filter": "warnings"}
-    assert card["topFailing"][0]["link"]["params"] == {
-        "item": "SAMPLE App",
-        "filter": "errors",
-    }
-    assert card["silentAgents"] == {
-        "count": 1,
-        "thresholdDays": 7,
-        "link": {"path": "/installs", "params": {"stale": "1"}},
-    }
-
-
-def test_silent_agents_use_the_agent_the_device_runs():
-    from datetime import datetime, timedelta, timezone
-
-    seen = datetime(2026, 10, 22, 12, tzinfo=timezone.utc)
-    rows = [
-        {
-            "has_cimian": True,
-            "cimian_sessions": [{"end_time": (seen - timedelta(days=9)).isoformat()}],
-            "cimian_run": {},
-            "last_seen": seen,
-        },
-        {
-            "has_munki": True,
-            "munki_sessions": None,
-            "munki_run": {"endTime": (seen - timedelta(days=2)).isoformat()},
-            "last_seen": seen,
-        },
-        {
-            "has_munki": True,
-            "munki_sessions": [],
-            "munki_run": {"startTime": None},
-            "last_seen": seen,
-        },
-    ]
-    assert di.silent_agent_count(rows) == 1
-
-
 def test_checkin_gaps_reasons_and_links():
     card = di.shape_checkin_gaps(
         (5, 2, 1),
@@ -236,90 +156,6 @@ def test_certificates_soonest_link():
     assert card["expiredUser"]["link"]["params"] == {"certs": "expired"}
 
 
-def test_local_admins_join_links():
-    card = di.shape_local_admins(
-        [
-            {
-                "platform": "macOS",
-                "devices": 3,
-                "extra_admins": 1,
-                "admins_2": 1,
-                "admins_3": 0,
-                "admins_4_plus": 0,
-                "entra": 0,
-                "domain": 0,
-                "hybrid": 0,
-                "workgroup": 3,
-            }
-        ],
-        [
-            {
-                "serial": "SAMPLE1",
-                "name": "SAMPLE1-name",
-                "platform": "macOS",
-                "admins": 2,
-            }
-        ],
-    )
-    assert card["extraAdmins"]["link"]["params"] == {"admins": "extra"}
-    assert [b["link"]["params"] for b in card["byAdminCount"]] == [
-        {"admins": "2"},
-        {"admins": "3"},
-        {"admins": "4+"},
-    ]
-    assert {j["key"]: j["link"]["params"]["join"] for j in card["join"]} == {
-        "entra": "entra",
-        "domain": "domain",
-        "hybrid": "hybrid",
-        "workgroup": "workgroup",
-    }
-    assert card["workgroup"]["byPlatform"] == [
-        {
-            "platform": "macOS",
-            "count": 3,
-            "link": {"path": "/identity", "params": {"join": "workgroup"}},
-        }
-    ]
-    assert card["topDevices"][0]["link"] == {"path": "/device/SAMPLE1", "params": {}}
-
-
-def test_unused_software_needs_the_install_floor():
-    usage = [
-        {
-            "app": "Shelfware",
-            "key": "shelfware",
-            "total_seconds": 3600,
-            "active_seconds": 0,
-            "device_count": 1,
-            "active_device_count": 0,
-        },
-        {
-            "app": "Popular",
-            "key": "popular",
-            "total_seconds": 360000,
-            "active_seconds": 3600,
-            "device_count": 40,
-            "active_device_count": 40,
-        },
-        {
-            "app": "Rare",
-            "key": "rare",
-            "total_seconds": 10,
-            "active_seconds": 0,
-            "device_count": 1,
-            "active_device_count": 0,
-        },
-    ]
-    card = di.shape_unused_software(usage, {"shelfware": 50, "popular": 50, "rare": 9})
-    assert [a["name"] for a in card["leastUsed"]] == ["Shelfware", "Popular"]
-    assert card["leastUsed"][0]["usageRate"] == 0.0
-    assert [a["name"] for a in card["mostUsed"]] == ["Popular", "Shelfware", "Rare"]
-    assert card["leastUsed"][0]["link"] == {
-        "path": "/applications/usage/Shelfware",
-        "params": {"days": "30"},
-    }
-
-
 def test_connectivity_links():
     card = di.shape_connectivity(
         {
@@ -340,6 +176,119 @@ def test_connectivity_links():
         "params": {"quality": "poor"},
     }
     assert card["onVpn"]["link"] == {"path": "/network", "params": {"vpn": "1"}}
+
+
+def test_install_health_splits_agents_and_links_carry_them():
+    counts = {"munki_devices": 4, "cimian_devices": 3, "munki_with_errors": 2, "munki_with_warnings": 1,
+              "cimian_with_errors": 1, "cimian_with_warnings": 0, "munki_error_items": 5,
+              "munki_warning_items": 1, "cimian_error_items": 2, "cimian_warning_items": 0}
+    card = di.shape_install_health(counts, [{"name": "SAMPLE App", "devices": 2}],
+                                   {"munki": 1, "cimian": 2}, [{"agent": "cimian", "items": 4, "devices": 2}])
+    assert (card["devices"], card["withErrors"]["count"], card["errorItems"]["count"]) == (7, 3, 7)
+    assert (card["pending"]["items"], card["silentAgents"]["count"]) == (4, 3)
+    assert card["withErrors"]["link"] == {"path": "/installs", "params": {"filter": "errors"}}
+    assert card["silentAgents"]["link"]["params"] == {"stale": "1"}
+    assert card["topFailing"][0]["link"]["params"] == {"item": "SAMPLE App", "filter": "errors"}
+    cimian = card["byAgent"][1]
+    assert (cimian["name"], cimian["platform"]) == ("Cimian", "Windows")
+    assert cimian["silentAgents"]["link"]["params"] == {"stale": "1", "agent": "cimian"}
+    assert cimian["warningItems"]["link"]["params"] == {"filter": "warnings", "agent": "cimian"}
+    only_mac = di.shape_install_health(counts, [], {}, [], "macOS")
+    assert [a["agent"] for a in only_mac["byAgent"]] == ["munki"]
+
+
+def test_silent_agents_counted_per_agent():
+    from datetime import datetime, timedelta, timezone
+
+    seen = datetime(2026, 10, 22, 12, tzinfo=timezone.utc)
+    rows = [
+        {"has_cimian": True, "cimian_sessions": [{"end_time": (seen - timedelta(days=9)).isoformat()}],
+         "cimian_run": {}, "last_seen": seen},
+        {"has_munki": True, "munki_sessions": None,
+         "munki_run": {"endTime": (seen - timedelta(days=2)).isoformat()}, "last_seen": seen},
+        {"has_munki": True, "munki_sessions": [], "munki_run": {"startTime": None}, "last_seen": seen},
+    ]
+    assert di.silent_agent_counts(rows) == {"munki": 0, "cimian": 1}
+
+
+def test_storage_buckets_and_links():
+    rows = [{"platform": "macOS", "devices": 3, "free_lt5": 1, "free_5_10": 1, "free_10_20": 0, "free_20_plus": 1,
+             "cap_le256": 1, "cap_512": 2, "cap_1t": 0, "cap_2t_plus": 0}]
+    card = di.shape_storage(rows, [{"serial": "SAMPLE1", "name": None, "platform": "macOS",
+                                    "total_bytes": 1000, "free_bytes": 20, "free_ratio": 0.02}])
+    assert [b["link"]["params"]["storage"] for b in card["freeSpace"]] == ["lt5", "5-10", "10-20", "20+"]
+    assert card["lowStorage"]["count"] == 2
+    assert card["lowStorage"]["byPlatform"] == [{"platform": "macOS", "count": 2,
+        "link": {"path": "/hardware", "params": {"storage": "low", "platform": "macOS"}}}]
+    assert [c["link"]["params"]["capacity"] for c in card["capacity"]] == ["le256", "512", "1t", "2t+"]
+    assert card["fullest"][0] == {"serialNumber": "SAMPLE1", "name": "SAMPLE1", "platform": "macOS", "freePct": 2.0,
+                                  "freeBytes": 20, "totalBytes": 1000, "link": {"path": "/device/SAMPLE1", "params": {}}}
+
+
+def test_directory_join_views():
+    rows = [
+        {"platform": "Windows", "devices": 4, "entra": 1, "domain": 1, "hybrid": 1, "workgroup": 1,
+         "mac_psso": 0, "mac_bound": 0, "mac_unbound": 0, "extra_admins": 2, "shared": 1, "assigned": 3},
+        {"platform": "macOS", "devices": 3, "entra": 0, "domain": 1, "hybrid": 0, "workgroup": 2,
+         "mac_psso": 1, "mac_bound": 1, "mac_unbound": 1, "extra_admins": 1, "shared": 0, "assigned": 3},
+    ]
+    views = di.shape_directory_join(rows)["views"]
+    assert set(views) == {"all", "windows", "mac"}
+    assert {s["key"]: s["count"] for s in views["all"]["segments"]}["workgroup"] == 3
+    assert [s["key"] for s in views["mac"]["segments"]] == ["psso", "bound", "unbound"]
+    assert views["mac"]["segments"][1]["link"] == {"path": "/identity",
+                                                   "params": {"directory": "bound", "platform": "macOS"}}
+    assert views["windows"]["segments"][0]["link"]["params"] == {"join": "entra", "platform": "Windows"}
+    assert views["all"]["extraAdmins"] == {"count": 3, "link": {"path": "/identity", "params": {"admins": "extra"}}}
+    assert views["windows"]["assigned"]["link"]["params"] == {"usage": "assigned", "platform": "Windows"}
+
+
+def test_management_tools_products_merge_and_links():
+    rows = [
+        {"tool": "installs", "platform": "macOS", "mdm_name": None, "devices": 5, "devices_with_errors": 2,
+         "devices_with_warnings": 1, "error_lines": 9, "warning_lines": 1},
+        {"tool": "installs", "platform": "Windows", "mdm_name": None, "devices": 3, "devices_with_errors": 1,
+         "devices_with_warnings": 0, "error_lines": 1, "warning_lines": 0},
+        {"tool": "bootstrap", "platform": "macOS", "mdm_name": None, "devices": 5, "devices_with_errors": 1,
+         "devices_with_warnings": 0, "error_lines": 2, "warning_lines": 0},
+        {"tool": "bootstrap", "platform": "Windows", "mdm_name": None, "devices": 3, "devices_with_errors": 1,
+         "devices_with_warnings": 0, "error_lines": 1, "warning_lines": 0},
+        {"tool": "mdm", "platform": "Windows", "mdm_name": "Intune", "devices": 3, "devices_with_errors": 0,
+         "devices_with_warnings": 0, "error_lines": 0, "warning_lines": 0},
+    ]
+    messages = [{"message": "Download of <n> failed", "tool": "installs", "platform": "macOS", "mdm_name": None,
+                 "devices": 2, "lines": 4, "sample_serial": "SAMPLE1"}]
+    card = di.shape_management_tools(rows, messages)
+    names = [t["name"] for t in card["tools"]]
+    assert names == ["Munki", "BootstrapMate", "Cimian", "Intune"]
+    boot = card["tools"][1]
+    assert (boot["devices"], boot["devicesWithErrors"], boot["platform"]) == (8, 2, None)
+    assert boot["link"] == {"path": "/devices", "params": {"tool": "bootstrap", "level": "error"}}
+    assert card["tools"][0]["link"]["params"] == {"tool": "installs", "level": "error", "platform": "macOS"}
+    assert card["tools"][0]["warningsLink"]["params"]["level"] == "warning"
+    top = card["topErrors"][0]
+    assert (top["name"], top["devices"]) == ("Munki", 2)
+    assert top["sampleDevice"]["link"] == {"path": "/device/SAMPLE1",
+                                           "params": {"tab": "management", "tool": "installs", "level": "error"}}
+
+
+def test_tool_window_start_is_an_hour_key():
+    from datetime import datetime, timezone
+
+    assert di.window_start_hour(datetime(2026, 10, 22, 13, 44, tzinfo=timezone.utc)) == "2026-10-21T13"
+
+
+def test_app_usage_top_ten_and_filter_links():
+    usage = [{"app": f"SAMPLE {i}", "total_seconds": 3600 * i, "active_seconds": 0,
+              "device_count": 1, "active_device_count": 1} for i in range(1, 13)]
+    options = [{"kind": "usage", "value": "Shared", "devices": 3}, {"kind": "catalog", "value": "Lab", "devices": 2}]
+    card = di.shape_app_usage(usage, options, platform="Windows", days=30, usages=["Shared"], catalogs=[])
+    assert len(card["apps"]) == 10
+    assert card["apps"][0]["name"] == "SAMPLE 12"
+    assert card["apps"][0]["link"]["params"] == {"days": "30", "usages": "Shared", "platform": "Windows"}
+    assert card["available"] == {"usages": [{"value": "Shared", "devices": 3}],
+                                 "catalogs": [{"value": "Lab", "devices": 2}]}
+    assert card["link"]["params"] == {"type": "usage", "period": "30", "usages": "Shared", "platform": "Windows"}
 
 
 # ── OS Currency: the five-device rule ───────────────────────────
@@ -467,7 +416,8 @@ def test_a_failing_card_does_not_take_the_others_down(monkeypatch):
     monkeypatch.setattr(di, "CARD_FUNCTIONS", funcs)
 
     result = di.compute_insights("all", False)
-    cards = result["cards"]
+    assert all(c.pop("generatedAt") and "computeSeconds" in c for c in result["cards"].values())
+    cards = {k: {f: v for f, v in c.items() if f != "computeSeconds"} for k, c in result["cards"].items()}
     assert list(cards) == list(di.CARD_KEYS)
     assert cards["protectionGaps"] == {"error": "Could not compute this card"}
     assert cards["osCurrency"]["error"].startswith("Timed out after")
@@ -484,16 +434,68 @@ def test_no_database_fails_every_card_but_still_answers(monkeypatch):
         raise RuntimeError("Database connection failed")
 
     monkeypatch.setattr(di, "get_db_connection", down)
+    monkeypatch.setattr(di, "_inventory_state_checked", None)
     result = di.compute_insights("all", False)
-    assert all(v == {"error": "Database unavailable"} for v in result["cards"].values())
+    assert all(v["error"] == "Database unavailable" for v in result["cards"].values())
 
 
-# ── Endpoint and cache ──────────────────────────────────────────
+# ── Log level summaries (stamped at ingest) ─────────────────────
+
+
+def test_parse_line_shapes():
+    from log_tails import parse_line
+
+    cases = {
+        "[2026-10-22 13:44:00] ERROR  boom": ("2026-10-22T13", "error"),
+        "[2026-10-22 13:44:00] INFO  mentions CRITICAL": ("2026-10-22T13", "info"),
+        "Oct 22 2026 13:44:00 -0700 WARNING: slow": ("2026-10-22T20", "warning"),
+        "2026-10-22 13:44:00:123 | IntuneMdmAgent | E | 7 | x | failed": ("2026-10-22T13", "error"),
+        '<![LOG[step failed]LOG]!><time="13:44:00.000+000" date="10-22-2026" component="c" context="" type="3" thread="1" file="">':
+            ("2026-10-22T13", "error"),
+        "2026-10-22T13:44:00Z something WARN here": ("2026-10-22T13", "warning"),
+        "no time but ERROR": (None, "error"),
+    }
+    for line, (hour, level) in cases.items():
+        when, got = parse_line(line)
+        assert (when.strftime("%Y-%m-%dT%H") if when else None, got) == (hour, level), line
+    when, level = parse_line('{"timestamp": "2026-10-22T13:44:00Z", "level": "error", "message": "x"}', jsonl=True)
+    assert (when.hour, level) == (13, "error")
+
+
+def test_summarize_root_counts_hours_messages_and_is_deterministic():
+    import copy
+
+    from log_tails import stamp_log_summaries, summarize_root
+
+    root = {"tool": "installs", "newestModified": "2026-10-22T15:00:00Z", "tails": [
+        {"file": "run.log", "lines": [
+            "[2026-10-22 13:01:00] ERROR  Download of SAMPLE failed: 404 at /Library/ManagedInstalls/x.pkg",
+            "[2026-10-22 13:02:00] ERROR  Download of SAMPLE failed: 500 at /Library/ManagedInstalls/y.pkg",
+            "[2026-10-22 14:00:00] WARN  slow",
+            "plain undated ERROR line",
+            "[2026-10-22 14:05:00] INFO  fine",
+        ]},
+        {"file": "state.json", "lines": ["{\"error\": \"ignored\"}"]},
+    ]}
+    summary = summarize_root(root)
+    assert summary["hours"] == {"2026-10-22T13": [2, 0], "2026-10-22T14": [0, 1], "2026-10-22T15": [1, 0]}
+    assert summary["undated"] == [0, 0]
+    top = summary["errors"][0]
+    assert top["n"] == 2 and top["last"] == "2026-10-22T13"
+    assert "<path>" in top["m"] and "404" not in top["m"]
+
+    module = {"logs": {"roots": [copy.deepcopy(root)]}}
+    again = {"logs": {"roots": [copy.deepcopy(root)]}}
+    assert stamp_log_summaries(module) == stamp_log_summaries(again)
+    assert module["logs"]["roots"][0]["levelSummary"] == summary
+
+
+# ── Endpoints and cache ─────────────────────────────────────────
 
 
 @pytest.fixture
 def client(monkeypatch):
-    monkeypatch.setattr(insights_router, "WARM_ON_STARTUP", False)
+    monkeypatch.setattr(insights_router, "BACKGROUND_REFRESH", False)
     insights_router.reset_cache()
     from main import app
 
@@ -502,122 +504,151 @@ def client(monkeypatch):
     insights_router.reset_cache()
 
 
-def fake_result(platform, include_archived, error=False):
-    cards = {k: {"devices": 1} for k in di.CARD_KEYS}
+def fake_card(card, platform="all", include_archived=False, error=False):
     if error:
-        cards["softwareRisk"] = {"error": "Could not compute this card"}
-    return {
-        "generatedAt": "2026-10-22T00:00:00+00:00",
-        "platform": platform,
-        "includeArchived": include_archived,
-        "computeSeconds": 0.0,
-        "cards": cards,
-    }
+        return {"error": "Could not compute this card", "generatedAt": "2026-10-22T00:00:00+00:00"}
+    return {"devices": 1, "card": card, "platform": platform, "generatedAt": "2026-10-22T00:00:00+00:00"}
 
 
-def test_endpoint_requires_auth(client):
+@pytest.fixture
+def calls(monkeypatch):
+    seen = []
+
+    def compute(card, platform, include_archived):
+        seen.append((card, platform, include_archived))
+        return fake_card(card, platform, include_archived)
+
+    def app_usage(platform, usages, catalogs, days):
+        seen.append(("appUsage", platform, usages, catalogs, days))
+        return {"apps": [], "generatedAt": "2026-10-22T00:00:00+00:00"}
+
+    monkeypatch.setattr(di, "compute_card", compute)
+    monkeypatch.setattr(di, "compute_app_usage", app_usage)
+    return seen
+
+
+def test_endpoints_require_auth(client):
     assert client.get("/api/v1/dashboard/insights").status_code == 401
+    assert client.get("/api/v1/dashboard/insights/storage").status_code == 401
+    assert client.get("/api/v1/dashboard/insights/appUsage").status_code == 401
 
 
-def test_endpoint_rejects_an_unknown_platform(client):
-    assert (
-        client.get(
-            "/api/v1/dashboard/insights?platform=linux", headers=AUTH
-        ).status_code
-        == 422
-    )
+def test_unknown_platform_and_card(client, calls):
+    assert client.get("/api/v1/dashboard/insights?platform=linux", headers=AUTH).status_code == 422
+    assert client.get("/api/v1/dashboard/insights/storage?platform=linux", headers=AUTH).status_code == 422
+    assert client.get("/api/v1/dashboard/insights/unmanagedDevices", headers=AUTH).status_code == 404
 
 
-def test_endpoint_shape_and_cache_per_scope(client, monkeypatch):
-    calls = []
-
-    def compute(platform, include_archived):
-        calls.append((platform, include_archived))
-        return fake_result(platform, include_archived)
-
-    monkeypatch.setattr(di, "compute_insights", compute)
-
-    r = client.get("/api/v1/dashboard/insights", headers=AUTH)
+def test_per_card_endpoint_envelope_and_cache(client, calls):
+    r = client.get("/api/v1/dashboard/insights/storage?platform=windows", headers=AUTH)
     assert r.status_code == 200
     assert r.headers["X-Insights-Cache"] == "miss"
     body = r.json()
-    assert set(body) >= {"generatedAt", "platform", "cards"}
-    assert list(body["cards"]) == list(di.CARD_KEYS)
+    assert body == {"card": "storage", "platform": "Windows", "includeArchived": False,
+                    "generatedAt": "2026-10-22T00:00:00+00:00", "data": fake_card("storage", "Windows")}
+    r = client.get("/api/v1/dashboard/insights/storage?platform=Windows", headers=AUTH)
+    assert r.headers["X-Insights-Cache"] == "fresh"
+    assert calls == [("storage", "Windows", False)]
 
-    r = client.get("/api/v1/dashboard/insights?platform=all", headers=AUTH)
+
+def test_per_card_etag_answers_304(client, calls):
+    r = client.get("/api/v1/dashboard/insights/osCurrency", headers=AUTH)
+    etag = r.headers["ETag"]
+    r = client.get("/api/v1/dashboard/insights/osCurrency", headers={**AUTH, "If-None-Match": etag})
+    assert r.status_code == 304
+    assert r.content == b""
+
+
+def test_combined_is_assembled_from_the_per_card_cache(client, calls):
+    client.get("/api/v1/dashboard/insights/storage", headers=AUTH)
+    r = client.get("/api/v1/dashboard/insights", headers=AUTH)
+    body = r.json()
+    assert list(body["cards"]) == list(di.CARD_KEYS)
+    assert body["cards"]["storage"]["generatedAt"]
+    assert sorted(calls) == sorted((card, "all", False) for card in di.CARD_KEYS)
+    r = client.get("/api/v1/dashboard/insights", headers=AUTH)
+    assert r.headers["X-Insights-Cache"] == "fresh"
+    assert len(calls) == len(di.CARD_KEYS)
+    r = client.get("/api/v1/dashboard/insights/protectionGaps", headers=AUTH)
     assert r.headers["X-Insights-Cache"] == "fresh"
 
-    r = client.get("/api/v1/dashboard/insights?platform=macos", headers=AUTH)
-    assert r.json()["platform"] == "macOS"
-    client.get("/api/v1/dashboard/insights?includeArchived=true", headers=AUTH)
 
-    assert calls == [("all", False), ("macOS", False), ("all", True)]
+def test_app_usage_is_cached_per_filter_combination(client, calls):
+    client.get("/api/v1/dashboard/insights/appUsage?usages=Shared,Lab", headers=AUTH)
+    r = client.get("/api/v1/dashboard/insights/app-usage?usages=Lab,%20Shared", headers=AUTH)
+    assert r.headers["X-Insights-Cache"] == "fresh"
+    assert r.json()["card"] == "appUsage"
+    client.get("/api/v1/dashboard/insights/appUsage?catalogs=Staff&days=7", headers=AUTH)
+    assert calls == [("appUsage", "all", ("Lab", "Shared"), (), 30), ("appUsage", "all", (), ("Staff",), 7)]
 
 
-def test_expired_value_is_served_while_one_refresh_runs(client, monkeypatch):
-    calls = []
+def test_expired_card_is_served_while_one_refresh_runs(client, calls):
+    client.get("/api/v1/dashboard/insights/storage", headers=AUTH)
+    key = ("storage", "all", False)
+    result, _stored = insights_router._entries[key]
+    insights_router._entries[key] = (result, time.monotonic() - 10_000)
 
-    def compute(platform, include_archived):
-        calls.append(platform)
-        return fake_result(platform, include_archived)
-
-    monkeypatch.setattr(di, "compute_insights", compute)
-    client.get("/api/v1/dashboard/insights", headers=AUTH)
-
-    result, _stored = insights_router._entries[("all", False)]
-    insights_router._entries[("all", False)] = (result, time.monotonic() - 10_000)
-
-    r = client.get("/api/v1/dashboard/insights", headers=AUTH)
+    r = client.get("/api/v1/dashboard/insights/storage", headers=AUTH)
     assert r.headers["X-Insights-Cache"] == "stale"
     assert int(r.headers["Age"]) >= 10_000
-
-    deadline = time.monotonic() + 5
-    while len(calls) < 2 and time.monotonic() < deadline:
-        time.sleep(0.01)
-    assert len(calls) == 2
     deadline = time.monotonic() + 5
     while time.monotonic() < deadline:
-        r = client.get("/api/v1/dashboard/insights", headers=AUTH)
+        r = client.get("/api/v1/dashboard/insights/storage", headers=AUTH)
         if r.headers["X-Insights-Cache"] == "fresh":
             break
         time.sleep(0.01)
     assert r.headers["X-Insights-Cache"] == "fresh"
+    assert calls.count(key) == 2
 
 
-def test_a_result_with_a_failed_card_expires_sooner(monkeypatch):
-    assert (
-        insights_router._ttl_for(fake_result("all", False, error=True))
-        == insights_router.ERROR_TTL_SECONDS
-    )
-    assert (
-        insights_router._ttl_for(fake_result("all", False))
-        == insights_router.CACHE_TTL_SECONDS
-    )
+def test_a_failed_card_expires_sooner():
+    assert insights_router._ttl_for(fake_card("x", error=True)) == insights_router.ERROR_TTL_SECONDS
+    assert insights_router._ttl_for(fake_card("x")) == insights_router.CACHE_TTL_SECONDS
 
 
 def test_concurrent_cold_requests_share_one_computation(monkeypatch):
     insights_router.reset_cache()
-    calls = []
+    seen = []
     release = threading.Event()
 
-    def compute(platform, include_archived):
-        calls.append(platform)
+    def compute(card, platform, include_archived):
+        seen.append(card)
         release.wait(5)
-        return fake_result(platform, include_archived)
+        return fake_card(card)
 
-    monkeypatch.setattr(di, "compute_insights", compute)
+    monkeypatch.setattr(di, "compute_card", compute)
 
     async def scenario():
-        waiters = [
-            asyncio.create_task(insights_router.get_insights(("all", False)))
-            for _ in range(8)
-        ]
+        waiters = [asyncio.create_task(insights_router.get_cached(("storage", "all", False))) for _ in range(8)]
         await asyncio.sleep(0.05)
         release.set()
         return await asyncio.gather(*waiters)
 
     results = asyncio.run(scenario())
     insights_router.reset_cache()
-    assert calls == ["all"]
+    assert seen == ["storage"]
     assert {state for _r, state, _age in results} == {"miss"}
-    assert all(r is results[0][0] for r, _s, _a in results)
+
+
+def test_refresh_pass_fills_every_default_card_one_at_a_time(monkeypatch):
+    insights_router.reset_cache()
+    running, peak, seen = [0], [0], []
+
+    def compute(card, platform, include_archived):
+        running[0] += 1
+        peak[0] = max(peak[0], running[0])
+        seen.append((card, platform))
+        running[0] -= 1
+        return fake_card(card, platform)
+
+    monkeypatch.setattr(di, "compute_card", compute)
+    monkeypatch.setattr(di, "compute_app_usage", lambda *a: {"apps": [], "generatedAt": "x"})
+    monkeypatch.setattr(insights_router, "REFRESH_STAGGER_SECONDS", 0)
+    asyncio.run(insights_router.refresh_pass())
+    assert peak[0] == 1
+    assert len(seen) == 3 * len(di.CARD_KEYS)
+    for platform in ("all", "macOS", "Windows"):
+        assert ("appUsage", platform, (), (), 30) in insights_router._entries
+        for card in di.CARD_KEYS:
+            assert (card, platform, False) in insights_router._entries
+    insights_router.reset_cache()

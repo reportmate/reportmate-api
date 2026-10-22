@@ -63,22 +63,20 @@ OS_CURRENCY_MIN_DEVICES = 5
 SILENT_AGENT_DAYS = 7
 #: Expiring Certificates: the look-ahead window.
 CERT_WINDOW_DAYS = 30
-#: Unused Software: the usage window and the install floor for shelfware.
+#: App Usage: the default usage window.
 USAGE_DAYS = 30
-MIN_INSTALLS_FOR_LEAST_USED = 10
 
 CARD_KEYS = (
+    "installHealth",
     "rebootDebt",
     "protectionGaps",
-    "unmanagedDevices",
-    "hardwareAtRisk",
-    "installHealth",
+    "managementToolErrors",
+    "storage",
     "checkinGaps",
     "osCurrency",
     "softwareRisk",
     "expiringCertificates",
-    "localAdminExposure",
-    "unusedSoftware",
+    "directoryJoin",
     "connectivityProblems",
 )
 
@@ -110,10 +108,6 @@ def link(path: str, **params: Any) -> Dict[str, Any]:
 
 def device_link(serial: str) -> Dict[str, Any]:
     return link(f"/device/{quote(str(serial), safe='')}")
-
-
-def app_usage_link(name: str) -> Dict[str, Any]:
-    return link(f"/applications/usage/{quote(str(name), safe='')}", days=USAGE_DAYS)
 
 
 # ── Small value helpers ─────────────────────────────────────────
@@ -162,13 +156,17 @@ class InsightsScope:
         return {"platform": self.platform, "include_archived": self.include_archived}
 
 
-def card_sql(name: str, scope: InsightsScope) -> str:
-    """A card query with the shared fleet scope and boolean vocabularies filled in."""
+def card_sql(name: str, scope: InsightsScope, select: Optional[str] = None) -> str:
+    """A card query with the shared fleet scope and boolean vocabularies filled
+    in. ``select`` names a fragment that replaces /*STORAGE_SELECT*/."""
     fleet = load_sql("insights/fleet").replace(
         "/*NOT_STORED*/", _NOT_STORED if scope.has_inventory_state else "TRUE"
     )
+    text = load_sql(f"insights/{name}")
+    if select:
+        text = text.replace("/*STORAGE_SELECT*/", load_sql(f"insights/{select}"))
     return (
-        load_sql(f"insights/{name}")
+        text
         .replace("/*FLEET*/", fleet)
         .replace("{{TRUE}}", _TRUE)
         .replace("{{FALSE}}", _FALSE)
@@ -179,16 +177,16 @@ Runner = Callable[..., List[Dict[str, Any]]]
 
 
 def _make_runner(cursor, scope: InsightsScope) -> Runner:
-    def run(name: str, **extra: Any) -> List[Dict[str, Any]]:
+    def run(name: str, _select: Optional[str] = None, **extra: Any) -> List[Dict[str, Any]]:
         params = {**scope.params, **extra}
-        cursor.execute(card_sql(name, scope), params)
+        cursor.execute(card_sql(name, scope, _select), params)
         cols = [c[0] for c in (cursor.description or [])]
         return [dict(zip(cols, row)) for row in cursor.fetchall()]
 
     return run
 
 
-# ── 1 Reboot & Update Debt ──────────────────────────────────────
+# ── Reboot & Update Debt ──────────────────────────────────────
 
 UPTIME_BUCKETS = (
     ("lt1d", "< 1 day", "up_lt1d"),
@@ -235,7 +233,7 @@ def card_reboot_debt(run: Runner, scope: InsightsScope) -> Dict[str, Any]:
     return shape_reboot_debt(run("reboot_debt")[0])
 
 
-# ── 2 Protection Gaps ───────────────────────────────────────────
+# ── Protection Gaps ───────────────────────────────────────────
 
 _PROTECTIONS = (
     ("encryption", "Disk encryption off", "encryption_off", "devices"),
@@ -278,158 +276,255 @@ def card_protection_gaps(run: Runner, scope: InsightsScope) -> Dict[str, Any]:
     return shape_protection_gaps(run("security_flags")[0])
 
 
-# ── 3 Unmanaged Devices ─────────────────────────────────────────
+# ── Management Tools Errors ─────────────────────────────────────
+
+#: The window the card counts over, in hours.
+TOOL_WINDOW_HOURS = 24
+
+#: Product names per log root, as the Mac app labels the tabs
+#: (ManagementLogs.Root.productNames): (macOS, Windows).
+TOOL_PRODUCTS = {
+    "installs": ("Munki", "Cimian"),
+    "bootstrap": ("BootstrapMate", "BootstrapMate"),
+    "reports": ("ReportMate", "ReportMate"),
+    "state": ("Outset", "StartSet"),
+    "encryption": ("Crypt", "Crypt"),
+    "users": ("ManageUsers", "ManageUsers"),
+    "utilities": ("Utilities", "Utilities"),
+    "notifications": ("swiftDialog", "csharpDialog"),
+    "installer": ("Installer", "Installer"),
+}
 
 
-def shape_unmanaged(
-    platform_rows: Sequence[Dict[str, Any]], recent_rows: Sequence[Dict[str, Any]]
-) -> Dict[str, Any]:
-    total = sum(_int(r.get("devices")) for r in platform_rows)
-    unmanaged = sum(_int(r.get("unmanaged")) for r in platform_rows)
-    unenrolled = link("/management", enrolled=0)
+def tool_product(tool: str, platform: Optional[str], mdm_name: Optional[str] = None) -> str:
+    """The product behind a log root on a platform: Munki or Cimian for installs."""
+    if tool == "mdm":
+        return (mdm_name or "").strip() or "MDM"
+    names = TOOL_PRODUCTS.get(tool)
+    if not names:
+        return tool[:1].upper() + tool[1:]
+    return names[1] if (platform or "").lower().startswith("win") else names[0]
+
+
+def _tool_platform_specific(tool: str) -> bool:
+    names = TOOL_PRODUCTS.get(tool)
+    return bool(names) and names[0] != names[1]
+
+
+def _tool_link(tool: str, level: str, platform: Optional[str]) -> Dict[str, Any]:
+    return link("/devices", tool=tool, level=level,
+                platform=platform if _tool_platform_specific(tool) else None)
+
+
+def tool_device_link(serial: str, tool: str, level: str = "error") -> Dict[str, Any]:
+    """The device page Management tab, log viewer on that tool and level."""
+    return link(f"/device/{quote(str(serial), safe='')}", tab="management", tool=tool, level=level)
+
+
+def window_start_hour(now: Optional[datetime] = None, hours: int = TOOL_WINDOW_HOURS) -> str:
+    """The first UTC hour key inside the window, comparable to levelSummary keys."""
+    return ((now or datetime.now(timezone.utc)) - timedelta(hours=hours)).strftime("%Y-%m-%dT%H")
+
+
+def shape_management_tools(rows: Sequence[Dict[str, Any]], messages: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
+    tools: Dict[Any, Dict[str, Any]] = {}
+    for r in rows:
+        tool = r.get("tool") or ""
+        product = tool_product(tool, r.get("platform"), r.get("mdm_name"))
+        key = (tool, product)
+        entry = tools.setdefault(key, {
+            "tool": tool, "name": product,
+            "platform": r.get("platform") if _tool_platform_specific(tool) else None,
+            "devices": 0, "devicesWithErrors": 0, "devicesWithWarnings": 0,
+            "errorLines": 0, "warningLines": 0,
+        })
+        entry["devices"] += _int(r.get("devices"))
+        entry["devicesWithErrors"] += _int(r.get("devices_with_errors"))
+        entry["devicesWithWarnings"] += _int(r.get("devices_with_warnings"))
+        entry["errorLines"] += _int(r.get("error_lines"))
+        entry["warningLines"] += _int(r.get("warning_lines"))
+    ordered = sorted(tools.values(), key=lambda t: (-t["devicesWithErrors"], -t["errorLines"],
+                                                    -t["devicesWithWarnings"], t["name"]))
+    for t in ordered:
+        t["link"] = _tool_link(t["tool"], "error", t["platform"])
+        t["warningsLink"] = _tool_link(t["tool"], "warning", t["platform"])
     return {
-        "devices": total,
-        "unmanaged": {
-            "count": unmanaged,
-            "pct": _pct(unmanaged, total),
-            "link": unenrolled,
-        },
-        "enrolledPct": _pct(total - unmanaged, total),
-        "byPlatform": [
+        "windowHours": TOOL_WINDOW_HOURS,
+        "tools": ordered,
+        "topErrors": [
             {
-                "platform": r.get("platform") or "Unknown",
-                "count": _int(r.get("unmanaged")),
-                "devices": _int(r.get("devices")),
-                "link": link("/management", enrolled=0, platform=r.get("platform") or "Unknown"),
+                "message": m["message"],
+                "tool": m["tool"],
+                "name": tool_product(m["tool"], m.get("platform"), m.get("mdm_name")),
+                "devices": _int(m.get("devices")),
+                "lines": _int(m.get("lines")),
+                "link": _tool_link(m["tool"], "error", m.get("platform")),
+                "sampleDevice": {
+                    "serialNumber": m["sample_serial"],
+                    "link": tool_device_link(m["sample_serial"], m["tool"]),
+                },
             }
-            for r in sorted(
-                platform_rows,
-                key=lambda r: (-_int(r.get("unmanaged")), r.get("platform") or ""),
-            )
-            if _int(r.get("devices")) > 0
+            for m in messages
         ],
-        "lastSeen": [
-            {
-                "key": "24h",
-                "label": "Seen in the last 24 hours",
-                "count": sum(_int(r.get("seen_24h")) for r in platform_rows),
-                "link": link("/management", enrolled=0, lastSeen="24h"),
-            },
-            {
-                "key": "1-7d",
-                "label": "Seen 1-7 days ago",
-                "count": sum(_int(r.get("seen_7d")) for r in platform_rows),
-                "link": link("/management", enrolled=0, lastSeen="1-7d"),
-            },
-            {
-                "key": "7d+",
-                "label": "Silent over 7 days",
-                "count": sum(_int(r.get("silent")) for r in platform_rows),
-                "link": link("/management", enrolled=0, lastSeen="7d+"),
-            },
+    }
+
+
+def card_management_tools(run: Runner, scope: InsightsScope) -> Dict[str, Any]:
+    since = window_start_hour()
+    return shape_management_tools(
+        run("management_tool_errors", since_hour=since),
+        run("management_tool_messages", since_hour=since, limit=TOP_N),
+    )
+
+
+# ── Storage ─────────────────────────────────────────────────────
+
+FREE_BUCKETS = (
+    ("lt5", "Under 5% free", "free_lt5"),
+    ("5-10", "5-10% free", "free_5_10"),
+    ("10-20", "10-20% free", "free_10_20"),
+    ("20+", "20% or more free", "free_20_plus"),
+)
+CAPACITY_BUCKETS = (
+    ("le256", "256 GB or less", "cap_le256"),
+    ("512", "512 GB", "cap_512"),
+    ("1t", "1 TB", "cap_1t"),
+    ("2t+", "2 TB or more", "cap_2t_plus"),
+)
+
+
+def shape_storage(platform_rows: Sequence[Dict[str, Any]], fullest: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
+    def total(col: str) -> int:
+        return sum(_int(r.get(col)) for r in platform_rows)
+
+    def low(r: Dict[str, Any]) -> int:
+        return _int(r.get("free_lt5")) + _int(r.get("free_5_10"))
+
+    return {
+        "devices": total("devices"),
+        "freeSpace": [
+            {"key": k, "label": label, "count": total(col), "link": link("/hardware", storage=k)}
+            for k, label, col in FREE_BUCKETS
         ],
-        "recent": [
+        "lowStorage": {
+            "count": sum(low(r) for r in platform_rows),
+            "link": link("/hardware", storage="low"),
+            "byPlatform": [
+                {"platform": r.get("platform") or "Unknown", "count": low(r),
+                 "link": link("/hardware", storage="low", platform=r.get("platform") or "Unknown")}
+                for r in platform_rows
+            ],
+        },
+        "capacity": [
+            {"key": k, "label": label, "count": total(col), "link": link("/hardware", capacity=k)}
+            for k, label, col in CAPACITY_BUCKETS
+        ],
+        "fullest": [
             {
                 "serialNumber": r["serial"],
                 "name": r.get("name") or r["serial"],
                 "platform": r.get("platform"),
-                "lastSeen": _iso(r.get("last_seen")),
+                "freePct": round(float(r.get("free_ratio") or 0) * 100, 1),
+                "freeBytes": int(r.get("free_bytes") or 0),
+                "totalBytes": int(r.get("total_bytes") or 0),
                 "link": device_link(r["serial"]),
             }
-            for r in recent_rows
+            for r in fullest
         ],
     }
 
 
-def card_unmanaged(run: Runner, scope: InsightsScope) -> Dict[str, Any]:
-    return shape_unmanaged(run("unmanaged"), run("unmanaged_recent", limit=TOP_N))
+def card_storage(run: Runner, scope: InsightsScope) -> Dict[str, Any]:
+    return shape_storage(
+        run("storage_devices", _select="storage"),
+        run("storage_devices", _select="storage_fullest", limit=TOP_N),
+    )
 
 
-# ── 4 Hardware at Risk ──────────────────────────────────────────
+# ── Install Health ──────────────────────────────────────────────
 
-
-def shape_hardware(row: Dict[str, Any]) -> Dict[str, Any]:
-    return {
-        "devices": _int(row.get("devices")),
-        "lowStorage": {
-            "count": _int(row.get("low_storage")),
-            "link": link("/hardware", storage="low"),
-        },
-        "lowMemory": {
-            "count": _int(row.get("low_memory")),
-            "link": link("/hardware", memory="le8"),
-        },
-        "intelMacs": {
-            "count": _int(row.get("intel_macs")),
-            "macs": _int(row.get("macs")),
-            "link": link("/hardware", arch="Intel"),
-        },
-    }
-
-
-def card_hardware(run: Runner, scope: InsightsScope) -> Dict[str, Any]:
-    return shape_hardware(run("hardware_at_risk")[0])
-
-
-# ── 5 Install Health ────────────────────────────────────────────
+INSTALL_AGENTS = (("munki", "Munki", "macOS"), ("cimian", "Cimian", "Windows"))
 
 
 def _agent_record(sessions: Any, run_times: Any) -> Dict[str, Any]:
-    record: Dict[str, Any] = {
-        k: v for k, v in (run_times or {}).items() if v is not None
-    }
+    record: Dict[str, Any] = {k: v for k, v in (run_times or {}).items() if v is not None}
     record["sessions"] = sessions if isinstance(sessions, list) else []
     return record
 
 
-def silent_agent_count(
+def silent_agent_counts(
     rows: Iterable[Dict[str, Any]], threshold_days: float = SILENT_AGENT_DAYS
-) -> int:
-    """Devices whose management agent last ran more than ``threshold_days`` before
+) -> Dict[str, int]:
+    """Per agent, devices whose agent last ran more than ``threshold_days`` before
     the device last checked in, by the same reading as /installs/filters."""
     # Imported here: routers.fleet imports this module's neighbours at load.
     from routers.fleet import agent_last_run, agent_stale_days
 
-    silent = 0
+    silent = {"munki": 0, "cimian": 0}
     for r in rows:
         if r.get("has_cimian"):
-            agent = _agent_record(r.get("cimian_sessions"), r.get("cimian_run"))
+            name, agent = "cimian", _agent_record(r.get("cimian_sessions"), r.get("cimian_run"))
         elif r.get("has_munki"):
-            agent = _agent_record(r.get("munki_sessions"), r.get("munki_run"))
+            name, agent = "munki", _agent_record(r.get("munki_sessions"), r.get("munki_run"))
         else:
             continue
         days = agent_stale_days(agent_last_run(agent), r.get("last_seen"))
         if days is not None and days > threshold_days:
-            silent += 1
+            silent[name] += 1
     return silent
 
 
 def shape_install_health(
-    counts: Dict[str, Any], failing: Sequence[Dict[str, Any]], silent_agents: int
+    counts: Dict[str, Any],
+    failing: Sequence[Dict[str, Any]],
+    silent: Dict[str, int],
+    pending: Sequence[Dict[str, Any]],
+    platform: str = "all",
 ) -> Dict[str, Any]:
+    pend = {r.get("agent"): r for r in pending}
+    agents = []
+    for key, name, plat in INSTALL_AGENTS:
+        if platform not in ("all", plat):
+            continue
+        agents.append({
+            "agent": key,
+            "name": name,
+            "platform": plat,
+            "devices": _int(counts.get(f"{key}_devices")),
+            "withErrors": {"count": _int(counts.get(f"{key}_with_errors")),
+                           "link": link("/installs", filter="errors", agent=key)},
+            "withWarnings": {"count": _int(counts.get(f"{key}_with_warnings")),
+                             "link": link("/installs", filter="warnings", agent=key)},
+            "errorItems": {"count": _int(counts.get(f"{key}_error_items")),
+                           "link": link("/installs", filter="errors", agent=key)},
+            "warningItems": {"count": _int(counts.get(f"{key}_warning_items")),
+                             "link": link("/installs", filter="warnings", agent=key)},
+            "pending": {"items": _int(pend.get(key, {}).get("items")),
+                        "devices": _int(pend.get(key, {}).get("devices")),
+                        "link": link("/installs", filter="pending", agent=key)},
+            "silentAgents": {"count": _int(silent.get(key)),
+                             "link": link("/installs", stale=1, agent=key)},
+        })
+
+    def total(field: str, sub: str = "count") -> int:
+        return sum(a[field][sub] for a in agents)
+
     return {
-        "devices": _int(counts.get("devices")),
-        "withErrors": {
-            "count": _int(counts.get("with_errors")),
-            "link": link("/installs", filter="errors"),
-        },
-        "withWarnings": {
-            "count": _int(counts.get("with_warnings")),
-            "link": link("/installs", filter="warnings"),
-        },
+        "devices": sum(a["devices"] for a in agents),
+        "withErrors": {"count": total("withErrors"), "link": link("/installs", filter="errors")},
+        "withWarnings": {"count": total("withWarnings"), "link": link("/installs", filter="warnings")},
+        "errorItems": {"count": total("errorItems"), "link": link("/installs", filter="errors")},
+        "warningItems": {"count": total("warningItems"), "link": link("/installs", filter="warnings")},
+        "pending": {"items": total("pending", "items"), "devices": total("pending", "devices"),
+                    "link": link("/installs", filter="pending")},
+        "silentAgents": {"count": total("silentAgents"), "thresholdDays": SILENT_AGENT_DAYS,
+                         "link": link("/installs", stale=1)},
         "topFailing": [
-            {
-                "name": r["name"],
-                "devices": _int(r.get("devices")),
-                "link": link("/installs", item=r["name"], filter="errors"),
-            }
+            {"name": r["name"], "devices": _int(r.get("devices")),
+             "link": link("/installs", item=r["name"], filter="errors")}
             for r in failing
         ],
-        "silentAgents": {
-            "count": silent_agents,
-            "thresholdDays": SILENT_AGENT_DAYS,
-            "link": link("/installs", stale=1),
-        },
+        "byAgent": agents,
     }
 
 
@@ -437,11 +532,13 @@ def card_install_health(run: Runner, scope: InsightsScope) -> Dict[str, Any]:
     return shape_install_health(
         run("install_counts")[0],
         run("install_items_failing", limit=TOP_N),
-        silent_agent_count(run("install_agent_runs")),
+        silent_agent_counts(run("install_agent_runs")),
+        run("install_items_pending"),
+        scope.platform,
     )
 
 
-# ── 6 Check-in Gaps ─────────────────────────────────────────────
+# ── Check-in Gaps ─────────────────────────────────────────────
 
 CHECKIN_HOURS = 24
 
@@ -505,7 +602,7 @@ def card_checkin_gaps(run: Runner, scope: InsightsScope, cursor=None) -> Dict[st
     return shape_checkin_gaps(counts, reasons, run("silent_devices")[0])
 
 
-# ── 7 OS Currency ───────────────────────────────────────────────
+# ── OS Currency ───────────────────────────────────────────────
 
 _VERSION_PREFIX = re.compile(r"^\d+(?:\.\d+)*")
 _JS_FLOAT = re.compile(r"^\s*[+-]?(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?")
@@ -712,7 +809,7 @@ def card_os_currency(run: Runner, scope: InsightsScope) -> Dict[str, Any]:
     return os_currency(rows, scope.platform)
 
 
-# ── 8 Software Risk ─────────────────────────────────────────────
+# ── Software Risk ─────────────────────────────────────────────
 
 
 def shape_software_risk(
@@ -745,7 +842,7 @@ def card_software_risk(run: Runner, scope: InsightsScope) -> Dict[str, Any]:
     )
 
 
-# ── 9 Expiring Certificates ─────────────────────────────────────
+# ── Expiring Certificates ─────────────────────────────────────
 
 
 def shape_certificates(
@@ -782,186 +879,58 @@ def card_certificates(run: Runner, scope: InsightsScope) -> Dict[str, Any]:
     )
 
 
-# ── 10 Local Admin Exposure ─────────────────────────────────────
+# ── Directory Join ──────────────────────────────────────────────
 
-_JOINS = (
+WINDOWS_JOINS = (
     ("entra", "Entra joined"),
     ("domain", "Domain joined"),
     ("hybrid", "Hybrid joined"),
     ("workgroup", "Workgroup"),
 )
+MAC_DIRECTORY = (
+    ("psso", "Platform SSO / Entra", "mac_psso"),
+    ("bound", "AD-bound", "mac_bound"),
+    ("unbound", "Not bound", "mac_unbound"),
+)
 
 
-def shape_local_admins(
-    platform_rows: Sequence[Dict[str, Any]], top: Sequence[Dict[str, Any]]
-) -> Dict[str, Any]:
+def _directory_view(rows: Sequence[Dict[str, Any]], platform: Optional[str], segments) -> Dict[str, Any]:
     def total(col: str) -> int:
-        return sum(_int(r.get(col)) for r in platform_rows)
+        return sum(_int(r.get(col)) for r in rows)
 
-    extra = link("/identity", admins="extra")
     return {
         "devices": total("devices"),
-        "extraAdmins": {"count": total("extra_admins"), "link": extra},
-        "byAdminCount": [
-            {
-                "key": "2",
-                "label": "2 admins",
-                "count": total("admins_2"),
-                "link": link("/identity", admins="2"),
-            },
-            {
-                "key": "3",
-                "label": "3 admins",
-                "count": total("admins_3"),
-                "link": link("/identity", admins="3"),
-            },
-            {
-                "key": "4+",
-                "label": "4 or more admins",
-                "count": total("admins_4_plus"),
-                "link": link("/identity", admins="4+"),
-            },
+        "segments": [
+            {"key": key, "label": label, "count": total(col),
+             "link": link("/identity", **{param: key}, platform=platform)}
+            for key, label, col, param in segments
         ],
-        "topDevices": [
-            {
-                "serialNumber": r["serial"],
-                "name": r.get("name") or r["serial"],
-                "platform": r.get("platform"),
-                "admins": _int(r.get("admins")),
-                "link": device_link(r["serial"]),
-            }
-            for r in top
-        ],
-        "join": [
-            {
-                "key": key,
-                "label": label,
-                "count": total(key),
-                "link": link("/identity", join=key),
-            }
-            for key, label in _JOINS
-        ],
-        "workgroup": {
-            "count": total("workgroup"),
-            "link": link("/identity", join="workgroup"),
-            "byPlatform": [
-                {
-                    "platform": r.get("platform") or "Unknown",
-                    "count": _int(r.get("workgroup")), "link": link("/identity", join="workgroup"),
-                }
-                for r in platform_rows
-                if _int(r.get("workgroup")) > 0
-            ],
-        },
+        "extraAdmins": {"count": total("extra_admins"),
+                        "link": link("/identity", admins="extra", platform=platform)},
+        "shared": {"count": total("shared"), "link": link("/identity", usage="shared", platform=platform)},
+        "assigned": {"count": total("assigned"), "link": link("/identity", usage="assigned", platform=platform)},
     }
 
 
-def card_local_admins(run: Runner, scope: InsightsScope) -> Dict[str, Any]:
-    return shape_local_admins(
-        run("identity_admins"), run("identity_top_admins", limit=TOP_N)
-    )
-
-
-# ── 11 Unused Software ──────────────────────────────────────────
-
-
-def fold_name(raw: str, installed: bool = False) -> str:
-    """The usage bucket a raw app name belongs to, lower-cased for matching.
-    Installed names drop a trailing .app the way fold_installed_devices does."""
-    name = (raw or "").strip()
-    if installed and name.lower().endswith(".app"):
-        name = name[:-4].strip()
-    if not name:
-        return ""
-    return (canonicalize_app_name(name) or name).strip()
-
-
-def shape_unused_software(
-    usage: Sequence[Dict[str, Any]], installed: Dict[str, int]
-) -> Dict[str, Any]:
-    """``usage`` rows carry a display name in ``app`` and a lower-cased fold key
-    in ``key``; ``installed`` maps fold key to installed device count."""
-    apps = []
-    for r in usage:
-        apps.append(
-            {
-                "name": r["app"],
-                "totalHours": round(float(r.get("total_seconds") or 0) / 3600.0, 1),
-                "activeHours": round(float(r.get("active_seconds") or 0) / 3600.0, 1),
-                "devices": _int(r.get("device_count")),
-                "activeDevices": _int(r.get("active_device_count")),
-                "installedDevices": installed.get(r["key"], 0),
-            }
-        )
-    most = sorted(apps, key=lambda a: (-a["totalHours"], a["name"]))[:TOP_N]
-    candidates = [
-        a for a in apps if a["installedDevices"] >= MIN_INSTALLS_FOR_LEAST_USED
-    ]
-    for a in candidates:
-        a["usageRate"] = round(a["activeDevices"] / a["installedDevices"], 3)
-    least = sorted(
-        candidates, key=lambda a: (a["usageRate"], -a["installedDevices"], a["name"])
-    )[:TOP_N]
+def shape_directory_join(platform_rows: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
+    joins = [(k, label, k, "join") for k, label in WINDOWS_JOINS]
+    mac = [(k, label, col, "directory") for k, label, col in MAC_DIRECTORY]
+    win_rows = [r for r in platform_rows if r.get("platform") == "Windows"]
+    mac_rows = [r for r in platform_rows if r.get("platform") == "macOS"]
     return {
-        "days": USAGE_DAYS,
-        "minInstalls": MIN_INSTALLS_FOR_LEAST_USED,
-        "leastUsed": [
-            {
-                k: a[k]
-                for k in ("name", "activeDevices", "installedDevices", "usageRate")
-            }
-            | {"link": app_usage_link(a["name"])}
-            for a in least
-        ],
-        "mostUsed": [
-            {k: a[k] for k in ("name", "totalHours", "activeHours", "activeDevices")}
-            | {"link": app_usage_link(a["name"])}
-            for a in most
-        ],
+        "views": {
+            "all": _directory_view(platform_rows, None, joins),
+            "windows": _directory_view(win_rows, "Windows", joins),
+            "mac": _directory_view(mac_rows, "macOS", mac),
+        }
     }
 
 
-def card_unused_software(
-    run: Runner, scope: InsightsScope, today: Optional[date] = None
-) -> Dict[str, Any]:
-    cutoff = (today or datetime.now(timezone.utc).date()) - timedelta(days=USAGE_DAYS)
-
-    usage_names = [r["app_name"] for r in run("usage_app_names", cutoff=cutoff)]
-    display: Dict[str, str] = {}
-    usage_raw, usage_keys = [], []
-    for raw in usage_names:
-        folded = fold_name(raw)
-        if not folded:
-            continue
-        key = folded.lower()
-        display.setdefault(key, folded)
-        usage_raw.append(raw)
-        usage_keys.append(key)
-    if not usage_raw:
-        return shape_unused_software([], {})
-
-    wanted = set(usage_keys)
-    inst_raw, inst_keys = [], []
-    for r in run("installed_app_names"):
-        key = fold_name(r["app_name"], installed=True).lower()
-        if key in wanted:
-            inst_raw.append(r["app_name"])
-            inst_keys.append(key)
-
-    usage = run(
-        "usage_by_app", cutoff=cutoff, raw_names=usage_raw, folded_names=usage_keys
-    )
-    installed: Dict[str, int] = {}
-    if inst_raw:
-        for r in run("installed_by_app", raw_names=inst_raw, folded_names=inst_keys):
-            installed[r["app"]] = _int(r.get("installed_devices"))
-    for r in usage:
-        r["key"] = r["app"]
-        r["app"] = display.get(r["app"], r["app"])
-    return shape_unused_software(usage, installed)
+def card_directory_join(run: Runner, scope: InsightsScope) -> Dict[str, Any]:
+    return shape_directory_join(run("directory_join"))
 
 
-# ── 12 Connectivity Problems ────────────────────────────────────
+# ── Connectivity Problems ────────────────────────────────────
 
 
 def shape_connectivity(row: Dict[str, Any]) -> Dict[str, Any]:
@@ -989,15 +958,14 @@ def card_connectivity(run: Runner, scope: InsightsScope) -> Dict[str, Any]:
 CARD_FUNCTIONS: Dict[str, Callable[..., Dict[str, Any]]] = {
     "rebootDebt": card_reboot_debt,
     "protectionGaps": card_protection_gaps,
-    "unmanagedDevices": card_unmanaged,
-    "hardwareAtRisk": card_hardware,
+    "managementToolErrors": card_management_tools,
+    "storage": card_storage,
     "installHealth": card_install_health,
     "checkinGaps": card_checkin_gaps,
     "osCurrency": card_os_currency,
     "softwareRisk": card_software_risk,
     "expiringCertificates": card_certificates,
-    "localAdminExposure": card_local_admins,
-    "unusedSoftware": card_unused_software,
+    "directoryJoin": card_directory_join,
     "connectivityProblems": card_connectivity,
 }
 
@@ -1014,7 +982,8 @@ def _error_text(exc: BaseException) -> str:
 
 def run_card(key: str, scope: InsightsScope) -> Dict[str, Any]:
     """One card on its own connection, under its own statement timeout.
-    Any failure becomes ``{"error": ...}`` for this card alone."""
+    Any failure becomes ``{"error": ...}`` for this card alone. Every result
+    carries ``generatedAt``."""
     fn = CARD_FUNCTIONS[key]
     conn = None
     t0 = _time.monotonic()
@@ -1023,21 +992,13 @@ def run_card(key: str, scope: InsightsScope) -> Dict[str, Any]:
         cursor = conn.cursor()
         # SET LOCAL lasts until this transaction ends; closing the connection
         # rolls back, so the pooled connection returns with its own timeout.
-        cursor.execute(
-            f"SET LOCAL statement_timeout = '{int(STATEMENT_TIMEOUT_SECONDS * 1000)}ms'"
-        )
+        cursor.execute(f"SET LOCAL statement_timeout = '{int(STATEMENT_TIMEOUT_SECONDS * 1000)}ms'")
         run = _make_runner(cursor, scope)
-        if key == "checkinGaps":
-            result = fn(run, scope, cursor=cursor)
-        else:
-            result = fn(run, scope)
-        logger.info(f"[INSIGHTS] {key}: {_time.monotonic() - t0:.3f}s")
-        return result
+        result = fn(run, scope, cursor=cursor) if key == "checkinGaps" else fn(run, scope)
+        logger.info(f"[INSIGHTS] {key} platform={scope.platform}: {_time.monotonic() - t0:.3f}s")
     except Exception as exc:
-        logger.error(
-            f"[INSIGHTS] {key} failed after {_time.monotonic() - t0:.3f}s: {exc}"
-        )
-        return {"error": _error_text(exc)}
+        logger.error(f"[INSIGHTS] {key} platform={scope.platform} failed after {_time.monotonic() - t0:.3f}s: {exc}")
+        result = {"error": _error_text(exc)}
     finally:
         if conn is not None:
             try:
@@ -1048,16 +1009,30 @@ def run_card(key: str, scope: InsightsScope) -> Dict[str, Any]:
                 conn.close()
             except Exception:
                 pass
+    result["generatedAt"] = datetime.now(timezone.utc).isoformat()
+    result["computeSeconds"] = round(_time.monotonic() - t0, 3)
+    return result
+
+
+_inventory_state_checked: Optional[tuple] = None
+_INVENTORY_STATE_RECHECK_SECONDS = 600
 
 
 def _has_inventory_state_table() -> bool:
+    """Whether device_inventory_state exists, rechecked every ten minutes."""
+    global _inventory_state_checked
+    now = _time.monotonic()
+    if _inventory_state_checked and now - _inventory_state_checked[1] < _INVENTORY_STATE_RECHECK_SECONDS:
+        return _inventory_state_checked[0]
     conn = None
     try:
         conn = get_db_connection()
         cursor = conn.cursor()
         cursor.execute("SELECT to_regclass('device_inventory_state') IS NOT NULL")
         row = cursor.fetchone()
-        return bool(row and row[0])
+        found = bool(row and row[0])
+        _inventory_state_checked = (found, now)
+        return found
     except Exception as exc:
         logger.warning(f"[INSIGHTS] Could not check for device_inventory_state: {exc}")
         return False
@@ -1069,27 +1044,130 @@ def _has_inventory_state_table() -> bool:
                 pass
 
 
-def compute_insights(
-    platform: str = "all", include_archived: bool = False
-) -> Dict[str, Any]:
-    """Every card for one platform scope. Synchronous: run it off the event loop."""
+def compute_card(key: str, platform: str = "all", include_archived: bool = False) -> Dict[str, Any]:
+    """One card for one scope. Synchronous: run it off the event loop."""
+    return run_card(key, InsightsScope(platform, include_archived, _has_inventory_state_table()))
+
+
+def compute_insights(platform: str = "all", include_archived: bool = False) -> Dict[str, Any]:
+    """Every card for one scope at once (CONCURRENCY at a time). The endpoint
+    assembles the same document from per-card caches instead."""
     t0 = _time.monotonic()
     scope = InsightsScope(platform, include_archived, _has_inventory_state_table())
-    with ThreadPoolExecutor(
-        max_workers=CONCURRENCY, thread_name_prefix="insights"
-    ) as pool:
+    with ThreadPoolExecutor(max_workers=CONCURRENCY, thread_name_prefix="insights") as pool:
         futures = {key: pool.submit(run_card, key, scope) for key in CARD_KEYS}
         cards = {key: futures[key].result() for key in CARD_KEYS}
-    elapsed = _time.monotonic() - t0
-    failed = [k for k, v in cards.items() if "error" in v]
-    logger.info(
-        f"[INSIGHTS] platform={platform} includeArchived={include_archived}: "
-        f"{elapsed:.3f}s, {len(failed)} failed{(' (' + ', '.join(failed) + ')') if failed else ''}"
-    )
     return {
         "generatedAt": datetime.now(timezone.utc).isoformat(),
         "platform": platform,
         "includeArchived": include_archived,
-        "computeSeconds": round(elapsed, 3),
+        "computeSeconds": round(_time.monotonic() - t0, 3),
         "cards": cards,
     }
+
+
+# ── App Usage (GET /dashboard/insights/app-usage) ───────────────
+
+APP_USAGE_TOP = 10
+
+
+def fold_name(raw: str) -> str:
+    """The usage bucket a raw app name belongs to (canonicalize_app_name)."""
+    name = (raw or "").strip()
+    if not name:
+        return ""
+    return (canonicalize_app_name(name) or name).strip()
+
+
+def _csv(values: Sequence[str]) -> Optional[str]:
+    return ",".join(values) if values else None
+
+
+def app_usage_link(name: str, days: int = USAGE_DAYS, usages: Sequence[str] = (),
+                   catalogs: Sequence[str] = (), platform: str = "all") -> Dict[str, Any]:
+    return link(f"/applications/usage/{quote(str(name), safe='')}", days=days,
+                usages=_csv(usages), catalogs=_csv(catalogs),
+                platform=None if platform == "all" else platform)
+
+
+def shape_app_usage(usage: Sequence[Dict[str, Any]], options: Sequence[Dict[str, Any]], *,
+                    platform: str, days: int, usages: Sequence[str], catalogs: Sequence[str]) -> Dict[str, Any]:
+    apps = sorted(
+        ({
+            "name": r["app"],
+            "totalHours": round(float(r.get("total_seconds") or 0) / 3600.0, 1),
+            "activeHours": round(float(r.get("active_seconds") or 0) / 3600.0, 1),
+            "devices": _int(r.get("device_count")),
+            "activeDevices": _int(r.get("active_device_count")),
+        } for r in usage),
+        key=lambda a: (-a["totalHours"], a["name"]),
+    )[:APP_USAGE_TOP]
+    for a in apps:
+        a["link"] = app_usage_link(a["name"], days, usages, catalogs, platform)
+    return {
+        "generatedAt": datetime.now(timezone.utc).isoformat(),
+        "platform": platform,
+        "days": days,
+        "filters": {"usages": list(usages), "catalogs": list(catalogs)},
+        "available": {
+            "usages": [{"value": o["value"], "devices": _int(o.get("devices"))} for o in options if o.get("kind") == "usage"],
+            "catalogs": [{"value": o["value"], "devices": _int(o.get("devices"))} for o in options if o.get("kind") == "catalog"],
+        },
+        "link": link("/applications", type="usage", period=days, usages=_csv(usages),
+                     catalogs=_csv(catalogs), platform=None if platform == "all" else platform),
+        "apps": apps,
+    }
+
+
+def _app_usage(run: Runner, scope: InsightsScope, days: int, usages: Sequence[str],
+               catalogs: Sequence[str], today: Optional[date] = None) -> Dict[str, Any]:
+    cutoff = (today or datetime.now(timezone.utc).date()) - timedelta(days=days)
+    lower_u = [u.lower() for u in usages]
+    lower_c = [c.lower() for c in catalogs]
+    scoped = {"cutoff": cutoff, "usages": lower_u, "catalogs": lower_c}
+    options = run("usage_filter_options")
+    display: Dict[str, str] = {}
+    raw_names, keys = [], []
+    for r in run("usage_app_names", **scoped):
+        folded = fold_name(r["app_name"])
+        if not folded:
+            continue
+        key = folded.lower()
+        display.setdefault(key, folded)
+        raw_names.append(r["app_name"])
+        keys.append(key)
+    usage = run("usage_by_app", raw_names=raw_names, folded_names=keys, **scoped) if raw_names else []
+    for r in usage:
+        r["app"] = display.get(r["app"], r["app"])
+    return shape_app_usage(usage, options, platform=scope.platform, days=days,
+                           usages=usages, catalogs=catalogs)
+
+
+def compute_app_usage(platform: str = "all", usages: Sequence[str] = (), catalogs: Sequence[str] = (),
+                      days: int = USAGE_DAYS) -> Dict[str, Any]:
+    """The App Usage card: top apps by hours within an inventory scope, and the
+    usage and catalog values to filter by. A failure is ``{"error": ...}``."""
+    t0 = _time.monotonic()
+    scope = InsightsScope(platform, False, _has_inventory_state_table())
+    conn = None
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute(f"SET LOCAL statement_timeout = '{int(STATEMENT_TIMEOUT_SECONDS * 1000)}ms'")
+        result = _app_usage(_make_runner(cursor, scope), scope, days, list(usages), list(catalogs))
+        logger.info(f"[INSIGHTS] appUsage platform={platform}: {_time.monotonic() - t0:.3f}s")
+    except Exception as exc:
+        logger.error(f"[INSIGHTS] appUsage platform={platform} failed: {exc}")
+        result = {"error": _error_text(exc), "generatedAt": datetime.now(timezone.utc).isoformat()}
+    finally:
+        if conn is not None:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+            try:
+                conn.close()
+            except Exception:
+                pass
+    result["computeSeconds"] = round(_time.monotonic() - t0, 3)
+    return result

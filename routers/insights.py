@@ -1,11 +1,23 @@
-"""GET /api/v1/dashboard/insights: the dashboard insight cards in one cached call.
+"""The dashboard insight cards: one endpoint per card, and all of them at once.
 
-The computation (dashboard_insights.compute_insights) is a dozen aggregate
-queries. It is cached in process per (platform, includeArchived) for five
-minutes, and a refresh is single-flight: however many dashboards ask at once,
-one computation runs and they all receive its result. Once a value exists it
-is served immediately even when it has expired, while one background refresh
-replaces it, so after the first computation no request waits on the database.
+    GET /api/v1/dashboard/insights/{card}?platform=&includeArchived=
+    GET /api/v1/dashboard/insights/appUsage?platform=&usages=&catalogs=&days=
+    GET /api/v1/dashboard/insights?platform=&includeArchived=
+
+Every card is cached on its own, per scope, so a client can request the cards
+in parallel and paint each as it arrives, and the combined document is
+assembled from the same per-card cache.
+
+In steady state no request waits on SQL. A background refresher recomputes
+every card for all, macOS and Windows every few minutes, one card at a time,
+so at most one card query runs for it at once. Requests are answered from the
+cache. A value past its TTL is still served while a single background refresh
+replaces it. Only a scope nobody has asked for yet (a cold start, an
+includeArchived view, an App Usage filter combination) computes on request,
+and that is single-flight: concurrent callers share one computation.
+
+Every body is stable for a given computation, so the ETag middleware answers
+a poll that brings If-None-Match with 304 and no body.
 """
 
 from __future__ import annotations
@@ -13,7 +25,8 @@ from __future__ import annotations
 import asyncio
 import os
 import time as _time
-from typing import Any, Dict, Optional, Tuple
+from collections import OrderedDict
+from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Response
 from starlette.concurrency import run_in_threadpool
@@ -24,34 +37,66 @@ from dependencies import logger, verify_authentication
 router = APIRouter(tags=["statistics"])
 
 CACHE_TTL_SECONDS = int(os.getenv("INSIGHTS_CACHE_TTL_SECONDS", "300"))
-#: A result with a failed card is retried sooner than a clean one.
+#: A card that failed is retried sooner than a clean one.
 ERROR_TTL_SECONDS = int(os.getenv("INSIGHTS_ERROR_TTL_SECONDS", "60"))
-WARM_ON_STARTUP = os.getenv("INSIGHTS_WARM_ON_STARTUP", "true").lower() in (
-    "true",
-    "1",
-    "yes",
-)
+#: The refresher starts a pass this often; it finishes well inside the TTL.
+REFRESH_INTERVAL_SECONDS = int(os.getenv("INSIGHTS_REFRESH_INTERVAL_SECONDS", "240"))
+#: Pause between two cards of a refresh pass, so the pass is a trickle.
+REFRESH_STAGGER_SECONDS = float(os.getenv("INSIGHTS_REFRESH_STAGGER_SECONDS", "1"))
+BACKGROUND_REFRESH = os.getenv(
+    "INSIGHTS_BACKGROUND_REFRESH", os.getenv("INSIGHTS_WARM_ON_STARTUP", "true")
+).lower() in ("true", "1", "yes")
 WARM_DELAY_SECONDS = float(os.getenv("INSIGHTS_WARM_DELAY_SECONDS", "15"))
+MAX_ENTRIES = int(os.getenv("INSIGHTS_CACHE_MAX_ENTRIES", "256"))
 
-CacheKey = Tuple[str, bool]
+APP_USAGE = "appUsage"
+CARDS = tuple(dashboard_insights.CARD_KEYS) + (APP_USAGE,)
+REFRESH_PLATFORMS = ("all", "macOS", "Windows")
 
-_entries: Dict[CacheKey, Tuple[Dict[str, Any], float]] = {}
+CacheKey = Tuple[Any, ...]
+
+_entries: "OrderedDict[CacheKey, Tuple[Dict[str, Any], float]]" = OrderedDict()
 _inflight: Dict[CacheKey, asyncio.Task] = {}
-_warm_task: Optional[asyncio.Task] = None
+_refresher: Optional[asyncio.Task] = None
+_on_demand: Optional[asyncio.Semaphore] = None
 
 
 def _ttl_for(result: Dict[str, Any]) -> int:
-    cards = result.get("cards") or {}
-    return (
-        ERROR_TTL_SECONDS
-        if any("error" in c for c in cards.values())
-        else CACHE_TTL_SECONDS
-    )
+    return ERROR_TTL_SECONDS if "error" in result else CACHE_TTL_SECONDS
+
+
+def _store(key: CacheKey, result: Dict[str, Any]) -> None:
+    _entries[key] = (result, _time.monotonic())
+    _entries.move_to_end(key)
+    while len(_entries) > MAX_ENTRIES:
+        _entries.popitem(last=False)
+
+
+def _semaphore() -> asyncio.Semaphore:
+    """Bounds on-demand computations, so a cold combined request does not
+    take more pooled connections than the computation would on its own."""
+    global _on_demand
+    loop = asyncio.get_running_loop()
+    if _on_demand is None or getattr(_on_demand, "_rm_loop", None) is not loop:
+        _on_demand = asyncio.Semaphore(dashboard_insights.CONCURRENCY)
+        _on_demand._rm_loop = loop  # type: ignore[attr-defined]
+    return _on_demand
+
+
+def _computation(key: CacheKey) -> Callable[[], Dict[str, Any]]:
+    if key[0] == APP_USAGE:
+        _, platform, usages, catalogs, days = key
+        return lambda: dashboard_insights.compute_app_usage(
+            platform, usages, catalogs, days
+        )
+    card, platform, include_archived = key
+    return lambda: dashboard_insights.compute_card(card, platform, include_archived)
 
 
 async def _compute(key: CacheKey) -> Dict[str, Any]:
-    result = await run_in_threadpool(dashboard_insights.compute_insights, *key)
-    _entries[key] = (result, _time.monotonic())
+    async with _semaphore():
+        result = await run_in_threadpool(_computation(key))
+    _store(key, result)
     return result
 
 
@@ -73,9 +118,9 @@ def _refresh(key: CacheKey) -> asyncio.Task:
     return task
 
 
-async def get_insights(key: CacheKey) -> Tuple[Dict[str, Any], str, float]:
+async def get_cached(key: CacheKey) -> Tuple[Dict[str, Any], str, float]:
     """(result, cache state, age in seconds). State is ``fresh``, ``stale``
-    (expired, served while a refresh runs) or ``miss`` (computed for this call)."""
+    (past its TTL, served while one refresh runs) or ``miss`` (computed now)."""
     entry = _entries.get(key)
     if entry is not None:
         result, stored_at = entry
@@ -96,29 +141,98 @@ def reset_cache() -> None:
     _inflight.clear()
 
 
-async def _warm() -> None:
-    try:
-        await asyncio.sleep(WARM_DELAY_SECONDS)
-        await _refresh(("all", False))
-        logger.info("[INSIGHTS] warmed the platform=all cache")
-    except asyncio.CancelledError:
-        raise
-    except Exception as exc:
-        logger.warning(f"[INSIGHTS] warm-up failed: {exc}")
+# ── Background refresher ────────────────────────────────────────
+
+
+def _default_keys() -> List[CacheKey]:
+    keys: List[CacheKey] = []
+    for platform in REFRESH_PLATFORMS:
+        keys.extend((card, platform, False) for card in dashboard_insights.CARD_KEYS)
+        keys.append((APP_USAGE, platform, (), (), dashboard_insights.USAGE_DAYS))
+    return keys
+
+
+async def refresh_pass() -> None:
+    """Recompute every default card, one at a time."""
+    t0 = _time.monotonic()
+    for key in _default_keys():
+        try:
+            task = _inflight.get(key)
+            if task is not None and not task.done():
+                await asyncio.shield(task)
+            else:
+                result = await run_in_threadpool(_computation(key))
+                _store(key, result)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.warning(f"[INSIGHTS] background refresh of {key} failed: {exc}")
+        await asyncio.sleep(REFRESH_STAGGER_SECONDS)
+    logger.info(f"[INSIGHTS] background refresh pass: {_time.monotonic() - t0:.1f}s")
+
+
+async def _refresh_loop() -> None:
+    await asyncio.sleep(WARM_DELAY_SECONDS)
+    while True:
+        started = _time.monotonic()
+        try:
+            await refresh_pass()
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.warning(f"[INSIGHTS] background refresh pass failed: {exc}")
+        await asyncio.sleep(
+            max(1.0, REFRESH_INTERVAL_SECONDS - (_time.monotonic() - started))
+        )
 
 
 def start_warmup() -> None:
-    """Fill the default entry in the background after startup. Never blocks it."""
-    global _warm_task
-    if WARM_ON_STARTUP and _warm_task is None:
-        _warm_task = asyncio.get_running_loop().create_task(_warm())
+    """Start the background refresher. Never blocks startup."""
+    global _refresher
+    if BACKGROUND_REFRESH and _refresher is None:
+        _refresher = asyncio.get_running_loop().create_task(_refresh_loop())
 
 
 def stop_warmup() -> None:
-    global _warm_task
-    if _warm_task is not None and not _warm_task.done():
-        _warm_task.cancel()
-    _warm_task = None
+    global _refresher
+    if _refresher is not None and not _refresher.done():
+        _refresher.cancel()
+    _refresher = None
+
+
+# ── Endpoints ───────────────────────────────────────────────────
+
+
+def _platform(value: str) -> str:
+    normalized = dashboard_insights.normalize_platform(value)
+    if normalized is None:
+        raise HTTPException(
+            status_code=422, detail="platform must be all, macOS or Windows"
+        )
+    return normalized
+
+
+def _list(value: Optional[str]) -> Tuple[str, ...]:
+    """A comma-separated filter as a sorted, de-duplicated key part."""
+    seen = {v.strip().lower(): v.strip() for v in (value or "").split(",") if v.strip()}
+    return tuple(seen[k] for k in sorted(seen))
+
+
+def _headers(response: Response, state: str, age: float) -> None:
+    response.headers["X-Insights-Cache"] = state
+    response.headers["Age"] = str(int(age))
+
+
+def _envelope(
+    card: str, platform: str, include_archived: bool, data: Dict[str, Any]
+) -> Dict[str, Any]:
+    return {
+        "card": card,
+        "platform": platform,
+        "includeArchived": include_archived,
+        "generatedAt": data.get("generatedAt"),
+        "data": data,
+    }
 
 
 @router.get(
@@ -132,32 +246,95 @@ async def get_dashboard_insights(
     include_archived: bool = Query(default=False, alias="includeArchived"),
 ):
     """
-    The twelve dashboard insight cards in one call.
+    Every dashboard insight card in one document, assembled from the per-card
+    caches (see GET /dashboard/insights/{card}).
 
-    Each card answers one question (devices up 30+ days, devices without
-    disk encryption, managed items failing on the most devices, ...) with
-    counts and short top-N lists only, never device rows. Every item carries
-    ``link: {path, params}``, the report and filter it opens in the apps.
-
-    Computed with aggregate SQL and cached per (platform, includeArchived)
-    for five minutes. An expired value is served while one background
-    refresh replaces it; ``X-Insights-Cache`` says which (fresh, stale,
-    miss) and ``Age`` how old it is. A card that failed server-side is
-    ``{"error": "..."}`` and the others still return.
-
-    Returns ``{generatedAt, platform, includeArchived, computeSeconds,
-    cards: {rebootDebt, protectionGaps, unmanagedDevices, hardwareAtRisk,
-    installHealth, checkinGaps, osCurrency, softwareRisk,
-    expiringCertificates, localAdminExposure, unusedSoftware,
-    connectivityProblems}}``.
+    Returns ``{generatedAt, platform, includeArchived, cards}``. ``cards`` holds
+    installHealth, rebootDebt, protectionGaps, managementToolErrors, storage,
+    checkinGaps, osCurrency, softwareRisk, expiringCertificates, directoryJoin
+    and connectivityProblems. Each card carries its own ``generatedAt``, and a
+    card that failed server-side is ``{"error": "..."}``. App Usage has its own
+    endpoint because it takes its own filters.
     """
-    normalized = dashboard_insights.normalize_platform(platform)
-    if normalized is None:
-        raise HTTPException(
-            status_code=422, detail="platform must be all, macOS or Windows"
+    scope = _platform(platform)
+    results = await asyncio.gather(
+        *(
+            get_cached((card, scope, include_archived))
+            for card in dashboard_insights.CARD_KEYS
         )
+    )
+    states = {state for _r, state, _a in results}
+    state = "miss" if "miss" in states else "stale" if "stale" in states else "fresh"
+    _headers(response, state, max(age for _r, _s, age in results))
+    cards = {
+        card: r for card, (r, _s, _a) in zip(dashboard_insights.CARD_KEYS, results)
+    }
+    return {
+        "generatedAt": max(
+            (c.get("generatedAt") or "" for c in cards.values()), default=None
+        ),
+        "platform": scope,
+        "includeArchived": include_archived,
+        "cards": cards,
+    }
 
-    result, state, age = await get_insights((normalized, include_archived))
-    response.headers["X-Insights-Cache"] = state
-    response.headers["Age"] = str(int(age))
-    return result
+
+@router.get(
+    "/dashboard/insights/appUsage",
+    dependencies=[Depends(verify_authentication)],
+    tags=["statistics"],
+)
+@router.get(
+    "/dashboard/insights/app-usage",
+    dependencies=[Depends(verify_authentication)],
+    tags=["statistics"],
+    include_in_schema=False,
+)
+async def get_app_usage_insight(
+    response: Response,
+    platform: str = Query(default="all", description="all, macOS or Windows"),
+    usages: Optional[str] = Query(
+        default=None, description="Comma-separated inventory usages"
+    ),
+    catalogs: Optional[str] = Query(
+        default=None, description="Comma-separated inventory catalogs"
+    ),
+    days: int = Query(default=30, ge=1, le=365),
+):
+    """
+    The App Usage card: the ten most-used apps by hours in the window, within
+    the usage and catalog filters, and the usage and catalog values available
+    to filter by. Each app link carries the filters. Cached per combination.
+    """
+    scope = _platform(platform)
+    key = (APP_USAGE, scope, _list(usages), _list(catalogs), days)
+    result, state, age = await get_cached(key)
+    _headers(response, state, age)
+    return _envelope(APP_USAGE, scope, False, result)
+
+
+@router.get(
+    "/dashboard/insights/{card}",
+    dependencies=[Depends(verify_authentication)],
+    tags=["statistics"],
+)
+async def get_dashboard_insight(
+    card: str,
+    response: Response,
+    platform: str = Query(default="all", description="all, macOS or Windows"),
+    include_archived: bool = Query(default=False, alias="includeArchived"),
+):
+    """
+    One dashboard insight card: ``{card, platform, includeArchived,
+    generatedAt, data}``. ``data`` is the card, the same object the combined
+    endpoint returns under ``cards[card]``. ``X-Insights-Cache`` says whether
+    it came from the cache (fresh, stale) or was computed for this call (miss).
+    """
+    if card not in dashboard_insights.CARD_KEYS:
+        raise HTTPException(
+            status_code=404, detail=f"Unknown card. Cards: {', '.join(CARDS)}"
+        )
+    scope = _platform(platform)
+    result, state, age = await get_cached((card, scope, include_archived))
+    _headers(response, state, age)
+    return _envelope(card, scope, include_archived, result)

@@ -153,6 +153,7 @@ _NOISE = (
     (re.compile(r'\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2}[.,:]?\d*(?:Z|[+-]\d{2}:?\d{2})?'), "<ts>"),
     (re.compile(r'\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b', re.IGNORECASE), "<guid>"),
     (re.compile(r'\b0x[0-9a-f]+\b', re.IGNORECASE), "<hex>"),
+    (re.compile(r'(?<![\w<])(?:[A-Za-z]:\\[^\s"\']*|~?/(?:[^\s"\'/]+/)+[^\s"\']*)'), "<path>"),
     (re.compile(r'\d+(?:\.\d+){2,}'), "<ver>"),
     (re.compile(r'\b\d+\b'), "<n>"),
     (re.compile(r'\s+'), " "),
@@ -187,3 +188,205 @@ def normalize_message(line: str, width: int = 160) -> str:
     for pattern, replacement in _NOISE:
         text = pattern.sub(replacement, text)
     return text.strip()[:width]
+
+
+# ---------------------------------------------------------------------------
+# Level summaries, stamped onto each log root at ingest
+#
+# The dashboard counts errors and warnings per management tool across the
+# fleet. Classifying every tailed line of every device at query time would
+# mean shipping all the tails to Python on every refresh, so ingest does it
+# once per check-in and stores a few hundred bytes per root under
+# ``levelSummary``: error and warning line counts per UTC hour, and the most
+# frequent normalised error messages with the hour they were last seen. The
+# fleet aggregate is then plain SQL over those summaries.
+#
+# Lines are parsed the way the Mac app's ManagementLogs.parseStructured reads
+# them (convention, bracket stamp, CMTrace, Intune daemon, Munki, syslog, ISO
+# stamp, JSONL events). The summary depends only on the payload, never on the
+# clock, so a repeated identical check-in stamps identical JSON and ingest's
+# unchanged-payload fast path still holds. Times without a zone are taken as
+# UTC; a line with no time takes its root's newestModified hour.
+# ---------------------------------------------------------------------------
+
+from datetime import datetime, timezone
+
+SUMMARY_FIELD = "levelSummary"
+SUMMARY_VERSION = 1
+SUMMARY_MAX_MESSAGES = 20
+SUMMARY_MAX_HOURS = 168
+
+_P_CONVENTION = re.compile(r'^\[(\d{4}-\d{2}-\d{2}) (\d{2}:\d{2}:\d{2})\]\s+(DEBUG|INFO|WARN|WARNING|ERROR|FATAL|CRITICAL)\s+(.*)$', re.S)
+_P_BRACKET_STAMP = re.compile(r'^\[(\d{4}-\d{2}-\d{2})[ T](\d{2}:\d{2}:\d{2})(?:[.,]\d+)?\]\s*(.*)$', re.S)
+_P_BRACKET_LEVEL = re.compile(r'^\[(DEBUG|INFO|WARN|WARNING|ERROR|FATAL|CRITICAL)\]\s*(.*)$', re.I | re.S)
+_P_CMTRACE = re.compile(r'^<!\[LOG\[(.*?)\]LOG\]!><time="([^"]*)"\s+date="([^"]*)"\s+component="([^"]*)"(?:\s+context="[^"]*")?\s+type="(\d)"', re.S)
+_P_DAEMON = re.compile(r'^(\d{4}-\d{2}-\d{2}) (\d{2}:\d{2}:\d{2}):(\d{3}) \| ([^|]+?) \| ([IWE]) \| ', re.S)
+_P_MUNKI = re.compile(r'^([A-Z][a-z]{2}) (\d{2}) (\d{4}) (\d{2}:\d{2}:\d{2}) ([+-]\d{4}) (.*)$', re.S)
+_P_SYSLOG = re.compile(r'^(\d{4}-\d{2}-\d{2}) (\d{2}:\d{2}:\d{2})(?:[+-]\d{2})? (\S+) ([^\[:\s]+)(?:\[\d+\])?: (.*)$', re.S)
+_P_STAMPED = re.compile(r'^(\d{4}-\d{2}-\d{2})[ T](\d{2}:\d{2}:\d{2})(?:[.,:]\d+)?(Z|[+-]\d{2}:?\d{2})?\s+(.*)$', re.S)
+_MONTHS = {m: i for i, m in enumerate(("Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"), 1)}
+_CMTRACE_CLOSE = re.compile(r'\]LOG\]!>.*>\s*$', re.S)
+
+
+def _level_word(value: Any) -> str:
+    """``levelTone`` in the Mac app: a level field's value as a level."""
+    v = str(value or "").upper()
+    if v.startswith("ERR") or v in ("FAULT", "CRITICAL", "FATAL"):
+        return "error"
+    if v.startswith("WARN") or v == "WRN":
+        return "warning"
+    if v.startswith("DEBUG") or v in ("DBG", "VERBOSE", "TRACE"):
+        return "debug"
+    return "info"
+
+
+def _utc(day: str, clock: str, zone: Optional[str] = None) -> Optional[datetime]:
+    try:
+        stamp = datetime.fromisoformat(f"{day}T{clock}")
+    except ValueError:
+        return None
+    if zone:
+        z = zone.replace(":", "")
+        if z == "Z":
+            return stamp.replace(tzinfo=timezone.utc)
+        try:
+            return datetime.fromisoformat(f"{day}T{clock}{z[:3]}:{z[3:5]}").astimezone(timezone.utc)
+        except ValueError:
+            pass
+    return stamp.replace(tzinfo=timezone.utc)
+
+
+def _parse_any_time(value: Any) -> Optional[datetime]:
+    if not isinstance(value, str) or not value.strip():
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def parse_line(line: str, jsonl: bool = False):
+    """``(time, level)`` for one tailed line; time is None when it carries none."""
+    if jsonl:
+        text = line.strip()
+        if text.startswith("{"):
+            try:
+                import json as _json
+                obj = _json.loads(text)
+            except ValueError:
+                obj = None
+            if isinstance(obj, dict):
+                when = next((obj[k] for k in ("timestamp", "time", "ts", "date") if isinstance(obj.get(k), str)), None)
+                level = next((obj[k] for k in ("level", "severity") if isinstance(obj.get(k), str)), None)
+                return _parse_any_time(when), _level_word(level)
+        return None, classify_line(line)
+
+    m = _P_CONVENTION.match(line)
+    if m:
+        return _utc(m.group(1), m.group(2)), _level_word(m.group(3))
+    m = _P_BRACKET_STAMP.match(line)
+    if m:
+        rest = m.group(3)
+        lv = _P_BRACKET_LEVEL.match(rest)
+        return _utc(m.group(1), m.group(2)), (_level_word(lv.group(1)) if lv else classify_line(rest))
+    m = _P_CMTRACE.match(line)
+    if m:
+        clock, date_ = re.sub(r"[+-]\d+$", "", m.group(2)), m.group(3).split("-")
+        when = None
+        if len(date_) == 3:
+            when = _utc(f"{date_[2]}-{date_[0].zfill(2)}-{date_[1].zfill(2)}", clock.split(".")[0])
+        return when, {"3": "error", "2": "warning"}.get(m.group(5), "info")
+    m = _P_DAEMON.match(line)
+    if m:
+        return _utc(m.group(1), m.group(2)), {"E": "error", "W": "warning"}.get(m.group(5), "info")
+    m = _P_MUNKI.match(line)
+    if m:
+        month = _MONTHS.get(m.group(1))
+        when = _utc(f"{m.group(3)}-{month:02d}-{m.group(2)}", m.group(4), m.group(5)) if month else None
+        return when, classify_line(m.group(6))
+    m = _P_SYSLOG.match(line)
+    if m:
+        return _utc(m.group(1), m.group(2)), classify_line(m.group(5))
+    m = _P_STAMPED.match(line)
+    if m:
+        return _utc(m.group(1), m.group(2), m.group(3)), classify_line(m.group(4))
+    return None, classify_line(line)
+
+
+def stitch_cmtrace(lines: List[str]) -> List[str]:
+    """Rejoin a CMTrace record whose message spanned several tailed lines."""
+    out: List[str] = []
+    open_record: Optional[str] = None
+    for line in lines:
+        if open_record is not None:
+            open_record += "\n" + line
+            if _CMTRACE_CLOSE.search(line):
+                out.append(open_record)
+                open_record = None
+            continue
+        if line.startswith("<![LOG[") and not _CMTRACE_CLOSE.search(line):
+            open_record = line
+            continue
+        out.append(line)
+    if open_record is not None:
+        out.append(open_record)
+    return out
+
+
+def _hour(when: Optional[datetime]) -> Optional[str]:
+    return when.strftime("%Y-%m-%dT%H") if when else None
+
+
+def summarize_root(root: Dict[str, Any]) -> Dict[str, Any]:
+    """The ``levelSummary`` for one log root, from its tails."""
+    fallback = _hour(_parse_any_time(root.get("newestModified")))
+    hours: Dict[str, List[int]] = {}
+    undated = [0, 0]
+    messages: Dict[str, List[Any]] = {}
+    tails = root.get("tails") if isinstance(root.get("tails"), list) else []
+    for tail in tails:
+        if not isinstance(tail, dict) or not isinstance(tail.get("lines"), list):
+            continue
+        name = str(tail.get("file") or "").lower()
+        if name.endswith(".json"):
+            continue
+        jsonl = name.endswith(".jsonl")
+        lines = [l for l in tail["lines"] if isinstance(l, str)]
+        for line in (lines if jsonl else stitch_cmtrace(lines)):
+            when, level = parse_line(line, jsonl)
+            if level not in ("error", "warning"):
+                continue
+            slot = 0 if level == "error" else 1
+            hour = _hour(when) or fallback
+            if hour is None:
+                undated[slot] += 1
+                continue
+            hours.setdefault(hour, [0, 0])[slot] += 1
+            if level == "error":
+                key = normalize_message(line)
+                entry = messages.setdefault(key, [0, hour])
+                entry[0] += 1
+                if hour > entry[1]:
+                    entry[1] = hour
+    kept_hours = dict(sorted(hours.items())[-SUMMARY_MAX_HOURS:])
+    top = sorted(messages.items(), key=lambda kv: (-kv[1][0], kv[0]))[:SUMMARY_MAX_MESSAGES]
+    return {
+        "v": SUMMARY_VERSION,
+        "hours": kept_hours,
+        "undated": undated,
+        "errors": [{"m": m, "n": n, "last": last} for m, (n, last) in top],
+    }
+
+
+def stamp_log_summaries(management: Any) -> Any:
+    """Write ``levelSummary`` onto every log root of a management module, in place."""
+    target = management[0] if isinstance(management, list) and len(management) == 1 else management
+    for root in _roots(target):
+        try:
+            root[SUMMARY_FIELD] = summarize_root(root)
+        except Exception:
+            root.pop(SUMMARY_FIELD, None)
+    return management
