@@ -65,7 +65,7 @@ Only asymmetric signatures (`RS*`/`ES*`) are accepted; `none` and `HS*` are refu
 
 ## Dashboard insights
 
-The dashboard's insight cards come from small cached endpoints, one per card, so a client can request them all at once and draw each card as soon as it arrives. Each card answers one question with a few counts and short top-N lists, so no client downloads a bulk report to draw one. The cards are `installHealth`, `rebootDebt`, `protectionGaps`, `managementToolErrors`, `storage`, `checkinGaps`, `osCurrency`, `softwareRisk`, `expiringCertificates`, `directoryJoin`, `connectivityProblems` and `appUsage`. Request one card for one platform:
+The dashboard's insight cards come from small cached endpoints, one per card, so a client can request them all at once and draw each card as soon as it arrives. Each card answers one question with a few counts and short top-N lists, so no client downloads a bulk report to draw one. The cards are `installHealth`, `managementToolLogs`, `checkinGaps`, `rebootDebt`, `protectionGaps`, `storage`, `osCurrency`, `softwareRisk`, `expiringCertificates`, `directoryServices`, `connectivityProblems` and `appUsage`. `managementToolErrors`, the old name of `managementToolLogs`, still answers for one release. Request one card for one platform:
 
 ```
 curl -H "X-API-Key: $REPORTMATE_KEY" "http://localhost:8000/api/v1/dashboard/insights/storage?platform=macOS"
@@ -91,15 +91,17 @@ Each card is aggregate SQL over the module tables, run under a 20-second stateme
 
 The `X-Insights-Cache` response header says `fresh`, `stale` or `miss`, and `Age` gives the value's age in seconds. Every response carries an ETag, so a client that polls with `If-None-Match` gets a 304 with no body until the card changes.
 
-Management Tools Errors counts the error and warning lines in each management tool's log tails over the last 24 hours. Ingest parses the tails once, as they arrive, and stores a small `levelSummary` on each log root: error and warning counts per UTC hour, and the most frequent error messages with numbers, paths and GUIDs stripped. The card is SQL over those summaries, so it never reads the tails themselves.
+Management Tools Logs counts the error and warning lines in each management tool's log tails over the last 24 hours. The MDM agent is not one of those tools, so a log root the client tags as the MDM or enrollment agent, or one named after the MDM the device is enrolled in, is left out. Ingest parses the tails once, as they arrive, and stores a small `levelSummary` on each log root: error and warning counts per UTC hour, and the most frequent error messages with the leading timestamp and level, numbers, paths and GUIDs stripped. The card groups messages by tool and message text. The card is SQL over those summaries, so it never reads the tails themselves.
 
 The devices behind a tool's row come from the same summaries. This lists the devices with error lines in the Munki or Cimian log over the last 24 hours, most lines first:
 
 ```
-curl -H "X-API-Key: $REPORTMATE_KEY" "http://localhost:8000/api/v1/dashboard/insights/managementToolErrors/devices?tool=installs&level=error&hours=24&platform=macOS"
+curl -H "X-API-Key: $REPORTMATE_KEY" "http://localhost:8000/api/v1/dashboard/insights/managementToolLogs/devices?tool=installs&level=error&hours=24&platform=macOS"
 ```
 
 `tool` is the log root key from the card's link, `level` is `error` or `warning`, and `hours` is 1 to 168. The response is `{tool, level, hours, platform, generatedAt, devices}`. Each device has `serialNumber`, `deviceName`, `platform`, `count`, `lastAt` (the start of the latest UTC hour with such a line) and a `link` to its log viewer. It is cached like the cards.
+
+The Directory Services card uses the Identity report's Directory Services classification and names: Cloud Joined, Domain Joined (split into Trusted, Unconfirmed and Broken by domain trust), Standard and Unjoined. Each segment links to `/identity?directory=<name>`.
 
 These environment variables tune it: `INSIGHTS_CACHE_TTL_SECONDS` (300), `INSIGHTS_ERROR_TTL_SECONDS` (60), `INSIGHTS_REFRESH_INTERVAL_SECONDS` (240), `INSIGHTS_REFRESH_STAGGER_SECONDS` (1), `INSIGHTS_BACKGROUND_REFRESH` (true), `INSIGHTS_WARM_DELAY_SECONDS` (15), `INSIGHTS_STATEMENT_TIMEOUT_SECONDS` (20), `INSIGHTS_CONCURRENCY` (3, capped at a quarter of `DB_POOL_MAX`, which bounds on-demand computations) and `INSIGHTS_CACHE_MAX_ENTRIES` (256).
 

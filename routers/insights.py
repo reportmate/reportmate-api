@@ -50,7 +50,7 @@ WARM_DELAY_SECONDS = float(os.getenv("INSIGHTS_WARM_DELAY_SECONDS", "15"))
 MAX_ENTRIES = int(os.getenv("INSIGHTS_CACHE_MAX_ENTRIES", "256"))
 
 APP_USAGE = "appUsage"
-TOOL_DEVICES = "managementToolErrors/devices"
+TOOL_DEVICES = "managementToolLogs/devices"
 CARDS = tuple(dashboard_insights.CARD_KEYS) + (APP_USAGE,)
 REFRESH_PLATFORMS = ("all", "macOS", "Windows")
 
@@ -254,9 +254,10 @@ async def get_dashboard_insights(
     caches (see GET /dashboard/insights/{card}).
 
     Returns ``{generatedAt, platform, includeArchived, cards}``. ``cards`` holds
-    installHealth, rebootDebt, protectionGaps, managementToolErrors, storage,
-    checkinGaps, osCurrency, softwareRisk, expiringCertificates, directoryJoin
-    and connectivityProblems. Each card carries its own ``generatedAt``, and a
+    installHealth, managementToolLogs, checkinGaps, rebootDebt, protectionGaps,
+    storage, osCurrency, softwareRisk, expiringCertificates, directoryServices
+    and connectivityProblems, plus managementToolErrors, the old name of
+    managementToolLogs, kept for one release. Each card carries its own ``generatedAt``, and a
     card that failed server-side is ``{"error": "..."}``. App Usage has its own
     endpoint because it takes its own filters.
     """
@@ -273,6 +274,8 @@ async def get_dashboard_insights(
     cards = {
         card: r for card, (r, _s, _a) in zip(dashboard_insights.CARD_KEYS, results)
     }
+    for old, new in dashboard_insights.CARD_ALIASES.items():
+        cards[old] = cards[new]
     return {
         "generatedAt": max(
             (c.get("generatedAt") or "" for c in cards.values()), default=None
@@ -318,21 +321,29 @@ async def get_app_usage_insight(
 
 
 @router.get(
+    "/dashboard/insights/managementToolLogs/devices",
+    dependencies=[Depends(verify_authentication)],
+    tags=["statistics"],
+)
+@router.get(
     "/dashboard/insights/managementToolErrors/devices",
     dependencies=[Depends(verify_authentication)],
     tags=["statistics"],
+    include_in_schema=False,
 )
 async def get_tool_error_devices(
     response: Response,
     tool: str = Query(..., min_length=1, max_length=64, pattern=r"^[A-Za-z0-9_.-]+$",
-                      description="Log root key, as in a Management Tools Errors link (installs, bootstrap, mdm, ...)"),
+                      description="Log root key, as in a Management Tools Logs link (installs, bootstrap, reports, ...)"),
     level: str = Query(default="error", pattern="^(error|warning)$"),
     hours: int = Query(default=24, ge=1, le=168),
     platform: str = Query(default="all", description="all, macOS or Windows"),
 ):
     """
-    The devices behind a Management Tools Errors row: those whose log for
-    ``tool`` has ``level`` lines in the last ``hours``, most lines first.
+    The devices behind a Management Tools Logs row: those whose log for
+    ``tool`` has ``level`` lines in the last ``hours``, most lines first. The
+    MDM agent's logs are left out, as on the card. The old path under
+    managementToolErrors answers too, for one release.
 
     Returns ``{tool, level, hours, platform, generatedAt, devices: [{serialNumber,
     deviceName, platform, count, lastAt, link}]}``. ``lastAt`` is the start of
@@ -363,6 +374,8 @@ async def get_dashboard_insight(
     endpoint returns under ``cards[card]``. ``X-Insights-Cache`` says whether
     it came from the cache (fresh, stale) or was computed for this call (miss).
     """
+    requested = card
+    card = dashboard_insights.CARD_ALIASES.get(card, card)
     if card not in dashboard_insights.CARD_KEYS:
         raise HTTPException(
             status_code=404, detail=f"Unknown card. Cards: {', '.join(CARDS)}"
@@ -370,4 +383,4 @@ async def get_dashboard_insight(
     scope = _platform(platform)
     result, state, age = await get_cached((card, scope, include_archived))
     _headers(response, state, age)
-    return _envelope(card, scope, include_archived, result)
+    return _envelope(requested, scope, include_archived, result)

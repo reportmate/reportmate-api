@@ -70,17 +70,20 @@ CARD_KEYS = (
     "installHealth",
     "rebootDebt",
     "protectionGaps",
-    "managementToolErrors",
+    "managementToolLogs",
     "storage",
     "checkinGaps",
     "osCurrency",
     "softwareRisk",
     "expiringCertificates",
-    "directoryJoin",
+    "directoryServices",
     "connectivityProblems",
 )
 
 PLATFORMS = ("all", "macOS", "Windows")
+
+#: Old card keys still answered for one release, mapped to their new key.
+CARD_ALIASES = {"managementToolErrors": "managementToolLogs"}
 
 
 def normalize_platform(value: Optional[str]) -> Optional[str]:
@@ -139,6 +142,8 @@ def _iso(value: Any) -> Optional[str]:
 
 _TRUE = "('true', 't', 'yes', 'y', 'on', '1')"
 _FALSE = "('false', 'f', 'no', 'n', 'off', '0')"
+#: JavaScript falsy JSON values, for rules ported from the web app as-is.
+_JS_FALSY = "('false'::jsonb, '0'::jsonb, '\"\"'::jsonb, 'null'::jsonb)"
 _NOT_STORED = (
     "NOT EXISTS (SELECT 1 FROM device_inventory_state st "
     "WHERE st.serial_number = UPPER(d.serial_number) AND st.state = 'storage')"
@@ -162,13 +167,14 @@ def card_sql(name: str, scope: InsightsScope, select: Optional[str] = None) -> s
     fleet = load_sql("insights/fleet").replace(
         "/*NOT_STORED*/", _NOT_STORED if scope.has_inventory_state else "TRUE"
     )
-    text = load_sql(f"insights/{name}")
+    text = load_sql(f"insights/{name}").replace("/*MANAGEMENT_ROOTS*/", load_sql("insights/management_roots"))
     if select:
         text = text.replace("/*STORAGE_SELECT*/", load_sql(f"insights/{select}"))
     return (
         text
         .replace("/*FLEET*/", fleet)
         .replace("{{TRUE}}", _TRUE)
+        .replace("{{JS_FALSY}}", _JS_FALSY)
         .replace("{{FALSE}}", _FALSE)
     )
 
@@ -276,7 +282,7 @@ def card_protection_gaps(run: Runner, scope: InsightsScope) -> Dict[str, Any]:
     return shape_protection_gaps(run("security_flags")[0])
 
 
-# ── Management Tools Errors ─────────────────────────────────────
+# ── Management Tools Logs ───────────────────────────────────────
 
 #: The window the card counts over, in hours.
 TOOL_WINDOW_HOURS = 24
@@ -351,29 +357,54 @@ def shape_management_tools(rows: Sequence[Dict[str, Any]], messages: Sequence[Di
     return {
         "windowHours": TOOL_WINDOW_HOURS,
         "tools": ordered,
-        "topErrors": [
-            {
-                "message": m["message"],
-                "tool": m["tool"],
-                "name": tool_product(m["tool"], m.get("platform"), m.get("mdm_name")),
-                "devices": _int(m.get("devices")),
-                "lines": _int(m.get("lines")),
-                "link": _tool_link(m["tool"], "error", m.get("platform")),
-                "sampleDevice": {
-                    "serialNumber": m["sample_serial"],
-                    "link": tool_device_link(m["sample_serial"], m["tool"]),
-                },
-            }
-            for m in messages
-        ],
+        "topErrors": top_tool_messages(messages),
     }
+
+
+def top_tool_messages(messages: Sequence[Dict[str, Any]], limit: int = TOP_N) -> List[Dict[str, Any]]:
+    """Group stored messages by tool and message, after stripping any stamp,
+    offset or level prefix an older summary kept, and sum devices and lines."""
+    from log_tails import strip_message_prefix
+
+    grouped: Dict[Any, Dict[str, Any]] = {}
+    for m in messages:
+        tool = m.get("tool") or ""
+        text = strip_message_prefix(m.get("message") or "")
+        if not text:
+            continue
+        g = grouped.setdefault((tool, text), {"tool": tool, "message": text, "devices": 0, "lines": 0,
+                                              "platforms": set(), "sample": m.get("sample_serial")})
+        g["devices"] += _int(m.get("devices"))
+        g["lines"] += _int(m.get("lines"))
+        g["platforms"].update(p for p in (m.get("platforms") or []) if p)
+        if m.get("sample_serial") and (not g["sample"] or m["sample_serial"] < g["sample"]):
+            g["sample"] = m["sample_serial"]
+    ordered = sorted(grouped.values(), key=lambda g: (-g["devices"], -g["lines"], g["tool"], g["message"]))[:limit]
+    out = []
+    for g in ordered:
+        platforms = sorted(g["platforms"])
+        single = platforms[0] if len(platforms) == 1 else None
+        names = [] if not platforms else sorted({tool_product(g["tool"], p) for p in platforms})
+        out.append({
+            "message": g["message"],
+            "tool": g["tool"],
+            "name": " / ".join(names) if names else tool_product(g["tool"], None),
+            "devices": g["devices"],
+            "lines": g["lines"],
+            "link": _tool_link(g["tool"], "error", single),
+            "sampleDevice": {
+                "serialNumber": g["sample"],
+                "link": tool_device_link(g["sample"], g["tool"]),
+            },
+        })
+    return out
 
 
 def card_management_tools(run: Runner, scope: InsightsScope) -> Dict[str, Any]:
     since = window_start_hour()
     return shape_management_tools(
         run("management_tool_errors", since_hour=since),
-        run("management_tool_messages", since_hour=since, limit=TOP_N),
+        run("management_tool_messages", since_hour=since, limit=200),
     )
 
 
@@ -879,55 +910,51 @@ def card_certificates(run: Runner, scope: InsightsScope) -> Dict[str, Any]:
     )
 
 
-# ── Directory Join ──────────────────────────────────────────────
+# ── Directory Services ──────────────────────────────────────────
 
-WINDOWS_JOINS = (
-    ("entra", "Entra joined"),
-    ("domain", "Domain joined"),
-    ("hybrid", "Hybrid joined"),
-    ("workgroup", "Workgroup"),
+#: The Identity report Directory Services widget: its categories, in its order,
+#: and the trust breakdown of Domain Joined. Keys are the report own labels.
+DIRECTORY_SEGMENTS = (
+    ("Cloud Joined", "cloud_joined"),
+    ("Domain Joined", "domain_joined"),
+    ("Standard", "standard"),
+    ("Unjoined", "unjoined"),
 )
-MAC_DIRECTORY = (
-    ("psso", "Platform SSO / Entra", "mac_psso"),
-    ("bound", "AD-bound", "mac_bound"),
-    ("unbound", "Not bound", "mac_unbound"),
+DIRECTORY_TRUST = (
+    ("Trusted", "trusted"),
+    ("Unconfirmed", "unconfirmed"),
+    ("Broken", "broken"),
 )
 
 
-def _directory_view(rows: Sequence[Dict[str, Any]], platform: Optional[str], segments) -> Dict[str, Any]:
-    def total(col: str) -> int:
-        return sum(_int(r.get(col)) for r in rows)
+def _scoped(platform: str) -> Optional[str]:
+    return None if platform == "all" else platform
 
+
+def shape_directory_services(row: Dict[str, Any], platform: str = "all") -> Dict[str, Any]:
+    p = _scoped(platform)
+
+    def segment(key: str, col: str) -> Dict[str, Any]:
+        return {"key": key, "label": key, "count": _int(row.get(col)),
+                "link": link("/identity", directory=key, platform=p)}
+
+    segments = []
+    for key, col in DIRECTORY_SEGMENTS:
+        entry = segment(key, col)
+        if key == "Domain Joined":
+            entry["trust"] = [segment(k, c) for k, c in DIRECTORY_TRUST]
+        segments.append(entry)
     return {
-        "devices": total("devices"),
-        "segments": [
-            {"key": key, "label": label, "count": total(col),
-             "link": link("/identity", **{param: key}, platform=platform)}
-            for key, label, col, param in segments
-        ],
-        "extraAdmins": {"count": total("extra_admins"),
-                        "link": link("/identity", admins="extra", platform=platform)},
-        "shared": {"count": total("shared"), "link": link("/identity", usage="shared", platform=platform)},
-        "assigned": {"count": total("assigned"), "link": link("/identity", usage="assigned", platform=platform)},
+        "devices": _int(row.get("devices")),
+        "segments": segments,
+        "extraAdmins": {"count": _int(row.get("extra_admins")), "link": link("/identity", admins="extra", platform=p)},
+        "shared": {"count": _int(row.get("shared")), "link": link("/identity", usage="shared", platform=p)},
+        "assigned": {"count": _int(row.get("assigned")), "link": link("/identity", usage="assigned", platform=p)},
     }
 
 
-def shape_directory_join(platform_rows: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
-    joins = [(k, label, k, "join") for k, label in WINDOWS_JOINS]
-    mac = [(k, label, col, "directory") for k, label, col in MAC_DIRECTORY]
-    win_rows = [r for r in platform_rows if r.get("platform") == "Windows"]
-    mac_rows = [r for r in platform_rows if r.get("platform") == "macOS"]
-    return {
-        "views": {
-            "all": _directory_view(platform_rows, None, joins),
-            "windows": _directory_view(win_rows, "Windows", joins),
-            "mac": _directory_view(mac_rows, "macOS", mac),
-        }
-    }
-
-
-def card_directory_join(run: Runner, scope: InsightsScope) -> Dict[str, Any]:
-    return shape_directory_join(run("directory_join"))
+def card_directory_services(run: Runner, scope: InsightsScope) -> Dict[str, Any]:
+    return shape_directory_services(run("directory_services")[0], scope.platform)
 
 
 # ── Connectivity Problems ────────────────────────────────────
@@ -958,14 +985,14 @@ def card_connectivity(run: Runner, scope: InsightsScope) -> Dict[str, Any]:
 CARD_FUNCTIONS: Dict[str, Callable[..., Dict[str, Any]]] = {
     "rebootDebt": card_reboot_debt,
     "protectionGaps": card_protection_gaps,
-    "managementToolErrors": card_management_tools,
+    "managementToolLogs": card_management_tools,
     "storage": card_storage,
     "installHealth": card_install_health,
     "checkinGaps": card_checkin_gaps,
     "osCurrency": card_os_currency,
     "softwareRisk": card_software_risk,
     "expiringCertificates": card_certificates,
-    "directoryJoin": card_directory_join,
+    "directoryServices": card_directory_services,
     "connectivityProblems": card_connectivity,
 }
 
@@ -1173,7 +1200,7 @@ def compute_app_usage(platform: str = "all", usages: Sequence[str] = (), catalog
     return result
 
 
-# ── Management Tools Errors: matching devices ───────────────────
+# ── Management Tools Logs: matching devices ─────────────────────
 
 TOOL_DEVICES_LIMIT = 5000
 TOOL_LEVELS = ("error", "warning")

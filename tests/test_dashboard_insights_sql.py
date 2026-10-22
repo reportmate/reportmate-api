@@ -236,6 +236,7 @@ MANAGEMENT = {
     "SAMPLE1": {"logs": {"roots": [
         root("installs", [
             munki_line(ago(hours=1), "ERROR: Download of SAMPLE App failed: 404"),
+            ago(hours=1).strftime("%Y-%m-%dT%H:%M:%S.123 -07:00") + " [ERR] Device registration failed for 3f2504e0-4f89-11d3-9a0c-0305e82c3301",
             munki_line(ago(hours=2), "ERROR: Could not process item SAMPLE Tool"),
             munki_line(ago(hours=2), "WARNING: SAMPLE warning"),
             munki_line(ago(days=3), "ERROR: An old failure outside the window"),
@@ -244,7 +245,10 @@ MANAGEMENT = {
         root("mdm", [ago(hours=2).strftime("%Y-%m-%d %H:%M:%S") + ":123 | IntuneMdmAgent | E | 77 | SAMPLE | check-in failed"],
              name="Intune"),
     ]}},
-    "SAMPLE2": {"logs": {"roots": [
+    "SAMPLE2": {"mdmEnrollment": {"isEnrolled": True, "serverUrl": "https://sample.jamfcloud.com/mdm"},
+                "logs": {"roots": [
+        # Named after the MDM this device is enrolled in, so not a management tool.
+        root("jamf", [munki_line(ago(hours=2), "ERROR: SAMPLE Jamf agent failure")], name="Jamf Pro"),
         root("installs", [
             munki_line(ago(hours=3), "ERROR: Download of SAMPLE App failed: 500"),
             munki_line(ago(hours=3), "WARNING: Another SAMPLE warning"),
@@ -348,7 +352,11 @@ IDENTITY = {
     },
     "SAMPLE2": {"users": [{"isAdmin": True}], "platformSSOUsers": {"deviceRegistered": True}},
     "SAMPLE3": {"users": [{"isAdmin": True}], "directoryServices": {"activeDirectory": {"bound": True}}},
+    "SAMPLE4": {"users": [], "directoryServices": {"activeDirectory": {"isDomainJoined": True}},
+                "domainTrust": {"trustStatus": "Broken"}},
+    "SAMPLE10": {"users": [], "directoryServices": {"workgroup": "WORKGROUP"}},
     "SAMPLE8": {
+        "domainTrust": {"trustStatus": "Healthy"},
         "users": [{"isAdmin": True}] * 4,
         "directoryServices": {
             "activeDirectory": {"bound": True},
@@ -626,28 +634,35 @@ def test_install_health_platform_drops_the_other_agent(insights):
     assert card["withErrors"]["count"] == 1
 
 
-def test_management_tool_errors(insights):
-    card = insights.compute_card("managementToolErrors")
+def test_management_tool_logs(insights):
+    card = insights.compute_card("managementToolLogs")
     tools = {t["name"]: t for t in card["tools"]}
-    assert set(tools) == {"Munki", "Cimian", "BootstrapMate", "Intune"}
+    # The MDM agent is out: tagged mdm on SAMPLE1, and named after the
+    # device's own MDM (Jamf, from its enrollment URL) on SAMPLE2.
+    assert set(tools) == {"Munki", "Cimian", "BootstrapMate"}
     munki = tools["Munki"]
     assert (munki["devices"], munki["devicesWithErrors"], munki["devicesWithWarnings"]) == (2, 2, 2)
-    assert munki["errorLines"] == 3
+    assert munki["errorLines"] == 4
     assert munki["link"] == {"path": "/devices", "params": {"tool": "installs", "level": "error", "platform": "macOS"}}
     assert tools["Cimian"]["devicesWithErrors"] == 1
     assert tools["BootstrapMate"]["link"]["params"] == {"tool": "bootstrap", "level": "error"}
-    assert tools["Intune"]["devicesWithErrors"] == 1
     assert card["tools"][0]["name"] == "Munki"
 
     top = card["topErrors"][0]
     assert (top["name"], top["devices"]) == ("Munki", 2)
-    assert "SAMPLE App failed" in top["message"] and "404" not in top["message"]
+    assert top["message"].startswith("Download of SAMPLE App failed") and "404" not in top["message"]
     assert top["sampleDevice"]["link"] == {
         "path": "/device/SAMPLE1",
         "params": {"tab": "management", "tool": "installs", "level": "error"},
     }
-    assert all("archived" not in m["message"] for m in card["topErrors"])
-    assert all("old failure" not in m["message"] for m in card["topErrors"])
+    messages = [m["message"] for m in card["topErrors"]]
+    assert "Device registration failed for <guid>" in messages
+    assert len(messages) == len(set((m["tool"], m["message"]) for m in card["topErrors"]))
+    assert not any("archived" in m or "old failure" in m or "Jamf" in m or "check-in" in m for m in messages)
+
+
+def test_management_tool_errors_is_an_alias(insights):
+    assert "managementToolErrors" in insights.CARD_ALIASES
 
 
 def test_storage(insights):
@@ -664,24 +679,29 @@ def test_storage(insights):
     assert card["fullest"][0]["freePct"] == 3.0
 
 
-def test_directory_join(insights):
-    views = insights.compute_card("directoryJoin")["views"]
+def test_directory_services(insights):
+    card = insights.compute_card("directoryServices")
+    assert card["devices"] == 7
+    segments = {seg["key"]: seg for seg in card["segments"]}
+    assert [seg["key"] for seg in card["segments"]] == ["Cloud Joined", "Domain Joined", "Standard", "Unjoined"]
+    assert {k: v["count"] for k, v in segments.items()} == {
+        "Cloud Joined": 2, "Domain Joined": 3, "Standard": 1, "Unjoined": 1,
+    }
+    assert {t["key"]: t["count"] for t in segments["Domain Joined"]["trust"]} == {
+        "Trusted": 1, "Unconfirmed": 1, "Broken": 1,
+    }
+    assert segments["Cloud Joined"]["link"] == {"path": "/identity", "params": {"directory": "Cloud Joined"}}
+    assert segments["Domain Joined"]["trust"][2]["link"]["params"] == {"directory": "Broken"}
+    assert (card["extraAdmins"]["count"], card["shared"]["count"], card["assigned"]["count"]) == (2, 1, 2)
 
-    def seg(view):
-        return {s["key"]: s["count"] for s in views[view]["segments"]}
 
-    assert seg("all") == {"entra": 1, "domain": 1, "hybrid": 1, "workgroup": 2}
-    assert seg("windows") == {"entra": 1, "domain": 0, "hybrid": 1, "workgroup": 0}
-    assert seg("mac") == {"psso": 1, "bound": 1, "unbound": 1}
-    assert (views["all"]["extraAdmins"]["count"], views["all"]["shared"]["count"],
-            views["all"]["assigned"]["count"]) == (2, 1, 2)
-    assert views["windows"]["extraAdmins"]["count"] == 1
-    assert views["mac"]["assigned"]["count"] == 1
-    assert views["all"]["segments"][3]["link"] == {"path": "/identity", "params": {"join": "workgroup"}}
-    assert views["windows"]["segments"][3]["link"]["params"] == {"join": "workgroup", "platform": "Windows"}
-    assert views["mac"]["segments"][0]["link"]["params"] == {"directory": "psso", "platform": "macOS"}
-    assert views["mac"]["extraAdmins"]["link"]["params"] == {"admins": "extra", "platform": "macOS"}
-    assert views["windows"]["shared"]["link"]["params"] == {"usage": "shared", "platform": "Windows"}
+def test_directory_services_follows_the_platform_toggle(insights):
+    card = insights.compute_card("directoryServices", "Windows")
+    assert {seg["key"]: seg["count"] for seg in card["segments"]} == {
+        "Cloud Joined": 1, "Domain Joined": 1, "Standard": 0, "Unjoined": 1,
+    }
+    assert card["segments"][3]["link"]["params"] == {"directory": "Unjoined", "platform": "Windows"}
+    assert card["extraAdmins"]["link"]["params"] == {"admins": "extra", "platform": "Windows"}
 
 
 def test_app_usage(insights):
@@ -711,7 +731,7 @@ def test_every_card_carries_generated_at(insights):
 def test_management_tool_error_devices(insights):
     result = insights.compute_tool_devices("installs", "error", 24, "all")
     assert [(d["serialNumber"], d["count"]) for d in result["devices"]] == [
-        ("SAMPLE1", 2), ("SAMPLE8", 1), ("SAMPLE2", 1),
+        ("SAMPLE1", 3), ("SAMPLE8", 1), ("SAMPLE2", 1),
     ]
     first = result["devices"][0]
     assert first["deviceName"] == "SAMPLE1-name" and first["platform"] == "macOS"
@@ -724,7 +744,8 @@ def test_management_tool_error_devices(insights):
     assert [d["serialNumber"] for d in mac["devices"]] == ["SAMPLE1", "SAMPLE2"]
     warnings = insights.compute_tool_devices("installs", "warning", 24, "all")
     assert sorted(d["serialNumber"] for d in warnings["devices"]) == ["SAMPLE1", "SAMPLE2"]
-    assert [d["serialNumber"] for d in insights.compute_tool_devices("mdm")["devices"]] == ["SAMPLE1"]
+    assert insights.compute_tool_devices("mdm")["devices"] == []
+    assert insights.compute_tool_devices("jamf")["devices"] == []
     week = insights.compute_tool_devices("installs", "error", 168, "macOS")
-    assert [(d["serialNumber"], d["count"]) for d in week["devices"]][0] == ("SAMPLE1", 3)
+    assert [(d["serialNumber"], d["count"]) for d in week["devices"]][0] == ("SAMPLE1", 4)
     assert insights.compute_tool_devices("nosuchtool")["devices"] == []
