@@ -183,13 +183,111 @@ Runner = Callable[..., List[Dict[str, Any]]]
 
 
 def _make_runner(cursor, scope: InsightsScope) -> Runner:
-    def run(name: str, _select: Optional[str] = None, **extra: Any) -> List[Dict[str, Any]]:
-        params = {**scope.params, **extra}
-        cursor.execute(card_sql(name, scope, _select), params)
+    """Run a card query in ``scope``. For the whole fleet (``all``) each query
+    runs once per platform and the parts are merged (see QUERY_MERGE), so no
+    single statement scans the fleet: the 'all' view cannot time out while its
+    platform parts finish, and each part has the full statement timeout."""
+
+    def execute(name: str, select: Optional[str], params: Dict[str, Any]) -> List[Dict[str, Any]]:
+        cursor.execute(card_sql(name, scope, select), params)
         cols = [c[0] for c in (cursor.description or [])]
         return [dict(zip(cols, row)) for row in cursor.fetchall()]
 
+    def run(name: str, _select: Optional[str] = None, **extra: Any) -> List[Dict[str, Any]]:
+        params = {**scope.params, **extra}
+        spec = QUERY_MERGE.get(_select or name)
+        if params.get("platform") != "all" or spec is None:
+            return execute(name, _select, params)
+        limit = params.get("limit")
+        parts = []
+        for platform in FLEET_PLATFORMS:
+            part = dict(params, platform=platform)
+            if limit is not None:
+                # A platform's top rows are not the fleet's: fetch deeper, trim after merging.
+                part["limit"] = max(int(limit) * SPLIT_LIMIT_FACTOR, SPLIT_LIMIT_FLOOR)
+            parts.append(execute(name, _select, part))
+        return merge_rows(parts, spec, limit)
+
     return run
+
+
+#: The platform values fleet.sql assigns. They partition the fleet, so device
+#: counts from the parts add up to the fleet count.
+FLEET_PLATFORMS = ("macOS", "Windows", "Unknown")
+SPLIT_LIMIT_FACTOR = 20
+SPLIT_LIMIT_FLOOR = 200
+
+#: How each card query's per-platform parts merge into the fleet answer.
+#:   sum             one aggregate row: add every numeric column
+#:   concat          rows already distinct per platform: keep them all
+#:   group           rows keyed by ``key``: add ``sum`` columns, take the
+#:                   minimum of ``min`` columns, union ``union`` arrays and
+#:                   take the least of ``least`` values; then sort and trim
+QUERY_MERGE: Dict[str, Dict[str, Any]] = {
+    "reboot_debt": {"kind": "sum"},
+    "security_flags": {"kind": "sum"},
+    "install_counts": {"kind": "sum"},
+    "silent_devices": {"kind": "sum"},
+    "certificates": {"kind": "sum"},
+    "directory_services": {"kind": "sum"},
+    "network_problems": {"kind": "sum"},
+    "management_tool_errors": {"kind": "concat"},
+    "install_agent_runs": {"kind": "concat"},
+    "storage": {"kind": "concat"},
+    "storage_fullest": {"kind": "group", "key": ("serial",),
+                        "sort": lambda r: (float(r.get("free_ratio") or 0), r["serial"])},
+    "install_items_pending": {"kind": "group", "key": ("agent",), "sum": ("items", "devices")},
+    "install_items_failing": {"kind": "group", "key": ("name",), "sum": ("devices",),
+                              "sort": lambda r: (-_int(r.get("devices")), r["name"])},
+    "install_items_behind": {"kind": "group", "key": ("name",), "sum": ("devices",),
+                             "sort": lambda r: (-_int(r.get("devices")), r["name"])},
+    "management_tool_messages": {"kind": "group", "key": ("message", "tool"), "sum": ("devices", "lines"),
+                                 "union": ("platforms",), "least": ("sample_serial",),
+                                 "sort": lambda r: (-_int(r.get("devices")), -_int(r.get("lines")), r["message"])},
+    "certificates_soonest": {"kind": "group", "key": ("cn",), "sum": ("devices",), "min": ("days",),
+                             "sort": lambda r: (float(r.get("days") or 0), r["cn"])},
+    "os_versions": {"kind": "group",
+                    "key": ("os_platform", "os_name", "edition", "display_version", "version", "build", "feature_update"),
+                    "sum": ("devices",)},
+}
+
+
+def merge_rows(parts: Sequence[List[Dict[str, Any]]], spec: Dict[str, Any], limit: Optional[int] = None
+               ) -> List[Dict[str, Any]]:
+    """Merge per-platform query results by ``spec`` (see QUERY_MERGE)."""
+    kind = spec["kind"]
+    if kind == "sum":
+        rows = [r for part in parts for r in part]
+        if not rows:
+            return []
+        merged: Dict[str, Any] = {}
+        for col in rows[0]:
+            values = [r.get(col) for r in rows]
+            numeric = [v for v in values if isinstance(v, (int, float)) or hasattr(v, "as_integer_ratio")]
+            merged[col] = sum(numeric) if numeric else values[0]
+        return [merged]
+    rows = [dict(r) for part in parts for r in part]
+    if kind == "group":
+        grouped: Dict[tuple, Dict[str, Any]] = {}
+        for r in rows:
+            k = tuple(r.get(c) for c in spec["key"])
+            g = grouped.get(k)
+            if g is None:
+                grouped[k] = r
+                continue
+            for c in spec.get("sum", ()):
+                g[c] = (g.get(c) or 0) + (r.get(c) or 0)
+            for c in spec.get("min", ()):
+                g[c] = min(v for v in (g.get(c), r.get(c)) if v is not None) if (g.get(c) is not None or r.get(c) is not None) else None
+            for c in spec.get("union", ()):
+                g[c] = sorted(set(g.get(c) or []) | set(r.get(c) or []))
+            for c in spec.get("least", ()):
+                vals = [v for v in (g.get(c), r.get(c)) if v]
+                g[c] = min(vals) if vals else None
+        rows = list(grouped.values())
+    if spec.get("sort"):
+        rows.sort(key=spec["sort"])
+    return rows[: int(limit)] if limit is not None else rows
 
 
 # ── Reboot & Update Debt ──────────────────────────────────────
