@@ -847,7 +847,7 @@ def shape_local_admins(
             "byPlatform": [
                 {
                     "platform": r.get("platform") or "Unknown",
-                    "count": _int(r.get("workgroup")),
+                    "count": _int(r.get("workgroup")), "link": link("/identity", join="workgroup"),
                 }
                 for r in platform_rows
                 if _int(r.get("workgroup")) > 0
@@ -971,13 +971,12 @@ def shape_connectivity(row: Dict[str, Any]) -> Dict[str, Any]:
             "count": _int(row.get("weak_signal")),
             "link": link("/network", signal="weak"),
         },
-        # The network report has no filter for these two yet; the link opens it unfiltered.
         "poorQuality": {
             "count": _int(row.get("poor_quality")),
             "measured": _int(row.get("quality_measured")),
-            "link": link("/network"),
+            "link": link("/network", quality="poor"),
         },
-        "onVpn": {"count": _int(row.get("on_vpn")), "link": link("/network")},
+        "onVpn": {"count": _int(row.get("on_vpn")), "link": link("/network", vpn=1)},
     }
 
 

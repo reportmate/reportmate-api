@@ -259,7 +259,9 @@ def test_local_admins_join_links():
         "hybrid": "hybrid",
         "workgroup": "workgroup",
     }
-    assert card["workgroup"]["byPlatform"] == [{"platform": "macOS", "count": 3}]
+    assert card["workgroup"]["byPlatform"] == [
+        {"platform": "macOS", "count": 3, "link": {"path": "/identity", "params": {"join": "workgroup"}}}
+    ]
     assert card["topDevices"][0]["link"] == {"path": "/device/SAMPLE1", "params": {}}
 
 
@@ -315,6 +317,8 @@ def test_connectivity_links():
         "params": {"signal": "weak"},
     }
     assert card["poorQuality"]["measured"] == 3
+    assert card["poorQuality"]["link"] == {"path": "/network", "params": {"quality": "poor"}}
+    assert card["onVpn"]["link"] == {"path": "/network", "params": {"vpn": "1"}}
 
 
 # ── OS Currency: the five-device rule ───────────────────────────
