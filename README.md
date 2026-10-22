@@ -73,7 +73,7 @@ The client agents and Terraform modules live in separate repos and are Apache-2.
 
 ## Trademark
 
-The name "ReportMate" and the logo are not part of the license grant. Fork the code freely, but rename your fork. [TRADEMARK.md](https://github.com/reportmate/.github/blob/main/TRADEMARK.md) has the details.
+The name "ReportMate" and the logo are not part of the license grant. Fork the code freely, but rename your fork.
 
 ## Contributing
 
