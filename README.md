@@ -93,6 +93,14 @@ The `X-Insights-Cache` response header says `fresh`, `stale` or `miss`, and `Age
 
 Management Tools Errors counts the error and warning lines in each management tool's log tails over the last 24 hours. Ingest parses the tails once, as they arrive, and stores a small `levelSummary` on each log root: error and warning counts per UTC hour, and the most frequent error messages with numbers, paths and GUIDs stripped. The card is SQL over those summaries, so it never reads the tails themselves.
 
+The devices behind a tool's row come from the same summaries. This lists the devices with error lines in the Munki or Cimian log over the last 24 hours, most lines first:
+
+```
+curl -H "X-API-Key: $REPORTMATE_KEY" "http://localhost:8000/api/v1/dashboard/insights/managementToolErrors/devices?tool=installs&level=error&hours=24&platform=macOS"
+```
+
+`tool` is the log root key from the card's link, `level` is `error` or `warning`, and `hours` is 1 to 168. The response is `{tool, level, hours, platform, generatedAt, devices}`. Each device has `serialNumber`, `deviceName`, `platform`, `count`, `lastAt` (the start of the latest UTC hour with such a line) and a `link` to its log viewer. It is cached like the cards.
+
 These environment variables tune it: `INSIGHTS_CACHE_TTL_SECONDS` (300), `INSIGHTS_ERROR_TTL_SECONDS` (60), `INSIGHTS_REFRESH_INTERVAL_SECONDS` (240), `INSIGHTS_REFRESH_STAGGER_SECONDS` (1), `INSIGHTS_BACKGROUND_REFRESH` (true), `INSIGHTS_WARM_DELAY_SECONDS` (15), `INSIGHTS_STATEMENT_TIMEOUT_SECONDS` (20), `INSIGHTS_CONCURRENCY` (3, capped at a quarter of `DB_POOL_MAX`, which bounds on-demand computations) and `INSIGHTS_CACHE_MAX_ENTRIES` (256).
 
 ## License

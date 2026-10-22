@@ -652,3 +652,40 @@ def test_refresh_pass_fills_every_default_card_one_at_a_time(monkeypatch):
         for card in di.CARD_KEYS:
             assert (card, platform, False) in insights_router._entries
     insights_router.reset_cache()
+
+
+def test_tool_devices_shape():
+    rows = [{"serial": "SAMPLE1", "name": None, "platform": "macOS", "lines": 4, "last_hour": "2026-10-22T13"}]
+    out = di.shape_tool_devices(rows, tool="installs", level="warning", hours=24, platform="all")
+    assert out == {"tool": "installs", "level": "warning", "hours": 24, "platform": "all", "devices": [{
+        "serialNumber": "SAMPLE1", "deviceName": "SAMPLE1", "platform": "macOS", "count": 4,
+        "lastAt": "2026-10-22T13:00:00Z",
+        "link": {"path": "/device/SAMPLE1", "params": {"tab": "management", "tool": "installs", "level": "warning"}},
+    }]}
+
+
+def test_tool_devices_endpoint_validates_and_caches(client, monkeypatch):
+    seen = []
+
+    def compute(tool, level, hours, platform):
+        seen.append((tool, level, hours, platform))
+        return {"tool": tool, "level": level, "hours": hours, "platform": platform,
+                "devices": [], "generatedAt": "2026-10-22T00:00:00+00:00"}
+
+    monkeypatch.setattr(di, "compute_tool_devices", compute)
+    url = "/api/v1/dashboard/insights/managementToolErrors/devices"
+    assert client.get(f"{url}?tool=installs").status_code == 401
+    assert client.get(url, headers=AUTH).status_code == 422
+    assert client.get(f"{url}?tool=installs&level=info", headers=AUTH).status_code == 422
+    assert client.get(f"{url}?tool=installs&hours=500", headers=AUTH).status_code == 422
+    assert client.get(f"{url}?tool=x%20y", headers=AUTH).status_code == 422
+
+    r = client.get(f"{url}?tool=Installs&level=warning&platform=macos", headers=AUTH)
+    assert r.status_code == 200 and r.headers["X-Insights-Cache"] == "miss"
+    assert r.json()["devices"] == []
+    r = client.get(f"{url}?tool=installs&level=warning&platform=macOS", headers=AUTH)
+    assert r.headers["X-Insights-Cache"] == "fresh"
+    r2 = client.get(f"{url}?tool=installs&level=warning&platform=macOS",
+                    headers={**AUTH, "If-None-Match": r.headers["ETag"]})
+    assert r2.status_code == 304
+    assert seen == [("installs", "warning", 24, "macOS")]

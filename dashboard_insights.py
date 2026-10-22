@@ -1171,3 +1171,67 @@ def compute_app_usage(platform: str = "all", usages: Sequence[str] = (), catalog
                 pass
     result["computeSeconds"] = round(_time.monotonic() - t0, 3)
     return result
+
+
+# ── Management Tools Errors: matching devices ───────────────────
+
+TOOL_DEVICES_LIMIT = 5000
+TOOL_LEVELS = ("error", "warning")
+
+
+def shape_tool_devices(rows: Sequence[Dict[str, Any]], *, tool: str, level: str, hours: int,
+                       platform: str) -> Dict[str, Any]:
+    return {
+        "tool": tool,
+        "level": level,
+        "hours": hours,
+        "platform": platform,
+        "devices": [
+            {
+                "serialNumber": r["serial"],
+                "deviceName": r.get("name") or r["serial"],
+                "platform": r.get("platform"),
+                "count": _int(r.get("lines")),
+                "lastAt": f"{r['last_hour']}:00:00Z" if r.get("last_hour") else None,
+                "link": tool_device_link(r["serial"], tool, level),
+            }
+            for r in rows
+        ],
+    }
+
+
+def compute_tool_devices(tool: str, level: str = "error", hours: int = TOOL_WINDOW_HOURS,
+                         platform: str = "all") -> Dict[str, Any]:
+    """Devices with ``level`` lines in ``tool``'s log in the last ``hours``,
+    most lines first. ``lastAt`` is the start of the latest UTC hour with one.
+    A failure is ``{"error": ...}``."""
+    t0 = _time.monotonic()
+    scope = InsightsScope(platform, False, _has_inventory_state_table())
+    conn = None
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute(f"SET LOCAL statement_timeout = '{int(STATEMENT_TIMEOUT_SECONDS * 1000)}ms'")
+        rows = _make_runner(cursor, scope)(
+            "management_tool_devices", tool=tool.lower(), slot=TOOL_LEVELS.index(level),
+            since_hour=window_start_hour(hours=hours), limit=TOOL_DEVICES_LIMIT,
+        )
+        result = shape_tool_devices(rows, tool=tool.lower(), level=level, hours=hours, platform=platform)
+        logger.info(f"[INSIGHTS] tool devices {tool}/{level}/{hours}h platform={platform}: "
+                    f"{len(rows)} devices, {_time.monotonic() - t0:.3f}s")
+    except Exception as exc:
+        logger.error(f"[INSIGHTS] tool devices {tool}/{level} failed: {exc}")
+        result = {"tool": tool.lower(), "level": level, "hours": hours, "platform": platform,
+                  "error": _error_text(exc)}
+    finally:
+        if conn is not None:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+            try:
+                conn.close()
+            except Exception:
+                pass
+    result["generatedAt"] = datetime.now(timezone.utc).isoformat()
+    return result

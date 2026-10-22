@@ -50,6 +50,7 @@ WARM_DELAY_SECONDS = float(os.getenv("INSIGHTS_WARM_DELAY_SECONDS", "15"))
 MAX_ENTRIES = int(os.getenv("INSIGHTS_CACHE_MAX_ENTRIES", "256"))
 
 APP_USAGE = "appUsage"
+TOOL_DEVICES = "managementToolErrors/devices"
 CARDS = tuple(dashboard_insights.CARD_KEYS) + (APP_USAGE,)
 REFRESH_PLATFORMS = ("all", "macOS", "Windows")
 
@@ -84,6 +85,9 @@ def _semaphore() -> asyncio.Semaphore:
 
 
 def _computation(key: CacheKey) -> Callable[[], Dict[str, Any]]:
+    if key[0] == TOOL_DEVICES:
+        _, tool, level, hours, platform = key
+        return lambda: dashboard_insights.compute_tool_devices(tool, level, hours, platform)
     if key[0] == APP_USAGE:
         _, platform, usages, catalogs, days = key
         return lambda: dashboard_insights.compute_app_usage(
@@ -311,6 +315,35 @@ async def get_app_usage_insight(
     result, state, age = await get_cached(key)
     _headers(response, state, age)
     return _envelope(APP_USAGE, scope, False, result)
+
+
+@router.get(
+    "/dashboard/insights/managementToolErrors/devices",
+    dependencies=[Depends(verify_authentication)],
+    tags=["statistics"],
+)
+async def get_tool_error_devices(
+    response: Response,
+    tool: str = Query(..., min_length=1, max_length=64, pattern=r"^[A-Za-z0-9_.-]+$",
+                      description="Log root key, as in a Management Tools Errors link (installs, bootstrap, mdm, ...)"),
+    level: str = Query(default="error", pattern="^(error|warning)$"),
+    hours: int = Query(default=24, ge=1, le=168),
+    platform: str = Query(default="all", description="all, macOS or Windows"),
+):
+    """
+    The devices behind a Management Tools Errors row: those whose log for
+    ``tool`` has ``level`` lines in the last ``hours``, most lines first.
+
+    Returns ``{tool, level, hours, platform, generatedAt, devices: [{serialNumber,
+    deviceName, platform, count, lastAt, link}]}``. ``lastAt`` is the start of
+    the latest UTC hour with such a line, and ``link`` opens the device log
+    viewer on that tool and level. Computed from the levelSummary ingest
+    stores on each log root and cached like the cards.
+    """
+    scope = _platform(platform)
+    result, state, age = await get_cached((TOOL_DEVICES, tool.lower(), level, hours, scope))
+    _headers(response, state, age)
+    return result
 
 
 @router.get(
