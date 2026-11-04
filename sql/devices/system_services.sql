@@ -71,4 +71,13 @@ WHERE d.serial_number IS NOT NULL
     AND d.serial_number NOT LIKE 'TEST-%%'
     AND d.serial_number != 'localhost'
     AND (%(include_archived)s = TRUE OR d.archived = FALSE)
+    AND (
+        %(platform)s = ''
+        OR CASE
+            WHEN lower(COALESCE(sys.data->'operatingSystem'->>'name', d.platform, '')) LIKE '%%windows%%' THEN 'windows'
+            WHEN lower(COALESCE(sys.data->'operatingSystem'->>'name', d.platform, '')) LIKE '%%mac%%'
+                OR lower(COALESCE(sys.data->'operatingSystem'->>'name', d.platform, '')) LIKE '%%darwin%%' THEN 'macos'
+            ELSE lower(COALESCE(sys.data->'operatingSystem'->>'name', d.platform, ''))
+        END = %(platform)s
+    )
 ORDER BY lower(COALESCE(inv.data->>'deviceName', inv.data->>'device_name', d.name, d.serial_number)), d.serial_number;

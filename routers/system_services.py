@@ -155,6 +155,7 @@ def get_system_services(
         cursor.execute(load_sql("devices/system_services"), {
             "service": service.strip().lower(), "application": application.strip().lower(),
             "include_archived": include_archived,
+            "platform": normalized_platform,
         })
         rows = [row[0] for row in cursor.fetchall()]
         # Query returns only matching service/app entries, never full module documents.
