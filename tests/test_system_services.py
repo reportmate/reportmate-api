@@ -4,7 +4,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from main import app
-from routers.system_services import collection_freshness, coverage_state, service_state, startup_type
+from routers.system_services import collection_freshness, coverage_state, service_state, startup_type, _names
 
 
 @pytest.mark.parametrize("raw,expected", [
@@ -62,3 +62,20 @@ def test_invalid_queries_fail_before_accessing_the_database(query):
 def test_services_report_requires_authentication():
     client = TestClient(app)
     assert client.get("/api/v1/system/services?service=Sysmon").status_code == 401
+
+
+def test_exact_names_preserve_punctuation():
+    assert _names('["Agent Service", "Application (x64, English)"]') == {"agent service", "application (x64, english)"}
+    assert _names("Agent,Other") == {"agent", "other"}
+
+
+@pytest.mark.parametrize("value", ['[invalid', '[1]', '[null]'])
+def test_invalid_exact_names_fail_before_accessing_the_database(value):
+    response = TestClient(app).get("/api/v1/system/services", params={"serviceNames": value}, headers={"X-Internal-Secret": "test-internal-secret"})
+    assert response.status_code == 422
+
+
+def test_service_options_require_authentication_and_validate_platform():
+    client = TestClient(app)
+    assert client.get("/api/v1/system/services/filters").status_code == 401
+    assert client.get("/api/v1/system/services/filters?platform=invalid", headers={"X-Internal-Secret": "test-internal-secret"}).status_code == 422

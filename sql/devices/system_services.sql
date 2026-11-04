@@ -39,11 +39,11 @@ SELECT jsonb_build_object(
         ) ORDER BY COALESCE(s->>'name', s->>'label'))
         FROM jsonb_array_elements(CASE WHEN jsonb_typeof(sys.data->'services') = 'array'
             THEN sys.data->'services' ELSE '[]'::jsonb END) s
-        WHERE %(service)s != '' AND (
+        WHERE (lower(COALESCE(s->>'name', s->>'label', '')) = ANY(%(service_names)s::text[])) OR (%(service)s != '' AND (
             strpos(lower(COALESCE(s->>'name', s->>'label', '')), %(service)s) > 0
             OR strpos(lower(COALESCE(s->>'displayName', s->>'display_name', '')), %(service)s) > 0
             OR strpos(lower(COALESCE(s->>'path', s->>'program', '')), %(service)s) > 0
-        )
+        ))
     ), '[]'::jsonb),
     'applications', COALESCE((
         SELECT jsonb_agg(DISTINCT jsonb_build_object(
@@ -57,8 +57,8 @@ SELECT jsonb_build_object(
             WHEN jsonb_typeof(app.data->'InstalledApplications') = 'array' THEN app.data->'InstalledApplications'
             WHEN jsonb_typeof(app.data->'installed_applications') = 'array' THEN app.data->'installed_applications'
             ELSE '[]'::jsonb END) a
-        WHERE %(application)s != ''
-            AND strpos(lower(COALESCE(a->>'name', a->>'displayName', '')), %(application)s) > 0
+        WHERE lower(COALESCE(a->>'name', a->>'displayName', '')) = ANY(%(application_names)s::text[])
+            OR (%(application)s != '' AND strpos(lower(COALESCE(a->>'name', a->>'displayName', '')), %(application)s) > 0)
     ), '[]'::jsonb)
 )
 FROM devices d
