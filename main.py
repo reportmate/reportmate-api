@@ -44,6 +44,7 @@ from routers import (
     inventory_state,
     settings,
     statistics,
+    system_services,
 )
 
 # ── Pre-load SQL queries into memory ────────────────────────────
@@ -214,6 +215,7 @@ for _router_mod in (
     api_keys,
     auth_config,
     inventory_state,
+    system_services,
 ):
     app.include_router(_router_mod.router, prefix="/api/v1")
 
