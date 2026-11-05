@@ -7,6 +7,7 @@ from main import app
 from routers import security_vulnerabilities as report
 from routers.security_vulnerabilities import (
     cve_id,
+    safe_url,
     exploited_flag,
     normalize_cve,
     normalize_detection,
@@ -209,9 +210,7 @@ def test_device_rows_and_coverage(loaded):
     assert body["coverage"] == {
         "devices": 3,
         "reporting": 2,
-        "notReporting": 1,
-        "listMayBeIncomplete": 0,
-    }
+        "notReporting": 1, "unknown": 0, "listMayBeIncomplete": 0}
     assert {row["serialNumber"] for row in body["rows"]} == {
         "TESTSERIAL01",
         "TESTSERIAL02",
@@ -266,9 +265,7 @@ def test_detection_window_excludes_undated_rows(loaded):
     assert body["coverage"] == {
         "devices": 2,
         "reporting": 1,
-        "notReporting": 1,
-        "devicesWithDetections": 1,
-    }
+        "notReporting": 1, "unknown": 0, "devicesWithDetections": 1}
     body = loaded.get("/api/v1/security/detections", headers=HEADERS).json()
     assert body["total"] == 3
     assert body["rows"][0]["path"] == "C:\\Example\\app.exe"
@@ -341,3 +338,65 @@ def test_invalid_detection_queries_fail_before_the_database(query):
         .status_code
         == 422
     )
+
+
+MALFORMED = [
+    {"serialNumber": 12345, "deviceName": ["not", "text"], "platform": {"os": 1}, "usage": 7, "catalog": None,
+     "area": True, "location": 3.5, "room": {"x": 1}, "inventoryState": 0, "archived": "yes", "lastSeen": 99,
+     "collectedAt": ["bad"], "windowsCves": [None, 5, "text", {"cve": 42, "status": ["x"], "severity": {"a": 1},
+     "kbArticle": 77, "activelyExploited": {"b": 2}}], "macCves": {"not": "a list"},
+     "detections": [None, {"threatName": 5, "detectedAt": 1, "lastSeenAt": ["x"], "count": "many", "source": 9, "category": []}]},
+    {"serialNumber": "TESTSERIAL04", "platform": "macOS", "windowsCves": "oops", "macCves": [["nested"]], "detections": "oops"},
+    _device("TESTSERIAL01", "Windows 11", windowsCves=[WINDOWS_CVE], macCves=None, detections=None),
+]
+
+
+class Exploding(dict):
+    def get(self, key, default=None):
+        if key in ("windowsCves", "detections"):
+            raise RuntimeError("unreadable")
+        return super().get(key, default)
+
+
+@pytest.fixture
+def malformed(monkeypatch):
+    rows = MALFORMED + [Exploding(_device("TESTSERIAL05", "Windows"))]
+    monkeypatch.setattr(report, "_load", lambda kind, platform, archived: rows)
+    return TestClient(app)
+
+
+@pytest.mark.parametrize("path", ["/api/v1/security/vulnerabilities", "/api/v1/security/vulnerabilities?view=summary",
+                                  "/api/v1/security/vulnerabilities/filters", "/api/v1/security/detections?days=7",
+                                  "/api/v1/security/detections", "/api/v1/security/detections/filters",
+                                  "/api/v1/security/vulnerabilities?usages=7&search=123"])
+def test_malformed_device_payloads_never_fail_the_report(malformed, path):
+    assert malformed.get(path, headers=HEADERS).status_code == 200
+
+
+def test_malformed_device_payloads_are_unknown_not_clean(malformed):
+    body = malformed.get("/api/v1/security/vulnerabilities", headers=HEADERS).json()
+    assert body["coverage"]["unknown"] == 1
+    assert {row["serialNumber"] for row in body["rows"]} == {"12345", "TESTSERIAL01"}
+    odd = next(row for row in body["rows"] if row["serialNumber"] == "12345")
+    assert (odd["identifier"], odd["cve"], odd["severity"], odd["status"], odd["activelyExploited"]) == ("77", None, None, "unknown", None)
+    assert odd["deviceName"] is None and odd["platform"] == "Unknown"
+    detections = malformed.get("/api/v1/security/detections", headers=HEADERS).json()
+    assert detections["coverage"]["unknown"] == 1
+    assert [row["count"] for row in detections["rows"]] == [None]
+
+
+@pytest.mark.parametrize("raw,expected", [
+    ("https://example.com/advisory", "https://example.com/advisory"),
+    ("http://example.com/a", "http://example.com/a"),
+    ("javascript:alert(1)", None), ("JavaScript:alert(1)", None), (" javascript:alert(1)", None),
+    ("data:text/html,x", None), ("//example.com/a", None), ("https:///nohost", None), (["x"], None), (None, None),
+])
+def test_only_http_links_are_returned(raw, expected):
+    assert safe_url(raw) == expected
+
+
+def test_javascript_link_is_dropped_from_rows(monkeypatch):
+    row = _device("TESTSERIAL01", "Windows 11", windowsCves=[{**WINDOWS_CVE, "url": "javascript:alert(1)"}], macCves=None)
+    monkeypatch.setattr(report, "_load", lambda kind, platform, archived: [row])
+    body = TestClient(app).get("/api/v1/security/vulnerabilities", headers=HEADERS).json()
+    assert body["rows"][0]["url"] is None

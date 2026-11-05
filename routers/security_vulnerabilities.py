@@ -13,6 +13,7 @@ import re
 from collections import Counter, defaultdict
 from datetime import datetime, timedelta, timezone
 from typing import Literal
+from urllib.parse import urlparse
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 
@@ -74,6 +75,18 @@ def _reported(value):
     return None if text is None or text.lower() in UNREPORTED else text
 
 
+def safe_url(value):
+    """A device-supplied link, kept only when it is an absolute http(s) URL."""
+    text = _reported(value)
+    if not text:
+        return None
+    try:
+        parsed = urlparse(text)
+    except ValueError:
+        return None
+    return text if parsed.scheme.lower() in ("http", "https") and parsed.netloc else None
+
+
 def cve_id(value):
     text = _text(value)
     return text.upper() if text and CVE_PATTERN.match(text) else None
@@ -132,7 +145,7 @@ def normalize_cve(entry, source_list):
             entry.get("activelyExploited", entry.get("actively_exploited"))
         ),
         "installedDate": _reported(entry.get("installedDate")),
-        "url": _reported(entry.get("url")),
+        "url": safe_url(entry.get("url")),
     }
 
 
@@ -168,11 +181,13 @@ def normalize_detection(entry):
 
 
 def _device(row):
-    device = {key: row.get(key) for key in DEVICE_FIELDS}
-    device["platform"] = (
-        infer_platform(row.get("platform")) or row.get("platform") or "Unknown"
-    )
-    device["inventoryState"] = row.get("inventoryState") or "unknown"
+    """Device fields as text; device JSON is untrusted, so nothing is assumed to be a string."""
+    row = row if isinstance(row, dict) else {}
+    device = {key: _text(row.get(key)) for key in DEVICE_FIELDS}
+    device["serialNumber"] = device["serialNumber"] or "Unknown"
+    device["archived"] = row.get("archived") is True
+    device["platform"] = infer_platform(device["platform"]) or device["platform"] or "Unknown"
+    device["inventoryState"] = device["inventoryState"] or "unknown"
     return device
 
 
@@ -252,28 +267,28 @@ def _in_scope(device, selected, inventory_states, search):
 
 
 def vulnerability_devices(rows, now, max_age_hours):
-    """Devices with their normalized CVE entries and collection coverage."""
+    """Devices with their normalized CVE entries and collection coverage.
+
+    A device whose payload cannot be read reports "unknown" coverage instead
+    of failing the whole report.
+    """
     devices = []
     for row in rows:
         device = _device(row)
-        windows, mac = row.get("windowsCves"), row.get("macCves")
-        entries = []
-        if isinstance(windows, list):
-            entries += [e for e in (normalize_cve(x, "windows") for x in windows) if e]
-        if isinstance(mac, list):
-            entries += [e for e in (normalize_cve(x, "mac") for x in mac) if e]
-        device["cveReporting"] = (
-            "reported"
-            if isinstance(windows, list) or isinstance(mac, list)
-            else "not_reported"
-        )
-        device["listMayBeIncomplete"] = (
-            isinstance(mac, list) and len(mac) >= MAC_CVE_LIST_LIMIT
-        )
-        device["freshness"] = collection_freshness(
-            device.get("collectedAt"), now, max_age_hours
-        )
-        device["entries"] = entries
+        device.update(cveReporting="unknown", listMayBeIncomplete=False, entries=[])
+        device["freshness"] = collection_freshness(device.get("collectedAt"), now, max_age_hours)
+        try:
+            windows, mac = row.get("windowsCves"), row.get("macCves")
+            entries = []
+            if isinstance(windows, list):
+                entries += [e for e in (normalize_cve(x, "windows") for x in windows) if e]
+            if isinstance(mac, list):
+                entries += [e for e in (normalize_cve(x, "mac") for x in mac) if e]
+            device["cveReporting"] = "reported" if isinstance(windows, list) or isinstance(mac, list) else "not_reported"
+            device["listMayBeIncomplete"] = isinstance(mac, list) and len(mac) >= MAC_CVE_LIST_LIMIT
+            device["entries"] = entries
+        except Exception:
+            logger.warning("Unreadable CVE list for one device; reporting it as unknown")
         devices.append(device)
     return devices
 
@@ -421,6 +436,7 @@ def get_security_vulnerabilities(
         "devices": len(scoped),
         "reporting": sum(d["cveReporting"] == "reported" for d in scoped),
         "notReporting": sum(d["cveReporting"] == "not_reported" for d in scoped),
+        "unknown": sum(d["cveReporting"] == "unknown" for d in scoped),
         "listMayBeIncomplete": sum(d["listMayBeIncomplete"] for d in scoped),
     }
     pairs = [
@@ -507,15 +523,16 @@ def detection_devices(rows):
     devices = []
     for row in rows:
         device = _device(row)
-        raw = row.get("detections")
-        device["detectionReporting"] = (
-            "reported" if isinstance(raw, list) else "not_reported"
-        )
-        device["entries"] = (
-            [e for e in (normalize_detection(x) for x in raw or []) if e]
-            if isinstance(raw, list)
-            else []
-        )
+        device.update(detectionReporting="unknown", entries=[])
+        try:
+            raw = row.get("detections")
+            if isinstance(raw, list):
+                device["entries"] = [e for e in (normalize_detection(x) for x in raw) if e]
+                device["detectionReporting"] = "reported"
+            else:
+                device["detectionReporting"] = "not_reported"
+        except Exception:
+            logger.warning("Unreadable detection list for one device; reporting it as unknown")
         devices.append(device)
     return devices
 
@@ -611,6 +628,7 @@ def get_security_detections(
             "notReporting": sum(
                 d["detectionReporting"] == "not_reported" for d in scoped
             ),
+            "unknown": sum(d["detectionReporting"] == "unknown" for d in scoped),
             "devicesWithDetections": len({d["serialNumber"] for d, _ in pairs}),
         },
         "options": _scope_options(devices),
