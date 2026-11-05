@@ -18,7 +18,8 @@ SELECT jsonb_build_object(
     'pendingWindowsUpdates', COALESCE(sys.data->'pendingWindowsUpdates', sys.data->'pending_windows_updates'),
     'pendingWindowsUpdatesCount', COALESCE(sys.data->'pendingWindowsUpdatesCount', sys.data->'pending_windows_updates_count'),
     'installedUpdates', sys.data->'updates',
-    'pendingAppleUpdates', COALESCE(sys.data->'pendingAppleUpdates', sys.data->'pending_apple_updates')
+    'pendingAppleUpdates', COALESCE(sys.data->'pendingAppleUpdates', sys.data->'pending_apple_updates'),
+    'updateSearch', COALESCE(sys.data->'updateSearch', sys.data->'update_search')
 )
 FROM devices d
 LEFT JOIN system sys ON sys.device_id = d.serial_number

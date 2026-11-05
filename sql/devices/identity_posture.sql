@@ -43,6 +43,17 @@ SELECT jsonb_build_object(
             'isConfigured', ident.data->'windowsHello'->'credentialGuard'->'isConfigured'
         ) END,
         'tpmOwnership', ident.data->'tpmOwnership',
+        'userSso', CASE WHEN jsonb_typeof(ident.data->'userSsoState') = 'object' THEN jsonb_build_object(
+            'status', ident.data->'userSsoState'->'status',
+            'reason', ident.data->'userSsoState'->'reason',
+            'userName', ident.data->'userSsoState'->'userName',
+            'collectedAt', ident.data->'userSsoState'->'collectedAt',
+            'entraPrt', ident.data->'userSsoState'->'entraPrt',
+            'entraPrtUpdateTime', ident.data->'userSsoState'->'entraPrtUpdateTime',
+            'entraPrtExpiryTime', ident.data->'userSsoState'->'entraPrtExpiryTime',
+            'cloudTgt', ident.data->'userSsoState'->'cloudTgt',
+            'onPremTgt', ident.data->'userSsoState'->'onPremTgt'
+        ) END,
         'failedLoginsLast7Days', ident.data->'summary'->'failedLoginsLast7Days'
     ),
     'mac', jsonb_build_object(

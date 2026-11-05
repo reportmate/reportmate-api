@@ -26,7 +26,7 @@ from routers.system_services import (
 
 router = APIRouter(tags=["fleet"])
 
-STATES = {"pending", "installed", "not_reported", "none", "unknown"}
+STATES = {"pending", "installed", "not_reported", "none", "search_failed", "unknown"}
 SCOPES = {
     "usages": "usage",
     "catalogs": "catalog",
@@ -240,6 +240,40 @@ def device_updates(row, now):
         return platform, [], [], False
 
 
+def update_search(row, now, max_age_hours):
+    """The client's last OS update search: status, error, when, and whether it is fresh.
+
+    status is "succeeded" or "failed" as the client sent it, or "not_reported" when the
+    client does not send the field (older clients) or sent it in an unexpected shape.
+    """
+    raw = row.get("updateSearch")
+    status = raw.get("status") if isinstance(raw, dict) else None
+    if status not in ("succeeded", "failed"):
+        return {"status": "not_reported", "error": None, "checkedAt": None, "freshness": "unknown"}
+    checked = raw.get("checkedAt") if isinstance(raw.get("checkedAt"), str) else None
+    error = raw.get("error") if isinstance(raw.get("error"), str) and raw.get("error").strip() else None
+    return {
+        "status": status,
+        "error": error.strip()[:500] if error else None,
+        "checkedAt": checked,
+        "freshness": collection_freshness(checked, now, max_age_hours) if checked else "unknown",
+    }
+
+
+def empty_state(valid, trusted, search, reported_none):
+    """(reported, state) for a device-level row with no pending update to show.
+
+    "none" (nothing pending) needs a fresh, valid collection and a fresh update search
+    that succeeded. A failed search is "search_failed". Anything else is "unknown".
+    """
+    if not valid:
+        return "missing", "unknown"
+    if search["status"] == "failed":
+        return "search_failed", "search_failed" if trusted else "unknown"
+    proven = trusted and search["status"] == "succeeded" and search["freshness"] == "fresh"
+    return reported_none, reported_none if proven else "unknown"
+
+
 EMPTY_UPDATE = {
     "updateKey": None,
     "title": None,
@@ -357,6 +391,8 @@ def shape_updates(
         base["freshness"] = fresh
         base["collectionValid"] = valid
         base["pendingCount"] = len(pending) if valid else None
+        last_search = update_search(row, now, max_age_hours)
+        base["updateSearch"] = last_search
         trusted = valid and fresh == "fresh"
         device_rows = []
         if keys or cves:
@@ -374,26 +410,19 @@ def shape_updates(
             for update in installed_hits:
                 device_rows.append((update, "installed", "installed"))
             if not device_rows and not attribute_filter:
-                device_rows.append(
-                    (
-                        EMPTY_UPDATE,
-                        "not_reported" if valid else "missing",
-                        "not_reported" if trusted else "unknown",
-                    )
-                )
+                reported, state = empty_state(valid, trusted, last_search, "not_reported")
+                if reported == "not_reported" and last_search["status"] != "failed":
+                    # Installed history is partial, so "not reported" never needed a search.
+                    state = "not_reported" if trusted else "unknown"
+                device_rows.append((EMPTY_UPDATE, reported, state))
         else:
             for update in pending:
                 device_rows.append(
                     (update, "pending", "pending" if trusted else "unknown")
                 )
             if not pending and not attribute_filter:
-                device_rows.append(
-                    (
-                        EMPTY_UPDATE,
-                        "none" if valid else "missing",
-                        "none" if trusted else "unknown",
-                    )
-                )
+                reported, state = empty_state(valid, trusted, last_search, "none")
+                device_rows.append((EMPTY_UPDATE, reported, state))
         for update, reported, state in device_rows:
             if update is not EMPTY_UPDATE and not _passes(
                 update, security_only, deferred, reboot_required, min_age_days
@@ -569,8 +598,10 @@ def get_system_updates(
     pending and installed rows, or one "not_reported" row. Installed history is the
     collected recent-update list, so "not_reported" is not proof the update is
     absent. With no selection, every pending update is a row and devices with an
-    empty valid list get a "none" row. Stale, missing or malformed collection is
-    "unknown". Age is days since macOS first offered the update, or since the
+    empty valid list get a "none" row, but only when the client's last update
+    search succeeded and is fresh; a failed search is "search_failed" with its
+    error under updateSearch, and a client that does not report its search is
+    "unknown". Stale, missing or malformed collection is "unknown". Age is days since macOS first offered the update, or since the
     Windows update was released.
     """
     state = _list(states)

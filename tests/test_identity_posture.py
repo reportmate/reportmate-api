@@ -15,8 +15,10 @@ from fastapi.testclient import TestClient
 from main import app
 from routers.identity_posture import (
     activation_lock_state,
+    laps_source,
     laps_state,
     posture_checks,
+    prt_state,
     psso_state,
     psso_users,
     recovery_key_state,
@@ -67,6 +69,79 @@ def test_laps_needs_explicit_false_from_both_checks():
     )
     assert laps_state({"windowsLapsConfigured": False}) == "unknown"
     assert laps_state(None) == "unknown"
+
+
+def test_laps_source_is_reported_only_when_sent():
+    assert laps_source({"policySource": "gpo"}) == "gpo"
+    assert laps_source({"policySource": "none"}) == "none"
+    assert laps_source({"windowsLapsConfigured": False}) is None
+    assert laps_source({"policySource": "registry"}) is None
+    assert laps_source(None) is None
+
+
+def test_prt_state_is_judged_at_report_time_and_keeps_missing_apart():
+    collected = {"status": "collected", "entraPrt": True}
+    assert prt_state(None, NOW) == "not_reported"
+    assert prt_state({"status": "notAvailable", "reason": "No user is signed in"}, NOW) == "not_available"
+    assert prt_state({"status": "failed"}, NOW) == "failed"
+    assert prt_state({"status": "collected", "entraPrt": False}, NOW) == "none"
+    assert prt_state({"status": "collected"}, NOW) == "unknown"
+    assert prt_state({**collected, "entraPrtExpiryTime": iso(days=3)}, NOW) == "valid"
+    assert prt_state({**collected, "entraPrtExpiryTime": iso(hours=-1)}, NOW) == "expired"
+    assert prt_state(collected, NOW) == "valid"
+
+
+def test_no_valid_prt_view_needs_a_collected_answer():
+    def checks(prt):
+        return posture_checks("Windows", {"prtState": prt}, "fresh", "fresh")["noValidPrt"]
+
+    assert checks("none") is True
+    assert checks("expired") is True
+    assert checks("valid") is False
+    for state in ("not_reported", "not_available", "failed", "unknown"):
+        assert checks(state) is None
+    assert posture_checks("Windows", {"prtState": "none"}, "stale", "fresh")["noValidPrt"] is None
+    assert posture_checks("macOS", {"prtState": "none"}, "fresh", "fresh")["noValidPrt"] is None
+
+
+def test_windows_rows_report_sso_complexity_and_laps_source():
+    row = _row(
+        "WIN1",
+        "Windows 11",
+        iso(hours=-1),
+        windows={
+            "laps": {
+                "windowsLapsConfigured": False,
+                "legacyLapsInstalled": False,
+                "policySource": "none",
+            },
+            "passwordPolicy": {"errorMessage": "", "complexityRequired": False},
+            "userSso": {
+                "status": "collected",
+                "userName": "EXAMPLE\\sample",
+                "entraPrt": True,
+                "entraPrtExpiryTime": iso(days=5),
+                "cloudTgt": True,
+            },
+        },
+    )
+    old = _row("WIN2", "Windows 11", iso(hours=-1), windows={"laps": {}})
+    result = shape_posture(
+        [row, old], views=[], freshness="all", search="", max_age_hours=168,
+        limit=500, offset=0, now=NOW,
+    )
+    by = {d["serialNumber"]: d for d in result["devices"]}
+    new = by["WIN1"]["reported"]
+    assert (new["prtState"], new["prtUser"], new["cloudTgt"], new["onPremTgt"]) == (
+        "valid", "EXAMPLE\\sample", True, None,
+    )
+    assert (new["passwordComplexity"], new["lapsPolicySource"]) == (False, "none")
+    legacy = by["WIN2"]["reported"]
+    assert (legacy["prtState"], legacy["passwordComplexity"], legacy["lapsPolicySource"]) == (
+        "not_reported", None, None,
+    )
+    assert by["WIN2"]["checks"]["noValidPrt"] is None
+    assert result["unknown"]["noValidPrt"] == 1
 
 
 def test_activation_lock_keeps_inference_separate():
@@ -288,6 +363,19 @@ WIN_IDENTITY = {
         "credentialGuard": {"isEnabled": False, "isConfigured": False},
     },
     "tpmOwnership": {"isOwned": True, "isReady": True},
+    "userSsoState": {
+        "status": "collected",
+        "userName": "EXAMPLE\\sample",
+        "sessionId": 1,
+        "context": "userSession",
+        "collectedAt": "2026-06-01T11:00:00Z",
+        "entraPrt": True,
+        "entraPrtUpdateTime": "2000-01-01T00:00:00Z",
+        "entraPrtExpiryTime": "2000-01-14T00:00:00Z",
+        "entraPrtAuthority": "https://login.example.com/tenant",
+        "cloudTgt": True,
+        "onPremTgt": False,
+    },
     "summary": {"failedLoginsLast7Days": 2},
     "users": [{"username": "sample", "sid": "S-1-5-21-0"}],
 }
@@ -427,6 +515,8 @@ def test_projection_joins_identity_and_security_without_full_documents(db):
         "hasDefaultPassword": True,
     }
     assert win["identityCollectedAt"] == "2026-06-01T11:00:00Z"
+    assert win["windows"]["userSso"]["entraPrt"] is True
+    assert "entraPrtAuthority" not in win["windows"]["userSso"]
     assert mac["mac"]["activationLock"] == {
         "status": "Likely Enabled",
         "findMyMac": "Enabled",
@@ -472,6 +562,8 @@ def test_projection_shapes_into_report(db):
         and by["TESTSERIAL01"]["checks"]["autoLogin"] is True
     )
     assert by["TESTSERIAL01"]["reported"]["helloProviders"] == ["PIN"]
+    assert by["TESTSERIAL01"]["reported"]["prtState"] == "expired"
+    assert by["TESTSERIAL01"]["checks"]["noValidPrt"] is True
     assert by["TESTSERIAL02"]["checks"]["expiredPssoToken"] is True
     assert by["TESTSERIAL02"]["checks"]["activationLock"] is True
     assert by["TESTSERIAL02"]["checks"]["noRecoveryKey"] is False
