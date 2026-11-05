@@ -1,7 +1,8 @@
 -- Fleet vulnerability rows: /api/v1/security/vulnerabilities
 -- One row per device that matches the scope. A device's collected CVE entries
 -- come back as reported: Windows clients send securityCves (MSRC, with status
--- and severity), macOS clients send unpatchedCVEs (SOFA feed, no severity).
+-- and severity), macOS clients send unpatchedCVEs (SOFA feed, no severity)
+-- and, from newer clients, unpatchedCVEsTruncated when the list was bounded.
 -- A device with neither list still returns a row so coverage can be counted.
 -- Parameters: include_archived (boolean), platform ('' | 'windows' | 'macos').
 
@@ -22,7 +23,8 @@ SELECT jsonb_build_object(
     'collectedAt', COALESCE(sec.data->>'collectedAt', sec.data->>'collected_at', sec.collected_at::text),
     'hasSecurity', sec.device_id IS NOT NULL,
     'windowsCves', CASE WHEN jsonb_typeof(sec.data->'securityCves') = 'array' THEN sec.data->'securityCves' END,
-    'macCves', CASE WHEN jsonb_typeof(sec.data->'unpatchedCVEs') = 'array' THEN sec.data->'unpatchedCVEs' END
+    'macCves', CASE WHEN jsonb_typeof(sec.data->'unpatchedCVEs') = 'array' THEN sec.data->'unpatchedCVEs' END,
+    'macCvesTruncated', CASE WHEN jsonb_typeof(sec.data->'unpatchedCVEsTruncated') = 'boolean' THEN sec.data->'unpatchedCVEsTruncated' END
 )
 FROM devices d
 LEFT JOIN security sec ON sec.device_id = d.serial_number
