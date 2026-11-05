@@ -9,11 +9,13 @@ from routers.system_updates import build_update_options, flag, kb_number, shape_
 NOW = datetime(2026, 6, 30, 12, 0, tzinfo=timezone.utc)
 FRESH = (NOW - timedelta(hours=2)).isoformat()
 STALE = (NOW - timedelta(days=5)).isoformat()
+SEARCHED = {"status": "succeeded", "checkedAt": FRESH}
 
 
-def windows(serial, collected=FRESH, pending=None, installed=None, count=None):
+def windows(serial, collected=FRESH, pending=None, installed=None, count=None, search=SEARCHED):
     pending = [] if pending is None else pending
     return {
+        "updateSearch": search,
         "serialNumber": serial,
         "deviceName": serial,
         "platform": "Windows 11",
@@ -24,8 +26,9 @@ def windows(serial, collected=FRESH, pending=None, installed=None, count=None):
     }
 
 
-def mac(serial, collected=FRESH, pending=None):
+def mac(serial, collected=FRESH, pending=None, search=SEARCHED):
     return {
+        "updateSearch": search,
         "serialNumber": serial,
         "deviceName": serial,
         "platform": "macOS",
@@ -289,3 +292,52 @@ def test_malformed_collected_types_never_fail_the_report():
     updates, cves = build_update_options(rows, NOW)
     assert cves == []
     assert [(u["key"], u["pendingDevices"]) for u in updates] == [("windows:title:12345", 1)]
+
+
+def test_nothing_pending_needs_a_fresh_successful_search():
+    result = shape(
+        [
+            windows("TESTSERIAL01"),
+            windows("TESTSERIAL02", search=None),
+            windows("TESTSERIAL03", search={"status": "succeeded", "checkedAt": STALE}),
+            windows(
+                "TESTSERIAL04",
+                search={"status": "failed", "error": "Search timed out (0x8024401C)", "checkedAt": FRESH},
+            ),
+            mac("TESTSERIAL05", pending=[], search={"status": "failed", "error": "No network", "checkedAt": FRESH}),
+            mac("TESTSERIAL06", pending=[], search="succeeded"),
+        ]
+    )
+    rows = {r["serialNumber"]: r for r in result["rows"]}
+    assert rows["TESTSERIAL01"]["state"] == "none"
+    assert rows["TESTSERIAL02"]["state"] == "unknown"
+    assert rows["TESTSERIAL02"]["updateSearch"]["status"] == "not_reported"
+    assert rows["TESTSERIAL03"]["state"] == "unknown"
+    assert rows["TESTSERIAL03"]["updateSearch"]["freshness"] == "stale"
+    assert rows["TESTSERIAL04"]["state"] == "search_failed"
+    assert rows["TESTSERIAL04"]["updateSearch"]["error"] == "Search timed out (0x8024401C)"
+    assert rows["TESTSERIAL05"]["state"] == "search_failed"
+    assert rows["TESTSERIAL06"]["state"] == "unknown"
+    assert result["summary"] == {"none": 1, "unknown": 3, "search_failed": 2}
+
+
+def test_a_failed_search_on_a_stale_collection_is_unknown():
+    result = shape(
+        [windows("TESTSERIAL01", collected=STALE, search={"status": "failed", "checkedAt": STALE})]
+    )
+    row = result["rows"][0]
+    assert (row["reportedState"], row["state"]) == ("search_failed", "unknown")
+
+
+def test_pending_updates_stay_pending_whatever_the_search_status():
+    result = shape([windows("TESTSERIAL01", pending=[SECURITY], search=None)])
+    assert [r["state"] for r in result["rows"]] == ["pending"]
+
+
+def test_search_failed_is_a_valid_state_filter():
+    client = TestClient(app)
+    response = client.get(
+        "/api/v1/system/updates?states=search_failed",
+        headers={"X-Internal-Secret": "test-internal-secret"},
+    )
+    assert response.status_code != 422

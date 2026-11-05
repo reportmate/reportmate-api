@@ -41,7 +41,11 @@ WINDOWS = {
     ],
     "services": [{"name": "unrelated"}],
 }
-MACOS = {"operatingSystem": {"name": "macOS"}, "pendingAppleUpdates": []}
+MACOS = {
+    "operatingSystem": {"name": "macOS"},
+    "pendingAppleUpdates": [],
+    "updateSearch": {"status": "succeeded", "checkedAt": datetime.now(timezone.utc).isoformat()},
+}
 
 
 def _connect(search_path=True):
@@ -122,6 +126,8 @@ def test_query_projects_update_arrays_and_scope(db):
     assert rows[0]["pendingWindowsUpdatesCount"] == 1
     assert rows[0]["installedUpdates"][0]["id"] == "KB5000002"
     assert rows[1]["pendingAppleUpdates"] == []
+    assert rows[1]["updateSearch"]["status"] == "succeeded"
+    assert rows[0]["updateSearch"] is None
     assert rows[1]["collectedAt"]
     assert [
         r["serialNumber"] for r in _rows(platform="macos", include_archived=True)

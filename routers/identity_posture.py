@@ -25,6 +25,7 @@ router = APIRouter(tags=["fleet"])
 
 QUICK_VIEWS = (
     "noLaps",
+    "noValidPrt",
     "autoLogin",
     "expiredPssoToken",
     "activationLock",
@@ -32,6 +33,7 @@ QUICK_VIEWS = (
 )
 VIEW_PLATFORM = {
     "noLaps": "Windows",
+    "noValidPrt": "Windows",
     "autoLogin": "Windows",
     "expiredPssoToken": "macOS",
     "activationLock": "macOS",
@@ -94,6 +96,40 @@ def laps_state(laps):
     if win or legacy:
         return "configured"
     return "not_configured" if win is False and legacy is False else "unknown"
+
+
+LAPS_SOURCES = {"csp", "gpo", "local", "legacyGpo", "none"}
+
+
+def laps_source(laps):
+    """Which policy root the client found LAPS in; None from clients that do not say."""
+    value = _obj(laps).get("policySource")
+    return value if value in LAPS_SOURCES else None
+
+
+def prt_state(user_sso, now):
+    """Entra PRT of the signed-in user, judged against the report time.
+
+    not_reported: the client does not collect per-user SSO state (older clients).
+    not_available: nobody was signed in. failed: the client could not read it.
+    none: a user was signed in and had no PRT. expired / valid: a PRT, by its expiry.
+    """
+    if not isinstance(user_sso, dict):
+        return "not_reported"
+    status = user_sso.get("status")
+    if status == "notAvailable":
+        return "not_available"
+    if status != "collected":
+        return "failed" if status == "failed" else "unknown"
+    has_prt = tri(user_sso.get("entraPrt"))
+    if has_prt is False:
+        return "none"
+    if has_prt is not True:
+        return "unknown"
+    expires = _time(user_sso.get("entraPrtExpiryTime"))
+    if expires is None:
+        return "valid"
+    return "expired" if expires <= now else "valid"
 
 
 def activation_lock_state(lock):
@@ -191,9 +227,27 @@ def shape_device(row, now, max_age_hours):
             _obj(windows.get("tpmOwnership")),
         )
         policy_ok = bool(policy) and not policy.get("errorMessage")
+        laps, user_sso = windows.get("laps"), _obj(windows.get("userSso"))
         reported = {
-            "laps": laps_state(windows.get("laps")),
-            "lapsBackupDirectory": text(_obj(windows.get("laps")).get("backupDirectory")),
+            "laps": laps_state(laps),
+            "lapsBackupDirectory": text(_obj(laps).get("backupDirectory")),
+            "lapsPolicySource": laps_source(laps),
+            "lapsLastRotation": text(_obj(laps).get("lastPasswordRotation")),
+            "prtState": prt_state(windows.get("userSso"), now),
+            "prtUser": text(user_sso.get("userName")),
+            "prtCollectedAt": text(user_sso.get("collectedAt")),
+            "prtUpdateTime": text(user_sso.get("entraPrtUpdateTime")),
+            "prtExpiryTime": text(user_sso.get("entraPrtExpiryTime")),
+            "ssoReason": text(user_sso.get("reason")),
+            "cloudTgt": (
+                tri(user_sso.get("cloudTgt")) if user_sso.get("status") == "collected" else None
+            ),
+            "onPremTgt": (
+                tri(user_sso.get("onPremTgt")) if user_sso.get("status") == "collected" else None
+            ),
+            "passwordComplexity": (
+                tri(policy.get("complexityRequired")) if policy_ok else None
+            ),
             "autoLogin": tri(auto.get("autoAdminLogon")),
             "autoLoginStoredPassword": tri(auto.get("hasDefaultPassword")),
             "uacEnabled": tri(uac.get("enableLua")),
@@ -287,6 +341,10 @@ def posture_checks(platform, reported, identity_freshness, security_freshness):
         if view == "noLaps":
             value = {"not_configured": True, "configured": False}.get(
                 reported.get("laps")
+            )
+        elif view == "noValidPrt":
+            value = {"none": True, "expired": True, "valid": False}.get(
+                reported.get("prtState")
             )
         elif view == "autoLogin":
             value = reported.get("autoLogin")
@@ -384,7 +442,8 @@ def get_identity_posture(
 ):
     """One row per device with the sign-in and recovery posture it last reported.
 
-    Windows: LAPS policy, auto-login, UAC, local password and lockout policy,
+    Windows: LAPS policy and its source, the signed-in user's Entra PRT and
+    Kerberos tickets, auto-login, UAC, local password and lockout policy,
     Windows Hello, Credential Guard, TPM ownership, failed sign-ins in seven days.
     macOS: Platform SSO registration and per-user token expiry, Secure Token,
     Bootstrap Token, Activation Lock, Find My, FileVault recovery keys.
