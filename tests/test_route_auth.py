@@ -19,6 +19,7 @@ from routers import (
     events,
     fleet,
     health,
+    identity_posture,
     insights,
     inventory_state,
     management_profiles,
@@ -27,7 +28,7 @@ from routers import (
     system_services,
 )
 
-ROUTER_MODULES = [admin, api_keys, auth_config, devices, events, fleet, health, insights, inventory_state, management_profiles, settings, statistics, system_services]
+ROUTER_MODULES = [admin, api_keys, auth_config, devices, events, fleet, health, insights, inventory_state, management_profiles, settings, statistics, system_services, identity_posture]
 
 # Routes that are anonymous by design. Adding to this list is a deliberate,
 # reviewed decision — liveness/readiness must work before secrets are mounted,

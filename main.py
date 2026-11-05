@@ -40,6 +40,7 @@ from routers import (
     events,
     fleet,
     health,
+    identity_posture,
     insights,
     inventory_state,
     management_profiles,
@@ -218,6 +219,7 @@ for _router_mod in (
     auth_config,
     inventory_state,
     system_services,
+    identity_posture,
 ):
     app.include_router(_router_mod.router, prefix="/api/v1")
 
