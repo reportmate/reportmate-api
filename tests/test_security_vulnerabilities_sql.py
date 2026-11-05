@@ -48,6 +48,8 @@ MAC = {
             "actively_exploited": "true",
         }
     ],
+    "unpatchedCVEsTotal": 1,
+    "unpatchedCVEsTruncated": False,
     "detections": {"unexpected": "object"},
 }
 
@@ -143,6 +145,8 @@ def test_vulnerability_rows_keep_each_platform_list(db):
         rows["TESTSERIAL02"]["macCves"] == MAC["unpatchedCVEs"]
         and rows["TESTSERIAL02"]["windowsCves"] is None
     )
+    assert rows["TESTSERIAL02"]["macCvesTruncated"] is False
+    assert rows["TESTSERIAL01"]["macCvesTruncated"] is None
     assert rows["TESTSERIAL03"]["hasSecurity"] is False
     assert rows["TESTSERIAL01"]["inventoryState"] == "checked_out"
     assert rows["TESTSERIAL01"]["collectedAt"]

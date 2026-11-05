@@ -400,3 +400,28 @@ def test_javascript_link_is_dropped_from_rows(monkeypatch):
     monkeypatch.setattr(report, "_load", lambda kind, platform, archived: [row])
     body = TestClient(app).get("/api/v1/security/vulnerabilities", headers=HEADERS).json()
     assert body["rows"][0]["url"] is None
+
+
+@pytest.mark.parametrize(
+    "mac, truncated, expected",
+    [
+        ([{}] * 50, None, True),
+        ([{}] * 49, None, False),
+        ([{}] * 120, False, False),
+        ([{}] * 1000, True, True),
+        (None, True, False),
+        ([{}] * 60, "yes", True),
+    ],
+)
+def test_mac_list_incompleteness_prefers_the_client_flag(mac, truncated, expected):
+    assert report.mac_list_may_be_incomplete(mac, truncated) is expected
+
+
+def test_truncated_flag_reaches_device_rows():
+    rows = [
+        _device("TESTSERIAL05", "macOS", windowsCves=None, macCves=[MAC_CVE] * 60, macCvesTruncated=False),
+        _device("TESTSERIAL06", "macOS", windowsCves=None, macCves=[MAC_CVE], macCvesTruncated=True),
+    ]
+    devices = {d["serialNumber"]: d for d in report.vulnerability_devices(rows, datetime.now(timezone.utc), 24)}
+    assert devices["TESTSERIAL05"]["listMayBeIncomplete"] is False
+    assert devices["TESTSERIAL06"]["listMayBeIncomplete"] is True

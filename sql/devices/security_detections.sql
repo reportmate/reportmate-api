@@ -1,8 +1,9 @@
 -- Fleet threat detection rows: /api/v1/security/detections
 -- One row per device that matches the scope, with its collected detections
--- array as reported (Windows clients send Defender detections; macOS clients
--- send none). A device without the array still returns a row so coverage can
--- be counted.
+-- array as reported (Windows clients send Defender and event-log detections;
+-- newer macOS clients send XProtect Remediator and Defender detections, older
+-- ones send none). A device without the array still returns a row so coverage
+-- can be counted.
 -- Parameters: include_archived (boolean), platform ('' | 'windows' | 'macos').
 
 SELECT jsonb_build_object(

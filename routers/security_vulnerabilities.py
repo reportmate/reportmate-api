@@ -2,8 +2,9 @@
 
 Rows are the entries clients collected, normalized across platforms without
 filling gaps: Windows clients report MSRC entries with a status and severity,
-macOS clients report SOFA unpatched CVEs with no severity, and only Windows
-clients report individual threat detections. A field that was not collected
+macOS clients report SOFA unpatched CVEs with no severity, and both report
+individual threat detections (newer macOS clients: XProtect Remediator and
+Defender, with no severity). A field that was not collected
 stays null; a device that did not report the list counts as not reporting,
 never as clean.
 """
@@ -30,9 +31,23 @@ from routers.system_services import _list, _platform, _time, collection_freshnes
 
 router = APIRouter(tags=["fleet"])
 
-# The macOS client keeps at most this many SOFA entries per device, actively
-# exploited first, so a list of this length may be incomplete.
+# Older macOS clients kept at most this many SOFA entries per device, actively
+# exploited first, and sent no truncation flag, so a list of this length from
+# such a client may be incomplete. Newer clients send unpatchedCVEsTruncated.
 MAC_CVE_LIST_LIMIT = 50
+
+
+def mac_list_may_be_incomplete(mac, truncated):
+    """Whether a macOS CVE list may be missing entries.
+
+    Uses the client's own flag when it sends one; otherwise falls back to the
+    old fixed-cap heuristic, so old clients are still flagged.
+    """
+    if not isinstance(mac, list):
+        return False
+    if isinstance(truncated, bool):
+        return truncated
+    return len(mac) >= MAC_CVE_LIST_LIMIT
 
 SCOPES = {
     "usages": "usage",
@@ -285,7 +300,7 @@ def vulnerability_devices(rows, now, max_age_hours):
             if isinstance(mac, list):
                 entries += [e for e in (normalize_cve(x, "mac") for x in mac) if e]
             device["cveReporting"] = "reported" if isinstance(windows, list) or isinstance(mac, list) else "not_reported"
-            device["listMayBeIncomplete"] = isinstance(mac, list) and len(mac) >= MAC_CVE_LIST_LIMIT
+            device["listMayBeIncomplete"] = mac_list_may_be_incomplete(mac, row.get("macCvesTruncated"))
             device["entries"] = entries
         except Exception:
             logger.warning("Unreadable CVE list for one device; reporting it as unknown")
