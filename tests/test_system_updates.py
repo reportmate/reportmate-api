@@ -268,3 +268,24 @@ def test_updates_report_requires_authentication():
         ).status_code
         == 422
     )
+
+
+def test_malformed_collected_types_never_fail_the_report():
+    odd = {"title": 12345, "kbNumber": {"kb": 1}, "category": {"name": "Security"}, "severity": ["High"],
+           "cves": "CVE-2026-0001", "releaseDate": 20260609, "isDownloaded": "maybe"}
+    odd_installed = [{"id": 5000001, "title": ["Security Update"], "category": None, "installDate": {}}, "not an object"]
+    odd_mac = {"name": {"label": "x"}, "version": 26.5, "deferred": "yes", "firstOfferedAt": ["2026-05-12"]}
+    rows = [
+        windows("TESTSERIAL18", pending=[odd], installed=odd_installed),
+        mac("TESTSERIAL19", pending=[odd_mac]),
+        {"serialNumber": "TESTSERIAL20", "platform": None, "collectedAt": FRESH, "pendingWindowsUpdates": "garbage"},
+    ]
+    result = shape(rows)
+    states = {r["serialNumber"]: r["state"] for r in result["rows"]}
+    assert states == {"TESTSERIAL18": "pending", "TESTSERIAL19": "pending", "TESTSERIAL20": "unknown"}
+    win = next(r for r in result["rows"] if r["serialNumber"] == "TESTSERIAL18")
+    assert (win["title"], win["kb"], win["category"], win["cves"], win["isSecurity"]) == ("12345", None, "", [], False)
+    assert shape(rows, cves={"cve-2026-0001"})["summary"] == {"not_reported": 1}
+    updates, cves = build_update_options(rows, NOW)
+    assert cves == []
+    assert [(u["key"], u["pendingDevices"]) for u in updates] == [("windows:title:12345", 1)]

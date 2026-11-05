@@ -93,33 +93,45 @@ def _age_days(value, now):
     return int((now - when).total_seconds() // 86400)
 
 
+def _text(entry, *keys):
+    """First non-empty scalar among keys, as a stripped string. Device JSON is
+    untrusted: objects, lists and booleans are not text and read as absent."""
+    for key in keys:
+        value = entry.get(key)
+        if isinstance(value, bool) or not isinstance(value, (str, int, float)):
+            continue
+        text = str(value).strip()
+        if text:
+            return text
+    return None
+
+
+def _cves(value):
+    if not isinstance(value, list):
+        return []
+    return sorted({c.strip().upper() for c in value if isinstance(c, str) and _CVE.match(c.strip())})
+
+
 def windows_pending(entry, now):
-    kb = kb_number(entry.get("kbNumber"), entry.get("kb_number"), entry.get("title"))
-    title = entry.get("title") or entry.get("description") or kb or ""
-    cves = sorted(
-        {
-            str(c).strip().upper()
-            for c in entry.get("cves") or []
-            if _CVE.match(str(c).strip())
-        }
-    )
-    category = entry.get("category") or ""
-    released = entry.get("releaseDate") or entry.get("release_date") or None
+    kb = kb_number(_text(entry, "kbNumber", "kb_number"), _text(entry, "title"))
+    title = _text(entry, "title", "description") or kb or ""
+    cves = _cves(entry.get("cves"))
+    category = _text(entry, "category") or ""
+    severity = _text(entry, "severity")
+    released = _text(entry, "releaseDate", "release_date")
     return {
         "updateKey": update_key("windows", kb, title),
         "title": title,
         "kb": kb,
         "category": category,
-        "severity": entry.get("severity") or None,
+        "severity": severity,
         "cves": cves,
         # MSRC severity and CVEs are set only on security updates; a title such as
         # "Security Intelligence Update" is a definition update, not a security fix.
-        "isSecurity": bool(cves) or bool(entry.get("severity")) or "security" in category.lower(),
+        "isSecurity": bool(cves) or bool(severity) or "security" in category.lower(),
         "mandatory": flag(entry.get("isMandatory", entry.get("is_mandatory"))),
         "downloaded": flag(entry.get("isDownloaded", entry.get("is_downloaded"))),
-        "rebootRequired": flag(
-            entry.get("rebootRequired", entry.get("reboot_required"))
-        ),
+        "rebootRequired": flag(entry.get("rebootRequired", entry.get("reboot_required"))),
         "deferred": None,
         "deferredUntil": None,
         "firstOfferedAt": None,
@@ -134,26 +146,25 @@ def windows_pending(entry, now):
 
 
 def windows_installed(entry):
-    kb = kb_number(entry.get("id"), entry.get("updateId"), entry.get("title"))
-    title = entry.get("title") or entry.get("name") or kb or ""
+    kb = kb_number(_text(entry, "id", "updateId"), _text(entry, "title"))
+    title = _text(entry, "title", "name") or kb or ""
+    category = _text(entry, "category") or ""
     return {
         "updateKey": update_key("windows", kb, title),
         "title": title,
         "kb": kb,
-        "category": entry.get("category") or "",
+        "category": category,
         "severity": None,
         "cves": [],
-        "isSecurity": "security" in f"{title} {entry.get('category') or ''}".lower(),
+        "isSecurity": "security" in f"{title} {category}".lower(),
         "mandatory": None,
         "downloaded": None,
-        "rebootRequired": flag(
-            entry.get("requiresRestart", entry.get("requires_restart"))
-        ),
+        "rebootRequired": flag(entry.get("requiresRestart", entry.get("requires_restart"))),
         "deferred": None,
         "deferredUntil": None,
         "firstOfferedAt": None,
         "releaseDate": None,
-        "installDate": entry.get("installDate") or entry.get("installed_date") or None,
+        "installDate": _text(entry, "installDate", "installed_date"),
         "version": None,
         "buildVersion": None,
         "updateType": None,
@@ -163,37 +174,31 @@ def windows_installed(entry):
 
 
 def macos_pending(entry, now):
-    label = (
-        entry.get("name") or entry.get("display_name") or entry.get("productKey") or ""
-    )
-    offered = entry.get("firstOfferedAt") or entry.get("first_offered_at") or None
+    label = _text(entry, "name", "display_name", "productKey", "product_key") or ""
+    offered = _text(entry, "firstOfferedAt", "first_offered_at")
+    update_type = _text(entry, "updateType", "update_type")
     return {
         "updateKey": update_key("macos", title=label),
         "title": label,
         "kb": None,
-        "productKey": entry.get("productKey") or entry.get("product_key") or None,
-        "category": entry.get("updateType") or entry.get("update_type") or "",
+        "productKey": _text(entry, "productKey", "product_key"),
+        "category": update_type or "",
         "severity": None,
         "cves": [],
         "isSecurity": flag(entry.get("isSecurity", entry.get("is_security"))) is True,
         "mandatory": None,
         "downloaded": None,
         "rebootRequired": flag(
-            entry.get(
-                "restartRequired",
-                entry.get("restart_required", entry.get("reboot_required")),
-            )
+            entry.get("restartRequired", entry.get("restart_required", entry.get("reboot_required")))
         ),
         "deferred": flag(entry.get("deferred")),
-        "deferredUntil": entry.get("deferredUntil")
-        or entry.get("deferred_until")
-        or None,
+        "deferredUntil": _text(entry, "deferredUntil", "deferred_until"),
         "firstOfferedAt": offered,
         "releaseDate": None,
         "installDate": None,
-        "version": entry.get("version") or None,
-        "buildVersion": entry.get("buildVersion") or entry.get("build_version") or None,
-        "updateType": entry.get("updateType") or entry.get("update_type") or None,
+        "version": _text(entry, "version"),
+        "buildVersion": _text(entry, "buildVersion", "build_version"),
+        "updateType": update_type,
         "ageDays": _age_days(offered, now),
         "ageSource": "offered" if offered else None,
     }
@@ -206,29 +211,33 @@ def device_updates(row, now):
     Windows, a count that agrees with it). An empty valid list is what the clients
     send both when nothing is pending and when the update search failed, so a
     device-level "none" row is reported only as "none reported", never as patched.
+    Never raises: a device whose collected values cannot be read is invalid, and
+    so reported as unknown, rather than failing the fleet report.
     """
-    platform = _platform_key(row)
-    raw = (
-        row.get("pendingWindowsUpdates")
-        if platform == "windows"
-        else row.get("pendingAppleUpdates")
-    )
-    valid = isinstance(raw, list) and all(isinstance(e, dict) for e in raw)
-    if valid and platform == "windows":
-        count = row.get("pendingWindowsUpdatesCount")
-        if isinstance(count, int) and not isinstance(count, bool) and count != len(raw):
-            valid = False
-    pending, installed = [], []
-    if valid:
-        pending = [
-            windows_pending(e, now) if platform == "windows" else macos_pending(e, now)
-            for e in raw
-        ]
-    if platform == "windows" and isinstance(row.get("installedUpdates"), list):
-        installed = [
-            windows_installed(e) for e in row["installedUpdates"] if isinstance(e, dict)
-        ]
-    return platform, pending, installed, valid
+    platform = ""
+    try:
+        platform = _platform_key(row)
+        raw = row.get("pendingWindowsUpdates") if platform == "windows" else row.get("pendingAppleUpdates")
+        valid = isinstance(raw, list) and all(isinstance(e, dict) for e in raw)
+        if valid and platform == "windows":
+            count = row.get("pendingWindowsUpdatesCount")
+            if isinstance(count, int) and not isinstance(count, bool) and count != len(raw):
+                valid = False
+        pending, installed = [], []
+        if valid:
+            parse = windows_pending if platform == "windows" else macos_pending
+            pending = [parse(e, now) for e in raw]
+        if platform == "windows" and isinstance(row.get("installedUpdates"), list):
+            for entry in row["installedUpdates"]:
+                if isinstance(entry, dict):
+                    try:
+                        installed.append(windows_installed(entry))
+                    except Exception:
+                        continue
+        return platform, pending, installed, valid
+    except Exception:
+        logger.warning("Unreadable update collection for one device; reporting it as unknown")
+        return platform, [], [], False
 
 
 EMPTY_UPDATE = {
