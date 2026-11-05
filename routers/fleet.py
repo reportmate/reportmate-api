@@ -9,6 +9,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
 
 from pagination import add_pagination_headers
 from log_tails import classify_line, normalize_message, parse_levels, sql_pattern_for_levels
+from routers.management_enrollment import enrollment_fields
 
 from dependencies import (
     cache_get, cache_set, get_db_connection, load_sql, logger,
@@ -3290,7 +3291,8 @@ def get_bulk_management(
                     'isEnrolled': is_enrolled,
                     # Pre-extracted fields (replaces raw blob)
                     'autopilotConfig': management_data.get('autopilot_config') or management_data.get('autopilotConfig') if management_data else None,
-                    'osName': db_os_name  # real OS name from the devices table
+                    'osName': db_os_name,  # real OS name from the devices table
+                    **enrollment_fields(management_data, mdm_certificate, mdm_enrollment),
                 })
 
                 # Fall back to embedded system data only when the devices table
