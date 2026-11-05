@@ -48,6 +48,7 @@ from routers import (
     statistics,
     system_services,
     security_vulnerabilities,
+    system_updates,
 )
 
 # ── Pre-load SQL queries into memory ────────────────────────────
@@ -222,6 +223,7 @@ for _router_mod in (
     system_services,
     identity_posture,
     security_vulnerabilities,
+    system_updates,
 ):
     app.include_router(_router_mod.router, prefix="/api/v1")
 

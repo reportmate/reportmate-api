@@ -27,9 +27,10 @@ from routers import (
     statistics,
     system_services,
     security_vulnerabilities,
+    system_updates,
 )
 
-ROUTER_MODULES = [admin, api_keys, auth_config, devices, events, fleet, health, insights, inventory_state, management_profiles, settings, statistics, system_services, identity_posture, security_vulnerabilities]
+ROUTER_MODULES = [admin, api_keys, auth_config, devices, events, fleet, health, insights, inventory_state, management_profiles, settings, statistics, system_services, identity_posture, security_vulnerabilities, system_updates]
 
 # Routes that are anonymous by design. Adding to this list is a deliberate,
 # reviewed decision — liveness/readiness must work before secrets are mounted,
