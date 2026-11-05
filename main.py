@@ -42,6 +42,7 @@ from routers import (
     health,
     insights,
     inventory_state,
+    management_profiles,
     settings,
     statistics,
     system_services,
@@ -207,6 +208,7 @@ for _router_mod in (
     # Before fleet: GET /management/logs/fleet would otherwise be taken by
     # fleet's GET /management/logs/{tool} as a tool named "fleet".
     insights,
+    management_profiles,
     fleet,
     events,
     statistics,
