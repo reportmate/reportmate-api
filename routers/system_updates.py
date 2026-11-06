@@ -109,7 +109,13 @@ def _text(entry, *keys):
 def _cves(value):
     if not isinstance(value, list):
         return []
-    return sorted({c.strip().upper() for c in value if isinstance(c, str) and _CVE.match(c.strip())})
+    return sorted(
+        {
+            c.strip().upper()
+            for c in value
+            if isinstance(c, str) and _CVE.match(c.strip())
+        }
+    )
 
 
 def windows_pending(entry, now):
@@ -131,7 +137,9 @@ def windows_pending(entry, now):
         "isSecurity": bool(cves) or bool(severity) or "security" in category.lower(),
         "mandatory": flag(entry.get("isMandatory", entry.get("is_mandatory"))),
         "downloaded": flag(entry.get("isDownloaded", entry.get("is_downloaded"))),
-        "rebootRequired": flag(entry.get("rebootRequired", entry.get("reboot_required"))),
+        "rebootRequired": flag(
+            entry.get("rebootRequired", entry.get("reboot_required"))
+        ),
         "deferred": None,
         "deferredUntil": None,
         "firstOfferedAt": None,
@@ -159,7 +167,9 @@ def windows_installed(entry):
         "isSecurity": "security" in f"{title} {category}".lower(),
         "mandatory": None,
         "downloaded": None,
-        "rebootRequired": flag(entry.get("requiresRestart", entry.get("requires_restart"))),
+        "rebootRequired": flag(
+            entry.get("requiresRestart", entry.get("requires_restart"))
+        ),
         "deferred": None,
         "deferredUntil": None,
         "firstOfferedAt": None,
@@ -189,7 +199,10 @@ def macos_pending(entry, now):
         "mandatory": None,
         "downloaded": None,
         "rebootRequired": flag(
-            entry.get("restartRequired", entry.get("restart_required", entry.get("reboot_required")))
+            entry.get(
+                "restartRequired",
+                entry.get("restart_required", entry.get("reboot_required")),
+            )
         ),
         "deferred": flag(entry.get("deferred")),
         "deferredUntil": _text(entry, "deferredUntil", "deferred_until"),
@@ -202,6 +215,19 @@ def macos_pending(entry, now):
         "ageDays": _age_days(offered, now),
         "ageSource": "offered" if offered else None,
     }
+
+
+def _unique(updates):
+    """Keep one entry per update key: Windows can list the same driver update once per
+    matching hardware instance, which is one update to the reader."""
+    seen, result = set(), []
+    for update in updates:
+        key = update.get("updateKey")
+        if key is not None and key in seen:
+            continue
+        seen.add(key)
+        result.append(update)
+    return result
 
 
 def device_updates(row, now):
@@ -217,11 +243,19 @@ def device_updates(row, now):
     platform = ""
     try:
         platform = _platform_key(row)
-        raw = row.get("pendingWindowsUpdates") if platform == "windows" else row.get("pendingAppleUpdates")
+        raw = (
+            row.get("pendingWindowsUpdates")
+            if platform == "windows"
+            else row.get("pendingAppleUpdates")
+        )
         valid = isinstance(raw, list) and all(isinstance(e, dict) for e in raw)
         if valid and platform == "windows":
             count = row.get("pendingWindowsUpdatesCount")
-            if isinstance(count, int) and not isinstance(count, bool) and count != len(raw):
+            if (
+                isinstance(count, int)
+                and not isinstance(count, bool)
+                and count != len(raw)
+            ):
                 valid = False
         pending, installed = [], []
         if valid:
@@ -234,9 +268,11 @@ def device_updates(row, now):
                         installed.append(windows_installed(entry))
                     except Exception:
                         continue
-        return platform, pending, installed, valid
+        return platform, _unique(pending), _unique(installed), valid
     except Exception:
-        logger.warning("Unreadable update collection for one device; reporting it as unknown")
+        logger.warning(
+            "Unreadable update collection for one device; reporting it as unknown"
+        )
         return platform, [], [], False
 
 
@@ -249,14 +285,25 @@ def update_search(row, now, max_age_hours):
     raw = row.get("updateSearch")
     status = raw.get("status") if isinstance(raw, dict) else None
     if status not in ("succeeded", "failed"):
-        return {"status": "not_reported", "error": None, "checkedAt": None, "freshness": "unknown"}
+        return {
+            "status": "not_reported",
+            "error": None,
+            "checkedAt": None,
+            "freshness": "unknown",
+        }
     checked = raw.get("checkedAt") if isinstance(raw.get("checkedAt"), str) else None
-    error = raw.get("error") if isinstance(raw.get("error"), str) and raw.get("error").strip() else None
+    error = (
+        raw.get("error")
+        if isinstance(raw.get("error"), str) and raw.get("error").strip()
+        else None
+    )
     return {
         "status": status,
         "error": error.strip()[:500] if error else None,
         "checkedAt": checked,
-        "freshness": collection_freshness(checked, now, max_age_hours) if checked else "unknown",
+        "freshness": (
+            collection_freshness(checked, now, max_age_hours) if checked else "unknown"
+        ),
     }
 
 
@@ -270,7 +317,9 @@ def empty_state(valid, trusted, search, reported_none):
         return "missing", "unknown"
     if search["status"] == "failed":
         return "search_failed", "search_failed" if trusted else "unknown"
-    proven = trusted and search["status"] == "succeeded" and search["freshness"] == "fresh"
+    proven = (
+        trusted and search["status"] == "succeeded" and search["freshness"] == "fresh"
+    )
     return reported_none, reported_none if proven else "unknown"
 
 
@@ -410,7 +459,9 @@ def shape_updates(
             for update in installed_hits:
                 device_rows.append((update, "installed", "installed"))
             if not device_rows and not attribute_filter:
-                reported, state = empty_state(valid, trusted, last_search, "not_reported")
+                reported, state = empty_state(
+                    valid, trusted, last_search, "not_reported"
+                )
                 if reported == "not_reported" and last_search["status"] != "failed":
                     # Installed history is partial, so "not reported" never needed a search.
                     state = "not_reported" if trusted else "unknown"
@@ -618,8 +669,14 @@ def get_system_updates(
         raise HTTPException(
             status_code=422, detail="CVE ids must look like CVE-YYYY-NNNN"
         )
-    selected = {"usage": _list(usages), "catalog": _list(catalogs), "area": _list(areas),
-                "fleet": _list(fleets), "location": _list(locations), "room": _list(rooms)}
+    selected = {
+        "usage": _list(usages),
+        "catalog": _list(catalogs),
+        "area": _list(areas),
+        "fleet": _list(fleets),
+        "location": _list(locations),
+        "room": _list(rooms),
+    }
     try:
         rows = _query_rows(normalized, include_archived)
         now = datetime.now(timezone.utc)

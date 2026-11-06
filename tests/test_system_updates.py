@@ -341,3 +341,11 @@ def test_search_failed_is_a_valid_state_filter():
         headers={"X-Internal-Secret": "test-internal-secret"},
     )
     assert response.status_code != 422
+
+
+def test_duplicate_pending_entries_collapse_to_one_row_per_device():
+    driver = {"title": "Example Driver Update (1.2.3)", "category": "Drivers"}
+    result = shape([windows("TESTSERIAL30", pending=[driver, dict(driver)])])
+    keys = [(r["serialNumber"], r["updateKey"], r["reportedState"]) for r in result["rows"]]
+    assert len(keys) == len(set(keys)) == 1
+    assert result["rows"][0]["pendingCount"] == 1
