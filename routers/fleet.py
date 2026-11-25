@@ -3807,7 +3807,7 @@ def get_bulk_identity(
                 # Do NOT return the full raw identity blob (~50KB per device)
                 summary = {}
                 users_preview = []
-                admin_usernames: list[str] = []
+                admin_accounts: list[dict] = []
                 logged_in_usernames = []
                 btmdb = {}
                 secure_token = {}
@@ -3843,7 +3843,12 @@ def get_bulk_identity(
                             if key in _seen_admins:
                                 continue
                             _seen_admins.add(key)
-                            admin_usernames.append(str(name))
+                            creation_time = (u.get('creationTime') or u.get('creation_time')
+                                             or u.get('accountCreated') or u.get('createdAt') or u.get('created_at'))
+                            admin_accounts.append({
+                                'username': str(name),
+                                'creationTime': creation_time if isinstance(creation_time, str) and creation_time.strip() else None,
+                            })
                     
                     # Mac client emits raw osquery shape ({'user': ...}); Windows client
                     # emits the C# LoggedInUser model ({'username': ...}). Accept both.
@@ -3891,7 +3896,8 @@ def get_bulk_identity(
                     'fleet': fleet,
                     'summary': summary,
                     'users': users_preview,
-                    'adminUsernames': admin_usernames,
+                    'adminUsernames': [account['username'] for account in admin_accounts],
+                    'adminAccounts': admin_accounts,
                     'loggedInUsernames': logged_in_usernames,
                     # The full health record, not just size and status. The
                     # consumer of this field is a fleet alert that has to decide
