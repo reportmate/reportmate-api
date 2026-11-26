@@ -47,3 +47,23 @@ def test_no_stale_nested_device_module_paths():
     assert (
         nested == []
     ), f"stale nested device-module paths leaked into schema: {nested}"
+
+
+def test_cors_preflight_allows_put_and_api_key_header(monkeypatch):
+    origin = next(iter(
+        m.kwargs["allow_origins"] for m in app.user_middleware if m.kwargs.get("allow_origins")
+    ), None)
+    if not origin:
+        return
+    client = TestClient(app)
+    resp = client.options(
+        "/settings",
+        headers={
+            "Origin": origin[0],
+            "Access-Control-Request-Method": "PUT",
+            "Access-Control-Request-Headers": "x-api-key",
+        },
+    )
+    assert resp.status_code == 200
+    assert "PUT" in resp.headers["access-control-allow-methods"]
+    assert "x-api-key" in resp.headers["access-control-allow-headers"].lower()
